@@ -23,7 +23,13 @@ import arena_core_agent as agent
 CORE_ID = UUID(int=1)
 
 
-def controlled_unit(unit_id: int, unit_type: UnitType, position: tuple[int, int]):
+def controlled_unit(
+    unit_id: int,
+    unit_type: UnitType,
+    position: tuple[int, int],
+    *,
+    cargo: int = 0,
+):
     kwargs = {
         "kind": "UNIT",
         "id": UUID(int=unit_id),
@@ -33,7 +39,7 @@ def controlled_unit(unit_id: int, unit_type: UnitType, position: tuple[int, int]
         "unit_type": unit_type,
     }
     if unit_type is UnitType.WORKER:
-        kwargs["cargo"] = 0
+        kwargs["cargo"] = cargo
     return UnitView(**kwargs)
 
 
@@ -319,6 +325,46 @@ class WorkerTests(AgentTestCase):
         self.assertNotIn(dead_vanguard_id, memory.roam_goal)
         persisted_sectors = memory.persistent_state()["worker_sectors"]
         self.assertEqual(persisted_sectors, {str(live_worker.id): 3})
+
+    def test_return_route_does_not_reverse_when_enemy_worker_leaves_view(self):
+        worker_id = UUID(int=100)
+        memory = agent.AgentMemory()
+        first_worker = controlled_unit(
+            100,
+            UnitType.WORKER,
+            (0, 0),
+            cargo=1,
+        )
+        stationary_enemy = enemy_unit(401, UnitType.WORKER, (1, 0))
+
+        first_plan, _, _ = self.plan(
+            make_turn(
+                [first_worker],
+                enemies=[stationary_enemy],
+                tick=100,
+                core_position=(2, 0),
+            ),
+            memory,
+        )
+        self.assertEqual(first_plan.unit_actions[worker_id].direction.value, "UP")
+
+        second_worker = controlled_unit(
+            100,
+            UnitType.WORKER,
+            (0, -1),
+            cargo=1,
+        )
+        second_plan, _, _ = self.plan(
+            make_turn(
+                [second_worker],
+                tick=101,
+                core_position=(2, 0),
+            ),
+            memory,
+        )
+
+        self.assertEqual(second_plan.unit_actions[worker_id].direction.value, "RIGHT")
+        self.assertIn(stationary_enemy.id, memory.enemy_worker_tracks)
 
 
 class PressureProductionTests(AgentTestCase):

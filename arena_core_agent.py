@@ -2177,6 +2177,11 @@ def plan_turn(
         turn.tick,
     )
     memory.observe_enemy_workers(turn.visible_enemies, turn.tick)
+    # 敌方 Worker 在视野边缘反复显隐时，短暂保留最后目击格作为寻路障碍，
+    # 避免返航 Worker 在两条等价路线之间来回切换。轨迹连续三 Tick 未见即过期。
+    known_enemy_worker_cells = {
+        track.position for track in memory.enemy_worker_tracks.values()
+    }
     danger_cells: set[Pos] = set()
     for threat, _ in memory.known_combat_threats.values():
         for dx in range(-3, 4):
@@ -2208,6 +2213,7 @@ def plan_turn(
         | known_enemy_core_cells
         | danger_cells
         | visible_enemy_unit_cells
+        | known_enemy_worker_cells
         | set(memory.temporary_blocked_cells)
     )
     threat_positions = tuple(
@@ -2233,7 +2239,10 @@ def plan_turn(
         visible_resources,
         turn.tick,
         navigation_obstacles,
-        memory.known_obstacles | known_enemy_core_cells | visible_enemy_unit_cells,
+        memory.known_obstacles
+        | known_enemy_core_cells
+        | visible_enemy_unit_cells
+        | known_enemy_worker_cells,
     )
     roaming_combat_units = tuple(
         unit
