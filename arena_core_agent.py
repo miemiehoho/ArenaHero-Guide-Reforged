@@ -1662,6 +1662,61 @@ def ranger_follow_destination(
     return None
 
 
+def full_capacity_worker_destination(
+    context: PlanningContext,
+    position: Pos,
+    worker_index: int,
+) -> tuple[Pos | None, Pos]:
+    """满仓时将 Worker 分散到家园待命点，并优先腾空 Core 格。"""
+    core = context.core_pos
+    occupied = context.occupied
+    obstacles = context.navigation_obstacles | {core}
+    staging_goal = add(
+        core,
+        HOME_PATROL_OFFSETS[worker_index % len(HOME_PATROL_OFFSETS)],
+    )
+
+    if position == core:
+        rotated_steps = (
+            DIRECTION_STEPS[worker_index % len(DIRECTION_STEPS) :]
+            + DIRECTION_STEPS[: worker_index % len(DIRECTION_STEPS)]
+        )
+        candidates = sorted(
+            (add(core, delta) for _, delta in rotated_steps),
+            key=lambda cell: occupied.count(cell),
+        )
+        destination = next(
+            (
+                cell
+                for cell in candidates
+                if cell not in context.navigation_obstacles
+                and occupied.can_enter(cell)
+            ),
+            None,
+        )
+        return destination, staging_goal
+
+    for offset_index in range(len(HOME_PATROL_OFFSETS)):
+        offset = HOME_PATROL_OFFSETS[
+            (worker_index + offset_index) % len(HOME_PATROL_OFFSETS)
+        ]
+        goal = add(core, offset)
+        if goal in obstacles:
+            continue
+        staging_goal = goal
+        if position == goal:
+            return position, staging_goal
+        destination = first_step_astar(
+            position,
+            goal,
+            obstacles,
+            set(occupied),
+        )
+        if destination is not None and occupied.can_enter(destination):
+            return destination, staging_goal
+    return None, staging_goal
+
+
 def plan_workers(context: PlanningContext) -> None:
     """按固定优先级规划 Worker：避险、返航、资源、拦截、侦察。"""
     turn = context.turn
@@ -1744,7 +1799,31 @@ def plan_workers(context: PlanningContext) -> None:
                         )
                         continue
 
-        # 状态 3：载货后只返回当前 Core，不再执行采集或侦察。
+        # 状态 3：Core 满仓后暂停采集和交付，分散待命并优先腾空生产格。
+        if turn.resources >= turn.resource_capacity:
+            destination, staging_goal = full_capacity_worker_destination(
+                context,
+                position,
+                worker_index,
+            )
+            if destination is not None and destination != position:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    worker.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(worker.id)[:8]} capacity-stage "
+                        f"{staging_goal} {direction.value}"
+                    )
+                    continue
+            worker.wait()
+            occupied.add(position)
+            actions.append(
+                f"{str(worker.id)[:8]} capacity-hold {staging_goal}"
+            )
+            continue
+
+        # 状态 4：载货后只返回当前 Core，不再执行采集或侦察。
         if worker.cargo > 0:
             if position == context.core_pos:
                 worker.deposit()
@@ -1773,7 +1852,7 @@ def plan_workers(context: PlanningContext) -> None:
             actions.append(f"{str(worker.id)[:8]} wait-return")
             continue
 
-        # 状态 4：脚下有当前可见资源时立即采集。
+        # 状态 5：脚下有当前可见资源时立即采集。
         if (
             position in context.visible_resources
             and turn.tick >= memory.resource_deferred_until.get(position, 0)
@@ -1783,7 +1862,7 @@ def plan_workers(context: PlanningContext) -> None:
             actions.append(f"{str(worker.id)[:8]} harvest")
             continue
 
-        # 状态 5：静态资源任务跨 Tick 保留，途中不因发现新资源而改派。
+        # 状态 6：静态资源任务跨 Tick 保留，途中不因发现新资源而改派。
         assigned_resource = context.resource_assignments.get(worker.id)
         if assigned_resource is not None and position == assigned_resource:
             worker.wait()
@@ -1825,7 +1904,7 @@ def plan_workers(context: PlanningContext) -> None:
             )
             continue
 
-        # 状态 6：没有资源任务时，才允许空载 Worker 临时协助拦截敌方 Worker。
+        # 状态 7：没有资源任务时，才允许空载 Worker 临时协助拦截敌方 Worker。
         intercept = memory.worker_intercept_goal.get(worker.id)
         if intercept is not None and worker.id == context.blocker_worker_id:
             intercept_goal, expiry = intercept
@@ -1852,7 +1931,7 @@ def plan_workers(context: PlanningContext) -> None:
                 actions.append(f"{str(worker.id)[:8]} intercept-hold")
                 continue
 
-        # 状态 7：其余 Worker 按固定扇区侦察。
+        # 状态 8：其余 Worker 按固定扇区侦察。
         goal = memory.goal_for(
             worker.id,
             worker_index,

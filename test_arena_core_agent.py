@@ -17,6 +17,7 @@ from arena_hero import (
     UnitView,
 )
 from arena_hero.actions import (
+    DepositAction,
     MoveAction,
     PickupBeaconAction,
     ShootAction,
@@ -471,6 +472,48 @@ class WorkerTests(AgentTestCase):
 
         self.assertEqual(second_plan.unit_actions[worker_id].direction.value, "RIGHT")
         self.assertIn(stationary_enemy.id, memory.enemy_worker_tracks)
+
+    def test_full_capacity_workers_clear_core_and_do_not_block_spawn(self):
+        first = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+        second = controlled_unit(101, UnitType.WORKER, (0, 0), cargo=1)
+
+        plan, actions, _ = self.plan(
+            make_turn([first, second], resources=10),
+        )
+
+        first_action = plan.unit_actions[first.id]
+        second_action = plan.unit_actions[second.id]
+        self.assertIsInstance(first_action, MoveAction)
+        self.assertIsInstance(second_action, MoveAction)
+        self.assertNotEqual(first_action.direction, second_action.direction)
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertTrue(any("capacity-stage" in action for action in actions))
+
+    def test_full_capacity_worker_still_flees_nearby_enemy(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+        enemy = enemy_unit(400, UnitType.VANGUARD, (1, 0))
+
+        plan, actions, _ = self.plan(
+            make_turn(
+                [worker],
+                enemies=[enemy],
+                resources=5,
+                core_position=(10, 10),
+            ),
+        )
+
+        self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
+        self.assertTrue(any("flee" in action for action in actions))
+        self.assertFalse(any("capacity-" in action for action in actions))
+
+    def test_worker_deposits_again_after_capacity_is_available(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+
+        plan, _, _ = self.plan(
+            make_turn([worker], resources=4),
+        )
+
+        self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
 
 
 class PressureProductionTests(AgentTestCase):
