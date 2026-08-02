@@ -1094,10 +1094,12 @@ class ExpeditionTests(AgentTestCase):
         self.assertNotIn(memory.home_ranger_id, memory.expedition_unit_ids)
         self.assertTrue(any("expedition-" in action for action in actions))
 
+        memory.expedition_returning = True
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 3)
+        self.assertEqual(restored.persistent_state()["version"], 4)
         self.assertEqual(restored.expedition_unit_ids, memory.expedition_unit_ids)
         self.assertEqual(restored.expedition_leader_id, memory.expedition_leader_id)
+        self.assertTrue(restored.expedition_returning)
 
     def test_expedition_leader_waits_for_member_beyond_formation_radius(self):
         units = [
@@ -1205,7 +1207,7 @@ class ExpeditionTests(AgentTestCase):
         self.assertFalse(any("expedition-engage" in action for action in actions))
         self.assertGreater(memory.expedition_chase_cooldown_until[enemy.id], 100)
 
-    def test_expedition_picks_up_ground_beacon_and_returns_home(self):
+    def test_expedition_turns_home_without_picking_up_ground_beacon(self):
         units = [
             controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
             controlled_unit(202, UnitType.VANGUARD, (5, 0)),
@@ -1219,7 +1221,7 @@ class ExpeditionTests(AgentTestCase):
         memory.expedition_ranger_ids = {UUID(int=302)}
         memory.expedition_leader_id = UUID(int=202)
 
-        plan, _, memory = self.plan(
+        plan, actions, memory = self.plan(
             make_turn(
                 units,
                 beacon_position=(5, 0),
@@ -1227,9 +1229,16 @@ class ExpeditionTests(AgentTestCase):
             ),
             memory,
         )
-        self.assertIsInstance(
-            plan.unit_actions[UUID(int=202)],
-            PickupBeaconAction,
+        leader_action = plan.unit_actions[UUID(int=202)]
+        self.assertIsInstance(leader_action, MoveAction)
+        self.assertEqual(leader_action.direction.value, "LEFT")
+        self.assertTrue(memory.expedition_returning)
+        self.assertTrue(any("expedition-return" in action for action in actions))
+        self.assertFalse(
+            any(
+                isinstance(action, PickupBeaconAction)
+                for action in plan.unit_actions.values()
+            )
         )
 
         plan, actions, _ = self.plan(
@@ -1237,13 +1246,43 @@ class ExpeditionTests(AgentTestCase):
                 units,
                 tick=101,
                 beacon_position=(5, 0),
-                beacon_status=BeaconStatus.CARRIED,
-                beacon_carrier_id=UUID(int=202),
+                beacon_status=BeaconStatus.GROUND,
             ),
             memory,
         )
         self.assertIsInstance(plan.unit_actions[UUID(int=202)], MoveAction)
-        self.assertTrue(any("expedition-lead" in action for action in actions))
+        self.assertTrue(any("expedition-return" in action for action in actions))
+
+    def test_expedition_releases_members_after_returning_without_beacon(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
+            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
+            controlled_unit(203, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(301, UnitType.RANGER, (-1, 1)),
+            controlled_unit(302, UnitType.RANGER, (1, 0)),
+        ]
+        memory = self.role_memory()
+        memory.expedition_active = True
+        memory.expedition_returning = True
+        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
+        memory.expedition_ranger_ids = {UUID(int=302)}
+        memory.expedition_leader_id = UUID(int=202)
+
+        plan, actions, memory = self.plan(
+            make_turn(
+                units,
+                beacon_position=(5, 0),
+                beacon_status=BeaconStatus.GROUND,
+            ),
+            memory,
+        )
+
+        self.assertIsInstance(plan.unit_actions[UUID(int=202)], WaitAction)
+        self.assertTrue(any("expedition-return-home" in action for action in actions))
+        self.assertFalse(memory.expedition_active)
+        self.assertFalse(memory.expedition_returning)
+        self.assertIsNone(memory.beacon_keeper_id)
+        self.assertEqual(memory.expedition_unit_ids, set())
 
     def test_beacon_carrier_at_core_becomes_persistent_keeper(self):
         units = [

@@ -627,6 +627,7 @@ class AgentMemory:
     expedition_leader_id: UUID | None = None
     expedition_assembling: bool = False
     expedition_home_recovery: bool = False
+    expedition_returning: bool = False
     expedition_target_id: UUID | None = None
     expedition_chase_started_tick: int = 0
     expedition_chase_cooldown_until: dict[UUID, int] = field(default_factory=dict)
@@ -668,6 +669,7 @@ class AgentMemory:
         memory.expedition_home_recovery = (
             state.get("expedition_home_recovery") is True
         )
+        memory.expedition_returning = state.get("expedition_returning") is True
         pending_type = state.get("pending_expedition_spawn_type")
         if isinstance(pending_type, str):
             try:
@@ -709,7 +711,7 @@ class AgentMemory:
 
     def persistent_state(self) -> dict:
         return {
-            "version": 3,
+            "version": 4,
             "known_resources": [
                 list(position) for position in sorted(self.known_resources)
             ],
@@ -753,6 +755,7 @@ class AgentMemory:
             ),
             "expedition_assembling": self.expedition_assembling,
             "expedition_home_recovery": self.expedition_home_recovery,
+            "expedition_returning": self.expedition_returning,
             "pending_expedition_spawn_type": (
                 self.pending_expedition_spawn_type.value
                 if self.pending_expedition_spawn_type
@@ -795,6 +798,7 @@ class AgentMemory:
             self.expedition_leader_id,
             self.expedition_assembling,
             self.expedition_home_recovery,
+            self.expedition_returning,
             self.pending_expedition_spawn_type,
             frozenset(self.pending_expedition_existing_ids),
             self.beacon_keeper_id,
@@ -847,6 +851,7 @@ class AgentMemory:
         ).id
         self.expedition_assembling = False
         self.expedition_home_recovery = False
+        self.expedition_returning = False
         self.expedition_target_id = None
         self.expedition_chase_started_tick = 0
         self.expedition_chase_cooldown_until.clear()
@@ -885,6 +890,7 @@ class AgentMemory:
             return False
         self.expedition_active = True
         self.expedition_home_recovery = True
+        self.expedition_returning = False
         self.expedition_assembling = False
         self.expedition_leader_id = recovery.id
         if recovery.unit_type is UnitType.VANGUARD:
@@ -939,6 +945,7 @@ class AgentMemory:
         self.expedition_leader_id = None
         self.expedition_assembling = False
         self.expedition_home_recovery = False
+        self.expedition_returning = False
         self.expedition_target_id = None
         self.expedition_chase_started_tick = 0
         self.expedition_chase_cooldown_until.clear()
@@ -2169,6 +2176,16 @@ def plan_expedition(context: PlanningContext) -> None:
         memory.complete_expedition(carrier_id)
         return
 
+    if memory.expedition_returning and leader_position == context.core_pos:
+        for unit in expedition_units.values():
+            position = tuple(unit.position)
+            occupied.discard(position)
+            unit.wait()
+            occupied.add(position)
+        actions.append(f"{str(leader.id)[:8]} expedition-return-home")
+        memory.reset_expedition()
+        return
+
     active_units = tuple(
         expedition_units[unit_id]
         for unit_id in frontline_ids
@@ -2247,7 +2264,11 @@ def plan_expedition(context: PlanningContext) -> None:
         | set(memory.temporary_blocked_cells)
     )
     own_carrier = carrier_id in expedition_units
-    mission_goal = context.core_pos if own_carrier else tuple(beacon.position)
+    mission_goal = (
+        context.core_pos
+        if own_carrier or memory.expedition_returning
+        else tuple(beacon.position)
+    )
     lagging = any(
         manhattan(tuple(unit.position), leader_position)
         > EXPEDITION_FORMATION_RADIUS
@@ -2313,10 +2334,19 @@ def plan_expedition(context: PlanningContext) -> None:
                 and position == tuple(beacon.position)
                 and beacon.status is BeaconStatus.GROUND
             ):
-                unit.pickup_beacon()
-                occupied.add(position)
-                actions.append(f"{str(unit.id)[:8]} expedition-pickup-beacon")
-                continue
+                if memory.expedition_home_recovery:
+                    unit.pickup_beacon()
+                    occupied.add(position)
+                    actions.append(f"{str(unit.id)[:8]} expedition-pickup-beacon")
+                    continue
+                memory.expedition_returning = True
+                mission_goal = context.core_pos
+                destination = expedition_move_toward(
+                    context,
+                    position,
+                    mission_goal,
+                    expedition_obstacles - {mission_goal},
+                )
             elif target_position is not None:
                 if unit.unit_type is UnitType.RANGER:
                     destination = expedition_ranger_aim_step(
@@ -2340,7 +2370,11 @@ def plan_expedition(context: PlanningContext) -> None:
                     mission_goal,
                     expedition_obstacles - {mission_goal},
                 )
-            label = "expedition-lead"
+            label = (
+                "expedition-return"
+                if memory.expedition_returning
+                else "expedition-lead"
+            )
         else:
             leader_distance = manhattan(position, planned_leader_position)
             if target_position is not None and leader_distance <= EXPEDITION_FORMATION_RADIUS:
