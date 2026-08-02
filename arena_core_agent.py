@@ -23,6 +23,7 @@ from arena_hero import (
     CoreView,
     Direction,
     InvalidActionError,
+    MoveAction,
     PlayerStatus,
     PolicyViolationError,
     TransportError,
@@ -582,6 +583,7 @@ class AgentMemory:
     vanguard_patrol_phase: dict[UUID, int] = field(default_factory=dict)
     roam_phase: dict[UUID, int] = field(default_factory=dict)
     roam_goal: dict[UUID, Pos] = field(default_factory=dict)
+    ranger_follow_vanguard: dict[UUID, UUID] = field(default_factory=dict)
     home_vanguard_id: UUID | None = None
     home_ranger_id: UUID | None = None
     enemy_worker_tracks: dict[UUID, EnemyWorkerTrack] = field(default_factory=dict)
@@ -714,6 +716,10 @@ class AgentMemory:
                 if unit_id not in live_ids:
                     state.pop(unit_id, None)
 
+        for ranger_id, vanguard_id in tuple(self.ranger_follow_vanguard.items()):
+            if ranger_id not in ranger_ids or vanguard_id not in vanguard_ids:
+                self.ranger_follow_vanguard.pop(ranger_id, None)
+
         return self.worker_sector != sectors_before
 
     def sync_combat_roles(self, vanguards, rangers, core: Pos) -> bool:
@@ -735,6 +741,47 @@ class AgentMemory:
             )
             self.home_ranger_id = replacement.id if replacement else None
         return before != (self.home_vanguard_id, self.home_ranger_id)
+
+    def assign_ranger_follow_targets(
+        self,
+        rangers: Iterable[Ranger],
+        vanguards: Iterable[Vanguard],
+    ) -> dict[UUID, UUID]:
+        """稳定分配游走 Ranger 的 Vanguard 跟随目标，并优先避免重复。"""
+        ordered_rangers = tuple(sorted(rangers, key=lambda unit: str(unit.id)))
+        ordered_vanguards = tuple(sorted(vanguards, key=lambda unit: str(unit.id)))
+        vanguard_by_id = {unit.id: unit for unit in ordered_vanguards}
+        assignments: dict[UUID, UUID] = {}
+        target_loads: Counter[UUID] = Counter()
+        unassigned: list[Ranger] = []
+
+        # 先保留仍然有效的一对一关系，避免距离轻微变化导致每 Tick 换搭档。
+        for ranger in ordered_rangers:
+            target_id = self.ranger_follow_vanguard.get(ranger.id)
+            if target_id in vanguard_by_id and target_loads[target_id] == 0:
+                assignments[ranger.id] = target_id
+                target_loads[target_id] += 1
+            else:
+                unassigned.append(ranger)
+
+        # 先锋不足时才复用目标；优先选择当前负载最少且距离最近的先锋。
+        for ranger in unassigned:
+            target = min(
+                ordered_vanguards,
+                key=lambda unit: (
+                    target_loads[unit.id],
+                    manhattan(tuple(ranger.position), tuple(unit.position)),
+                    str(unit.id),
+                ),
+                default=None,
+            )
+            if target is None:
+                continue
+            assignments[ranger.id] = target.id
+            target_loads[target.id] += 1
+
+        self.ranger_follow_vanguard = assignments
+        return dict(assignments)
 
     def observe_enemy_cores(
         self,
@@ -1241,6 +1288,58 @@ def roam_core_reacquire_goal(
         key=lambda candidate: (manhattan(position, candidate), candidate),
         default=None,
     )
+
+
+def planned_vanguard_positions(
+    context: PlanningContext,
+    vanguards: Iterable[Vanguard],
+) -> dict[UUID, Pos]:
+    """读取 Vanguard 本 Tick 的移动动作，返回提交后的预计位置。"""
+    positions: dict[UUID, Pos] = {}
+    for vanguard in vanguards:
+        position: Pos = tuple(vanguard.position)
+        action = context.turn.plan.unit_actions.get(vanguard.id)
+        if isinstance(action, MoveAction):
+            position = add(position, action.direction.delta)
+        positions[vanguard.id] = position
+    return positions
+
+
+def ranger_follow_destination(
+    context: PlanningContext,
+    position: Pos,
+    vanguard_position: Pos,
+    navigation_obstacles: set[Pos],
+) -> Pos | None:
+    """选择通往搭档 Vanguard 相邻格的下一步；已相邻时保持原位。"""
+    movement_obstacles = (
+        navigation_obstacles
+        | context.visible_enemy_unit_cells
+        | {vanguard_position}
+    )
+    follow_cells: list[Pos] = []
+    for _, delta in DIRECTION_STEPS:
+        candidate = add(vanguard_position, delta)
+        if (
+            chebyshev(context.core_pos, candidate) <= ROAM_RADIUS
+            and candidate not in movement_obstacles
+            and context.occupied.can_enter(candidate)
+        ):
+            follow_cells.append(candidate)
+    follow_cells.sort(key=lambda cell: (manhattan(position, cell), cell))
+    if position in follow_cells:
+        return position
+
+    for follow_cell in follow_cells:
+        destination = first_step_astar(
+            position,
+            follow_cell,
+            movement_obstacles,
+            set(context.occupied),
+        )
+        if destination is not None and context.occupied.can_enter(destination):
+            return destination
+    return None
 
 
 def plan_workers(context: PlanningContext) -> None:
@@ -1835,6 +1934,21 @@ def plan_rangers(context: PlanningContext) -> None:
         | set(memory.temporary_blocked_cells)
     )
     ranger_shot_blockers = memory.known_obstacles
+    roaming_vanguards = tuple(
+        vanguard
+        for vanguard in context.vanguards
+        if vanguard.id != memory.home_vanguard_id
+    )
+    roaming_rangers = tuple(
+        ranger
+        for ranger in context.rangers
+        if ranger.id != memory.home_ranger_id
+    )
+    follow_assignments = memory.assign_ranger_follow_targets(
+        roaming_rangers,
+        roaming_vanguards,
+    )
+    vanguard_positions = planned_vanguard_positions(context, roaming_vanguards)
 
     for ranger in context.rangers:
         position: Pos = tuple(ranger.position)
@@ -2059,6 +2173,34 @@ def plan_rangers(context: PlanningContext) -> None:
                 break
             if moved:
                 continue
+
+            follow_target_id = follow_assignments.get(ranger.id)
+            follow_target_position = vanguard_positions.get(follow_target_id)
+            if follow_target_position is not None:
+                destination = ranger_follow_destination(
+                    context,
+                    position,
+                    follow_target_position,
+                    ranger_navigation_obstacles,
+                )
+                if destination == position:
+                    ranger.wait()
+                    occupied.add(position)
+                    actions.append(
+                        f"{str(ranger.id)[:8]} roam-follow-hold "
+                        f"{str(follow_target_id)[:8]}"
+                    )
+                    continue
+                if destination is not None:
+                    direction = direction_between(position, destination)
+                    if direction is not None:
+                        ranger.move(direction)
+                        occupied.add(destination)
+                        actions.append(
+                            f"{str(ranger.id)[:8]} roam-follow "
+                            f"{str(follow_target_id)[:8]} {direction.value}"
+                        )
+                        continue
 
             patrol_goal = roam_core_reacquire_goal(context, position)
             if patrol_goal is None:

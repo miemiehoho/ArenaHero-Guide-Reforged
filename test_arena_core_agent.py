@@ -14,7 +14,7 @@ from arena_hero import (
     UnitType,
     UnitView,
 )
-from arena_hero.actions import ShootAction, SpawnAction, SweepAction
+from arena_hero.actions import MoveAction, ShootAction, SpawnAction, SweepAction
 from arena_hero.turn import Turn
 
 import arena_core_agent as agent
@@ -719,6 +719,96 @@ class CombatTests(AgentTestCase):
 
         self.assertTrue(hasattr(plan.unit_actions[UUID(int=204)], "direction"))
         self.assertTrue(any("roam-aim" in action for action in actions))
+
+    def test_roaming_rangers_follow_distinct_vanguards(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
+            controlled_unit(203, UnitType.VANGUARD, (-10, 0)),
+            controlled_unit(204, UnitType.RANGER, (1, 0)),
+            controlled_unit(205, UnitType.RANGER, (6, 0)),
+            controlled_unit(206, UnitType.RANGER, (-6, 0)),
+        ]
+        memory = agent.AgentMemory(
+            home_vanguard_id=UUID(int=201),
+            home_ranger_id=UUID(int=204),
+        )
+
+        plan, actions, memory = self.plan(make_turn(units), memory)
+
+        assignments = {
+            ranger_id: memory.ranger_follow_vanguard[ranger_id]
+            for ranger_id in (UUID(int=205), UUID(int=206))
+        }
+        self.assertEqual(
+            set(assignments.values()),
+            {UUID(int=202), UUID(int=203)},
+        )
+        self.assertIsInstance(plan.unit_actions[UUID(int=205)], MoveAction)
+        self.assertIsInstance(plan.unit_actions[UUID(int=206)], MoveAction)
+        self.assertEqual(
+            sum("roam-follow " in action for action in actions),
+            2,
+        )
+
+        starts = {UUID(int=205): (6, 0), UUID(int=206): (-6, 0)}
+        vanguard_starts = {UUID(int=202): (10, 0), UUID(int=203): (-10, 0)}
+        for ranger_id, vanguard_id in assignments.items():
+            vanguard_action = plan.unit_actions[vanguard_id]
+            ranger_action = plan.unit_actions[ranger_id]
+            self.assertIsInstance(vanguard_action, MoveAction)
+            planned_vanguard = agent.add(
+                vanguard_starts[vanguard_id],
+                vanguard_action.direction.delta,
+            )
+            ranger_destination = agent.add(
+                starts[ranger_id],
+                ranger_action.direction.delta,
+            )
+            self.assertLess(
+                agent.manhattan(ranger_destination, planned_vanguard),
+                agent.manhattan(starts[ranger_id], planned_vanguard),
+            )
+
+    def test_ranger_follow_assignments_remain_stable(self):
+        memory = agent.AgentMemory()
+        first_rangers = (
+            controlled_unit(205, UnitType.RANGER, (9, 0)),
+            controlled_unit(206, UnitType.RANGER, (-9, 0)),
+        )
+        vanguards = (
+            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
+            controlled_unit(203, UnitType.VANGUARD, (-10, 0)),
+        )
+        initial = memory.assign_ranger_follow_targets(first_rangers, vanguards)
+
+        moved_rangers = (
+            controlled_unit(205, UnitType.RANGER, (-9, 0)),
+            controlled_unit(206, UnitType.RANGER, (9, 0)),
+        )
+        updated = memory.assign_ranger_follow_targets(moved_rangers, vanguards)
+
+        self.assertEqual(updated, initial)
+        self.assertEqual(len(set(updated.values())), 2)
+
+    def test_ranger_follow_targets_balance_when_vanguards_are_fewer(self):
+        memory = agent.AgentMemory()
+        rangers = tuple(
+            controlled_unit(unit_id, UnitType.RANGER, (8 + unit_id - 205, 0))
+            for unit_id in (205, 206, 207)
+        )
+        vanguards = (
+            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
+            controlled_unit(203, UnitType.VANGUARD, (-10, 0)),
+        )
+
+        assignments = memory.assign_ranger_follow_targets(rangers, vanguards)
+        target_counts = sorted(
+            list(assignments.values()).count(vanguard.id)
+            for vanguard in vanguards
+        )
+
+        self.assertEqual(target_counts, [1, 2])
 
     def test_home_patrol_move_stays_inside_seven_by_seven_square(self):
         units = [
