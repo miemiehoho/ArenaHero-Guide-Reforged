@@ -1055,7 +1055,7 @@ class AgentMemory:
         for enemy_position, _ in sorted(self.known_enemy_cores.values()):
             for offset in ((0, -4), (4, 0), (0, 4), (-4, 0)):
                 candidate = add(enemy_position, offset)
-                if manhattan(core, candidate) <= ROAM_RADIUS:
+                if chebyshev(core, candidate) <= ROAM_RADIUS:
                     core_outskirts.append(candidate)
         frontier = [
             add(core, (vector[0] * radius, vector[1] * radius))
@@ -1766,7 +1766,7 @@ def plan_rangers(context: PlanningContext) -> None:
                             | visible_entity_cells
                         ) - {target_position, cell}
                         if (
-                            manhattan(cell, context.core_pos) <= ROAM_RADIUS
+                            chebyshev(cell, context.core_pos) <= ROAM_RADIUS
                             and cell not in movement_blockers
                             and clear_ranger_shot(
                                 cell,

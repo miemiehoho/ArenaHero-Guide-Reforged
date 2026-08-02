@@ -540,6 +540,38 @@ class CombatTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[UUID(int=202)], SweepAction)
         self.assertTrue(any("roam-sweep WORKER" in action for action in actions))
 
+    def test_enemy_core_diagonal_outskirts_are_valid_roam_goals(self):
+        memory = agent.AgentMemory(
+            known_enemy_cores={UUID(int=400): ((25, 25), 100)},
+        )
+
+        goal = memory.roam_goal_for(
+            UUID(int=202),
+            (0, 0),
+            (0, 0),
+            set(),
+        )
+
+        self.assertIn(goal, {(25, 21), (29, 25), (25, 29), (21, 25)})
+
+    def test_roaming_ranger_can_reposition_in_diagonal_area(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(202, UnitType.VANGUARD, (25, 24)),
+            controlled_unit(203, UnitType.RANGER, (0, 2)),
+            controlled_unit(204, UnitType.RANGER, (25, 25)),
+        ]
+        enemies = [enemy_unit(401, UnitType.VANGUARD, (28, 25))]
+        memory = agent.AgentMemory(known_obstacles={(27, 25)})
+
+        plan, actions, _ = self.plan(
+            make_turn(units, enemies=enemies),
+            memory,
+        )
+
+        self.assertTrue(hasattr(plan.unit_actions[UUID(int=204)], "direction"))
+        self.assertTrue(any("roam-aim" in action for action in actions))
+
     def test_home_patrol_move_stays_inside_seven_by_seven_square(self):
         units = [
             controlled_unit(201, UnitType.VANGUARD, (0, 0)),
