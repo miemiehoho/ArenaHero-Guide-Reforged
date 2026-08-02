@@ -20,6 +20,7 @@ from arena_hero import (
     AuthenticationError,
     ConfigurationError,
     CoreState,
+    CoreView,
     Direction,
     InvalidActionError,
     PlayerStatus,
@@ -28,7 +29,7 @@ from arena_hero import (
     UnitView,
     UnitType,
 )
-from arena_hero.turn import Ranger, Turn, Vanguard, Worker
+from arena_hero.turn import Core, Ranger, Turn, Vanguard, Worker
 
 
 Pos = tuple[int, int]
@@ -86,7 +87,13 @@ ROAM_VANGUARDS_PER_RANGER = 2
 # 19 是无需维护费的最后一个人口档；自动生产不得进入收费区间。
 # 用户仍可通过手动计划显式增加人口。
 MAX_AUTO_POPULATION = 19
-UNIT_VISION_RADIUS = 5
+# 官方视野半径按对象类型分别计算；资源与敌方 Core 的过期清理共用这套规则。
+CORE_VISION_RADIUS = 5
+UNIT_VISION_RADII: dict[UnitType, int] = {
+    UnitType.WORKER: 3,
+    UnitType.VANGUARD: 4,
+    UnitType.RANGER: 5,
+}
 TEMPORARY_BLOCK_TICKS = 8
 RESOURCE_REASSIGN_MIN_GAIN = 4
 # 距离仍是资源匹配的主要成本，同时用历史负载打散连续任务。
@@ -107,6 +114,7 @@ LOG_PATH = os.path.join(
     "arena_core_agent.rotating.log",
 )
 
+
 def load_local_env() -> None:
     """读取项目目录下 .env 中简单的 KEY=VALUE 配置。"""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -122,7 +130,7 @@ def load_local_env() -> None:
                 if key and key not in os.environ:
                     os.environ[key] = value
     except FileNotFoundError:
-        pass
+        return
 
 
 def load_persistent_state() -> dict:
@@ -170,6 +178,80 @@ def chebyshev(a: Pos, b: Pos) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
 
+def supercover_line(start: Pos, target: Pos) -> tuple[Pos, ...]:
+    """返回整数 supercover 直线经过的格子，包含起点和终点。"""
+    x, y = start
+    target_x, target_y = target
+    delta_x = abs(target_x - x)
+    delta_y = abs(target_y - y)
+    step_x = 1 if target_x > x else -1
+    step_y = 1 if target_y > y else -1
+    covered = [(x, y)]
+    progressed_x = 0
+    progressed_y = 0
+
+    while progressed_x < delta_x or progressed_y < delta_y:
+        horizontal = (1 + 2 * progressed_x) * delta_y
+        vertical = (1 + 2 * progressed_y) * delta_x
+        if horizontal == vertical:
+            # 射线正好穿过格角时，两侧格子都算经过，然后进入对角格。
+            previous_x, previous_y = x, y
+            x += step_x
+            progressed_x += 1
+            covered.append((x, y))
+            covered.append((previous_x, previous_y + step_y))
+            y += step_y
+            progressed_y += 1
+            covered.append((x, y))
+        elif horizontal < vertical:
+            x += step_x
+            progressed_x += 1
+            covered.append((x, y))
+        else:
+            y += step_y
+            progressed_y += 1
+            covered.append((x, y))
+    return tuple(covered)
+
+
+def visible_from(
+    source: Pos,
+    target: Pos,
+    radius: int,
+    obstacles: set[Pos],
+) -> bool:
+    """按官方 Manhattan 半径和 supercover 障碍规则判断视野。"""
+    if manhattan(source, target) > radius:
+        return False
+    return not any(cell in obstacles for cell in supercover_line(source, target)[1:-1])
+
+
+def any_vision_source_sees(
+    target: Pos,
+    sources: tuple[tuple[Pos, int], ...],
+    obstacles: set[Pos],
+) -> bool:
+    return any(
+        visible_from(source, target, radius, obstacles)
+        for source, radius in sources
+    )
+
+
+def friendly_vision_sources(
+    core: Core | None,
+    units: Iterable[Worker | Vanguard | Ranger],
+) -> tuple[tuple[Pos, int], ...]:
+    """构造当前 Tick 存活己方 Core 与 Unit 的视野源。"""
+    sources: list[tuple[Pos, int]] = []
+    if core is not None:
+        sources.append((tuple(core.position), CORE_VISION_RADIUS))
+    for unit in units:
+        radius = UNIT_VISION_RADII.get(unit.unit_type)
+        if radius is not None:
+            sources.append((tuple(unit.position), radius))
+    return tuple(sources)
+
+
 def direction_between(start: Pos, end: Pos) -> Direction | None:
     delta = end[0] - start[0], end[1] - start[1]
     for direction, step in DIRECTION_STEPS:
@@ -185,7 +267,7 @@ def minimum_cost_resource_matching(
 ) -> list[tuple[UUID, Pos]]:
     """用最小成本为尽可能多的 Worker 匹配互不重复的资源。
 
-    Hungarian 匹配在 Worker 较多时仍保持多项式复杂度；旧的位掩码动态
+    匈牙利匹配在 Worker 较多时仍保持多项式复杂度；旧的位掩码动态
     规划会随已知资源数量指数增长。
     """
     ordered_workers = tuple(sorted(workers, key=lambda worker: str(worker.id)))
@@ -279,20 +361,32 @@ def minimum_cost_resource_matching(
     ]
 
 
+def ranger_line_distance(start: Pos, target: Pos) -> int | None:
+    """返回 Ranger 合法直线距离；非横竖或精确 45 度斜线返回 None。"""
+    delta_x = abs(target[0] - start[0])
+    delta_y = abs(target[1] - start[1])
+    if delta_x == 0 or delta_y == 0 or delta_x == delta_y:
+        return max(delta_x, delta_y)
+    return None
+
+
 def clear_ranger_shot(start: Pos, target: Pos, blockers: set[Pos]) -> bool:
-    """判断 Ranger 是否能沿横向或纵向无障碍射击目标。"""
-    if start[0] == target[0]:
-        distance = abs(start[1] - target[1])
-        step = (0, 1 if target[1] > start[1] else -1)
-    elif start[1] == target[1]:
-        distance = abs(start[0] - target[0])
-        step = (1 if target[0] > start[0] else -1, 0)
-    else:
+    """按 v0.8 规则判断 Ranger 是否能沿八方向无障碍射击目标。"""
+    distance = ranger_line_distance(start, target)
+    if distance is None or not 1 <= distance <= 3:
         return False
-    if not 1 <= distance <= 3:
-        return False
+    delta_x = target[0] - start[0]
+    delta_y = target[1] - start[1]
+    step = (
+        0 if delta_x == 0 else (1 if delta_x > 0 else -1),
+        0 if delta_y == 0 else (1 if delta_y > 0 else -1),
+    )
     return all(
-        (start[0] + step[0] * offset, start[1] + step[1] * offset) not in blockers
+        (
+            start[0] + step[0] * offset,
+            start[1] + step[1] * offset,
+        )
+        not in blockers
         for offset in range(1, distance)
     )
 
@@ -510,7 +604,7 @@ class AgentMemory:
                 try:
                     setattr(memory, attribute, UUID(raw_id))
                 except ValueError:
-                    pass
+                    continue
         raw_sectors = state.get("worker_sectors", {})
         if isinstance(raw_sectors, dict):
             for raw_id, sector in raw_sectors.items():
@@ -645,7 +739,8 @@ class AgentMemory:
     def observe_enemy_cores(
         self,
         visible_enemies,
-        friendly_positions,
+        vision_sources: tuple[tuple[Pos, int], ...],
+        obstacles: set[Pos],
         tick: int,
     ) -> bool:
         before = dict(self.known_enemy_cores)
@@ -661,10 +756,7 @@ class AgentMemory:
         for enemy_id, (position, _) in list(self.known_enemy_cores.items()):
             if enemy_id in visible_core_ids:
                 continue
-            if any(
-                manhattan(position, friendly) <= UNIT_VISION_RADIUS
-                for friendly in friendly_positions
-            ):
+            if any_vision_source_sees(position, vision_sources, obstacles):
                 self.known_enemy_cores.pop(enemy_id, None)
         return self.known_enemy_cores != before
 
@@ -748,7 +840,8 @@ class AgentMemory:
         self,
         visible_resources: set[Pos],
         workers,
-        friendly_positions: tuple[Pos, ...],
+        vision_sources: tuple[tuple[Pos, int], ...],
+        obstacles: set[Pos],
         events,
     ) -> bool:
         """合并资源目击，并由任意进入视野的友军确认资源消失。"""
@@ -777,10 +870,7 @@ class AgentMemory:
 
         self.known_resources.update(visible_resources)
         for resource in tuple(self.known_resources - visible_resources):
-            if not any(
-                manhattan(resource, friendly) <= UNIT_VISION_RADIUS
-                for friendly in friendly_positions
-            ):
+            if not any_vision_source_sees(resource, vision_sources, obstacles):
                 continue
 
             self.known_resources.discard(resource)
@@ -870,7 +960,6 @@ class AgentMemory:
             if worker is None or worker.cargo > 0:
                 self.worker_resource_target.pop(worker_id, None)
                 continue
-            position = tuple(worker.position)
             if (
                 tick < self.retreat_until.get(worker_id, 0)
                 or resource not in known_resources
@@ -1088,6 +1177,7 @@ class PlanningContext:
     visible_resources: set[Pos]
     visible_enemy_unit_cells: set[Pos]
     known_enemy_core_cells: set[Pos]
+    visible_enemy_cores: tuple[CoreView, ...]
     combat_enemies: tuple[UnitView, ...]
     home_combat_targets: tuple[UnitView, ...]
     home_enemy_units: tuple[UnitView, ...]
@@ -1104,6 +1194,53 @@ class PlanningContext:
     roam_target_id: UUID | None
     blocker_worker_id: UUID | None
     actions: list[str]
+
+
+def visible_roam_core_for(
+    context: PlanningContext,
+    position: Pos,
+) -> CoreView | None:
+    """激进期选择当前巡逻方形内最近的可见敌方 Core。"""
+    if not context.roam_is_aggressive:
+        return None
+    candidates = tuple(
+        core
+        for core in context.visible_enemy_cores
+        if chebyshev(context.core_pos, tuple(core.position)) <= ROAM_RADIUS
+    )
+    return min(
+        candidates,
+        key=lambda core: (manhattan(position, tuple(core.position)), str(core.id)),
+        default=None,
+    )
+
+
+def roam_core_reacquire_goal(
+    context: PlanningContext,
+    position: Pos,
+) -> Pos | None:
+    """Core 离开视野后，前往最后目击点外围重新获取视野。"""
+    if not context.roam_is_aggressive or context.visible_enemy_cores:
+        return None
+    obstacles = (
+        context.navigation_obstacles
+        | context.known_enemy_core_cells
+        | context.visible_enemy_unit_cells
+    )
+    candidates: list[Pos] = []
+    for enemy_position, _ in context.memory.known_enemy_cores.values():
+        for offset in ((0, -4), (4, 0), (0, 4), (-4, 0)):
+            candidate = add(enemy_position, offset)
+            if (
+                chebyshev(context.core_pos, candidate) <= ROAM_RADIUS
+                and candidate not in obstacles
+            ):
+                candidates.append(candidate)
+    return min(
+        candidates,
+        key=lambda candidate: (manhattan(position, candidate), candidate),
+        default=None,
+    )
 
 
 def plan_workers(context: PlanningContext) -> None:
@@ -1387,6 +1524,51 @@ def plan_vanguards(context: PlanningContext) -> None:
                         )
                         continue
 
+            core_target = visible_roam_core_for(context, position)
+            if core_target is not None:
+                core_position = tuple(core_target.position)
+                if manhattan(position, core_position) == 1:
+                    direction = direction_between(position, core_position)
+                    if direction is not None:
+                        vanguard.sweep(direction)
+                        occupied.add(position)
+                        actions.append(
+                            f"{str(vanguard.id)[:8]} roam-core-sweep {direction.value}"
+                        )
+                        continue
+
+                core_approach_cells = sorted(
+                    (
+                        add(core_position, delta)
+                        for _, delta in DIRECTION_STEPS
+                        if add(core_position, delta) not in combat_navigation_obstacles
+                        and add(core_position, delta) not in occupied
+                    ),
+                    key=lambda cell: (manhattan(position, cell), cell),
+                )
+                for approach in core_approach_cells:
+                    destination = first_step_astar(
+                        position,
+                        approach,
+                        combat_navigation_obstacles,
+                        occupied | {core_position},
+                    )
+                    if destination is None or destination in occupied:
+                        continue
+                    direction = direction_between(position, destination)
+                    if direction is None:
+                        continue
+                    vanguard.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(vanguard.id)[:8]} roam-core {direction.value}"
+                    )
+                    break
+                else:
+                    core_target = None
+                if core_target is not None:
+                    continue
+
             target_enemy = None
             target_position: Pos | None = None
             can_engage_combat = nearby_combat_enemies and (
@@ -1502,12 +1684,14 @@ def plan_vanguards(context: PlanningContext) -> None:
                     actions.append(f"{str(vanguard.id)[:8]} roam-hunt-wait")
                 continue
 
-            patrol_goal = memory.roam_goal_for(
-                vanguard.id,
-                context.core_pos,
-                position,
-                memory.known_obstacles | context.known_enemy_core_cells,
-            )
+            patrol_goal = roam_core_reacquire_goal(context, position)
+            if patrol_goal is None:
+                patrol_goal = memory.roam_goal_for(
+                    vanguard.id,
+                    context.core_pos,
+                    position,
+                    memory.known_obstacles | context.known_enemy_core_cells,
+                )
             destination = first_step_astar(
                 position,
                 patrol_goal,
@@ -1644,7 +1828,7 @@ def plan_rangers(context: PlanningContext) -> None:
     occupied = context.occupied
     actions = context.actions
 
-    # v0.7 中 Unit 和 Core 不阻挡射线；移动仍要避让实体和临时占位。
+    # v0.8 中 Unit 和 Core 不阻挡八方向射线；移动仍要避让实体和临时占位。
     ranger_navigation_obstacles = (
         memory.known_obstacles
         | context.known_enemy_core_cells
@@ -1698,6 +1882,75 @@ def plan_rangers(context: PlanningContext) -> None:
                         )
                         continue
 
+            core_target = visible_roam_core_for(context, position)
+            if core_target is not None:
+                core_position = tuple(core_target.position)
+                if clear_ranger_shot(
+                    position,
+                    core_position,
+                    ranger_shot_blockers,
+                ):
+                    ranger.shoot(core_target)
+                    occupied.add(position)
+                    actions.append(
+                        f"{str(ranger.id)[:8]} roam-core-shoot"
+                    )
+                    continue
+
+                # 被障碍物挡住或尚未进入射程时，寻找八方向合法开火位。
+                core_firing_cells: list[tuple[int, int, Pos]] = []
+                for delta in SCOUT_VECTORS:
+                    for distance in range(1, 4):
+                        cell = (
+                            core_position[0] - delta[0] * distance,
+                            core_position[1] - delta[1] * distance,
+                        )
+                        movement_blockers = (
+                            ranger_navigation_obstacles
+                            | occupied.occupied_cells()
+                            | visible_entity_cells
+                        ) - {core_position, cell}
+                        if (
+                            chebyshev(cell, context.core_pos) <= ROAM_RADIUS
+                            and cell not in movement_blockers
+                            and clear_ranger_shot(
+                                cell,
+                                core_position,
+                                ranger_shot_blockers,
+                            )
+                        ):
+                            core_firing_cells.append(
+                                (
+                                    abs(distance - 3),
+                                    manhattan(position, cell),
+                                    cell,
+                                )
+                            )
+
+                for _, _, firing_cell in sorted(core_firing_cells):
+                    destination = first_step_astar(
+                        position,
+                        firing_cell,
+                        ranger_navigation_obstacles
+                        | context.visible_enemy_unit_cells,
+                        set(occupied),
+                    )
+                    if destination is None or destination in occupied:
+                        continue
+                    direction = direction_between(position, destination)
+                    if direction is None:
+                        continue
+                    ranger.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(ranger.id)[:8]} roam-core-aim {direction.value}"
+                    )
+                    break
+                else:
+                    core_target = None
+                if core_target is not None:
+                    continue
+
             can_engage_combat = nearby_combat_enemies and (
                 len(local_roaming_allies) > len(nearby_combat_enemies)
                 or (
@@ -1739,7 +1992,10 @@ def plan_rangers(context: PlanningContext) -> None:
                     shootable_roaming,
                     key=lambda enemy: (
                         enemy.unit_type is UnitType.WORKER,
-                        abs(manhattan(position, tuple(enemy.position)) - 3),
+                        abs(
+                            (ranger_line_distance(position, tuple(enemy.position)) or 0)
+                            - 3
+                        ),
                     ),
                 )
                 ranger.shoot(target_enemy)
@@ -1754,7 +2010,7 @@ def plan_rangers(context: PlanningContext) -> None:
             firing_cells: list[tuple[int, int, Pos]] = []
             for enemy in roaming_targets:
                 target_position = tuple(enemy.position)
-                for _, delta in DIRECTION_STEPS:
+                for delta in SCOUT_VECTORS:
                     for distance in range(1, 4):
                         cell = (
                             target_position[0] - delta[0] * distance,
@@ -1804,12 +2060,14 @@ def plan_rangers(context: PlanningContext) -> None:
             if moved:
                 continue
 
-            patrol_goal = memory.roam_goal_for(
-                ranger.id,
-                context.core_pos,
-                position,
-                memory.known_obstacles | context.known_enemy_core_cells,
-            )
+            patrol_goal = roam_core_reacquire_goal(context, position)
+            if patrol_goal is None:
+                patrol_goal = memory.roam_goal_for(
+                    ranger.id,
+                    context.core_pos,
+                    position,
+                    memory.known_obstacles | context.known_enemy_core_cells,
+                )
             destination = first_step_astar(
                 position,
                 patrol_goal,
@@ -1845,8 +2103,11 @@ def plan_rangers(context: PlanningContext) -> None:
             shootable,
             key=lambda enemy: (
                 enemy.unit_type is UnitType.WORKER,
-                abs(manhattan(position, tuple(enemy.position)) - 3),
-                -manhattan(position, tuple(enemy.position)),
+                abs(
+                    (ranger_line_distance(position, tuple(enemy.position)) or 0)
+                    - 3
+                ),
+                -(ranger_line_distance(position, tuple(enemy.position)) or 0),
             ),
             default=None,
         )
@@ -1861,7 +2122,7 @@ def plan_rangers(context: PlanningContext) -> None:
         firing_cells: list[tuple[int, int, int, Pos]] = []
         for enemy in context.home_enemy_units:
             target_position = tuple(enemy.position)
-            for _, delta in DIRECTION_STEPS:
+            for delta in SCOUT_VECTORS:
                 for distance in range(1, 4):
                     cell = (
                         target_position[0] - delta[0] * distance,
@@ -2104,6 +2365,7 @@ def plan_turn(
     memory.observe_worker_harvests(turn.events, workers)
     memory.sync_ranger_coverage(bool(turn.rangers), workers)
     friendly_positions = tuple(tuple(unit.position) for unit in turn.units)
+    vision_sources = friendly_vision_sources(turn.core, turn.units)
     visible_resources: set[Pos] = {tuple(position) for position in turn.resource_cells}
     obstacle_resource_conflicts = memory.known_resources & memory.known_obstacles
     resources_changed = bool(obstacle_resource_conflicts)
@@ -2118,10 +2380,14 @@ def plan_turn(
         memory.observe_resources(
             visible_resources,
             workers,
-            friendly_positions,
+            vision_sources,
+            memory.known_obstacles,
             turn.events,
         )
         or resources_changed
+    )
+    visible_enemy_cores = tuple(
+        enemy for enemy in turn.visible_enemies if enemy.kind == "CORE"
     )
     combat_enemies = tuple(
         enemy
@@ -2141,7 +2407,8 @@ def plan_turn(
     }
     enemy_cores_changed = memory.observe_enemy_cores(
         turn.visible_enemies,
-        friendly_positions,
+        vision_sources,
+        memory.known_obstacles,
         turn.tick,
     )
     memory.observe_enemy_workers(turn.visible_enemies, turn.tick)
@@ -2170,7 +2437,7 @@ def plan_turn(
     known_enemy_core_cells = {
         position for position, _ in memory.known_enemy_cores.values()
     }
-    # 从共同目标源排除与敌方 Core 同格的单位，确保所有分支都不会误伤 Core。
+    # 普通 Unit 目标排除与敌方 Core 同格的单位；激进巡逻会单独把 Core 作为目标。
     safe_enemy_units = tuple(
         enemy
         for enemy in turn.visible_enemies
@@ -2324,6 +2591,7 @@ def plan_turn(
         visible_resources=visible_resources,
         visible_enemy_unit_cells=visible_enemy_unit_cells,
         known_enemy_core_cells=known_enemy_core_cells,
+        visible_enemy_cores=visible_enemy_cores,
         combat_enemies=combat_enemies,
         home_combat_targets=home_combat_targets,
         home_enemy_units=home_enemy_units,

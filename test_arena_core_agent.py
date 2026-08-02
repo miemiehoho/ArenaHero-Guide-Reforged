@@ -192,6 +192,65 @@ class ResourceTests(AgentTestCase):
 
         self.assertIn(resource, memory.known_resources)
 
+    def test_worker_and_vanguard_use_their_own_vision_radius(self):
+        worker_resource = (4, 0)
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0))
+        worker_memory = agent.AgentMemory(known_resources={worker_resource})
+        self.plan(
+            make_turn([worker], core_position=(20, 0)),
+            worker_memory,
+        )
+        self.assertIn(worker_resource, worker_memory.known_resources)
+
+        vanguard_resource = (5, 0)
+        vanguard = controlled_unit(200, UnitType.VANGUARD, (0, 0))
+        vanguard_memory = agent.AgentMemory(known_resources={vanguard_resource})
+        self.plan(
+            make_turn([vanguard], core_position=(20, 0)),
+            vanguard_memory,
+        )
+        self.assertIn(vanguard_resource, vanguard_memory.known_resources)
+
+    def test_ranger_and_core_vision_can_confirm_missing_resource(self):
+        ranger_resource = (5, 0)
+        ranger = controlled_unit(200, UnitType.RANGER, (0, 0))
+        ranger_memory = agent.AgentMemory(known_resources={ranger_resource})
+        self.plan(
+            make_turn([ranger], core_position=(20, 0)),
+            ranger_memory,
+        )
+        self.assertNotIn(ranger_resource, ranger_memory.known_resources)
+
+        core_resource = (5, 0)
+        core_memory = agent.AgentMemory(known_resources={core_resource})
+        self.plan(
+            make_turn([], core_position=(0, 0)),
+            core_memory,
+        )
+        self.assertNotIn(core_resource, core_memory.known_resources)
+
+    def test_obstacle_blocks_resource_disappearance_confirmation(self):
+        resource = (2, 2)
+        ranger = controlled_unit(200, UnitType.RANGER, (0, 0))
+        memory = agent.AgentMemory(
+            known_resources={resource},
+            known_obstacles={(1, 0)},
+        )
+
+        self.plan(make_turn([ranger], core_position=(20, 0)), memory)
+
+        self.assertIn(resource, memory.known_resources)
+
+    def test_core_visibility_cleans_stale_enemy_core_with_no_units(self):
+        enemy_id = UUID(int=400)
+        memory = agent.AgentMemory(
+            known_enemy_cores={enemy_id: ((5, 0), 99)},
+        )
+
+        self.plan(make_turn([], core_position=(0, 0)), memory)
+
+        self.assertNotIn(enemy_id, memory.known_enemy_cores)
+
 
 class ProductionTests(AgentTestCase):
     """基础生产顺序和自动人口上限。"""
@@ -429,7 +488,18 @@ class PressureProductionTests(AgentTestCase):
 
 
 class RangerCombatTests(AgentTestCase):
-    """Ranger 的 v0.7 射线规则。"""
+    """Ranger 的 v0.8 八方向射线规则。"""
+
+    def test_ranger_diagonal_shot_geometry(self):
+        self.assertTrue(agent.clear_ranger_shot((0, 0), (2, 2), set()))
+        self.assertTrue(
+            agent.clear_ranger_shot((0, 0), (2, 2), {(1, 0)})
+        )
+        self.assertFalse(
+            agent.clear_ranger_shot((0, 0), (2, 2), {(1, 1)})
+        )
+        self.assertFalse(agent.clear_ranger_shot((0, 0), (2, 1), set()))
+        self.assertFalse(agent.clear_ranger_shot((0, 0), (4, 4), set()))
 
     def test_ranger_shoots_through_friendly_unit_and_enemy_core(self):
         units = [
@@ -503,6 +573,84 @@ class CombatTests(AgentTestCase):
         turn = make_turn(units, enemies=[enemy_core(400, (1, 0))])
         plan, _, _ = self.plan(turn)
         self.assertNotIsInstance(plan.unit_actions[UUID(int=201)], SweepAction)
+
+    def test_aggressive_roaming_vanguard_sweeps_visible_core(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 0)),
+            controlled_unit(202, UnitType.VANGUARD, (1, 2)),
+            controlled_unit(203, UnitType.VANGUARD, (6, 0)),
+            controlled_unit(204, UnitType.RANGER, (0, 1)),
+            controlled_unit(205, UnitType.RANGER, (0, 3)),
+        ]
+        memory = agent.AgentMemory(
+            home_vanguard_id=UUID(int=201),
+            home_ranger_id=UUID(int=204),
+        )
+        plan, actions, _ = self.plan(
+            make_turn(units, enemies=[enemy_core(400, (2, 2))]),
+            memory,
+        )
+
+        self.assertIsInstance(
+            plan.unit_actions[UUID(int=202)],
+            SweepAction,
+        )
+        self.assertTrue(any("roam-core-sweep" in action for action in actions))
+
+    def test_aggressive_roaming_ranger_prioritizes_visible_core(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(202, UnitType.VANGUARD, (6, 0)),
+            controlled_unit(203, UnitType.VANGUARD, (6, 1)),
+            controlled_unit(204, UnitType.RANGER, (1, 0)),
+            controlled_unit(205, UnitType.RANGER, (0, 0)),
+        ]
+        memory = agent.AgentMemory(
+            home_vanguard_id=UUID(int=201),
+            home_ranger_id=UUID(int=204),
+        )
+        core = enemy_core(400, (2, 2))
+        plan, actions, _ = self.plan(
+            make_turn(
+                units,
+                enemies=[core, enemy_unit(401, UnitType.VANGUARD, (2, 2))],
+            ),
+            memory,
+        )
+
+        ranger_action = plan.unit_actions[UUID(int=205)]
+        self.assertIsInstance(ranger_action, ShootAction)
+        self.assertEqual(ranger_action.target_id, core.id)
+        self.assertTrue(any("roam-core-shoot" in action for action in actions))
+
+    def test_aggressive_core_priority_keeps_outnumbered_retreat(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 0)),
+            controlled_unit(202, UnitType.VANGUARD, (1, 2)),
+            controlled_unit(203, UnitType.VANGUARD, (6, 0)),
+            controlled_unit(204, UnitType.RANGER, (0, 1)),
+            controlled_unit(205, UnitType.RANGER, (0, 3)),
+        ]
+        enemies = [
+            enemy_core(400, (2, 2)),
+            enemy_unit(401, UnitType.VANGUARD, (1, 1)),
+            enemy_unit(402, UnitType.VANGUARD, (1, 3)),
+            enemy_unit(403, UnitType.RANGER, (2, 1)),
+            enemy_unit(404, UnitType.RANGER, (2, 3)),
+        ]
+        memory = agent.AgentMemory(
+            home_vanguard_id=UUID(int=201),
+            home_ranger_id=UUID(int=204),
+        )
+
+        plan, actions, _ = self.plan(make_turn(units, enemies=enemies), memory)
+
+        self.assertNotIsInstance(
+            plan.unit_actions[UUID(int=202)],
+            SweepAction,
+        )
+        self.assertFalse(any("roam-core" in action for action in actions))
+        self.assertTrue(any("roam-retreat" in action for action in actions))
 
     def test_unit_sharing_enemy_core_cell_is_not_attacked(self):
         units = [
