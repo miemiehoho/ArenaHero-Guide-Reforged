@@ -2238,7 +2238,8 @@ def plan_turn(
         candidate_tracks = [
             (enemy_id, track)
             for enemy_id, track in memory.enemy_worker_tracks.items()
-            if manhattan(core_pos, track.position) <= ROAM_RADIUS
+            # 巡逻边界是以 Core 为中心的方形；对角区域不能按曼哈顿距离误判为越界。
+            if chebyshev(core_pos, track.position) <= ROAM_RADIUS
             and manhattan(track.first_seen_position, track.position) <= ROAM_CHASE_STEPS
             and (
                 roam_is_aggressive

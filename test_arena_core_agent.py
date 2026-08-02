@@ -527,6 +527,19 @@ class CombatTests(AgentTestCase):
         plan, _, _ = self.plan(make_turn(units, enemies=enemies))
         self.assertIsInstance(plan.unit_actions[UUID(int=202)], SweepAction)
 
+    def test_static_worker_in_diagonal_roam_area_is_not_filtered_out(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(202, UnitType.VANGUARD, (25, 25)),
+            controlled_unit(203, UnitType.RANGER, (1, 0)),
+        ]
+        enemies = [enemy_unit(401, UnitType.WORKER, (26, 25))]
+
+        plan, actions, _ = self.plan(make_turn(units, enemies=enemies))
+
+        self.assertIsInstance(plan.unit_actions[UUID(int=202)], SweepAction)
+        self.assertTrue(any("roam-sweep WORKER" in action for action in actions))
+
     def test_home_patrol_move_stays_inside_seven_by_seven_square(self):
         units = [
             controlled_unit(201, UnitType.VANGUARD, (0, 0)),
