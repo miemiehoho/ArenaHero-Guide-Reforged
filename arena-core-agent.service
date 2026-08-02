@@ -1,0 +1,16 @@
+[Unit]
+Description=Arena Hero long-term control agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/lingling/work/my_game/game1_ArenaHero_from_LD
+EnvironmentFile=/home/lingling/work/my_game/game1_ArenaHero_from_LD/.env
+ExecStart=/home/lingling/work/my_game/game1_ArenaHero_from_LD/.venv/bin/python -u /home/lingling/work/my_game/game1_ArenaHero_from_LD/arena_core_agent.py --mode control
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

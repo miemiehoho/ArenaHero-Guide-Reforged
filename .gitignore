@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+arena_core_agent*.log*
+.arena_core_state.json
+.arena_core_state.json.tmp
