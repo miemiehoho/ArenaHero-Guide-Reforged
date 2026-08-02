@@ -169,6 +169,29 @@ class ResourceTests(AgentTestCase):
         self.assertFalse(occupancy.can_enter((1, 1)))
         self.assertIn((1, 1), occupancy.full_cells())
 
+    def test_any_friendly_unit_confirms_missing_resource_in_vision(self):
+        resource = (5, 0)
+        owner = controlled_unit(100, UnitType.WORKER, (20, 0))
+        ranger = controlled_unit(200, UnitType.RANGER, (0, 0))
+        memory = agent.AgentMemory(
+            known_resources={resource},
+            worker_resource_target={owner.id: resource},
+        )
+
+        self.plan(make_turn([owner, ranger]), memory)
+
+        self.assertNotIn(resource, memory.known_resources)
+        self.assertNotIn(owner.id, memory.worker_resource_target)
+
+    def test_resource_outside_all_friendly_vision_is_preserved(self):
+        resource = (6, 0)
+        ranger = controlled_unit(200, UnitType.RANGER, (0, 0))
+        memory = agent.AgentMemory(known_resources={resource})
+
+        self.plan(make_turn([ranger]), memory)
+
+        self.assertIn(resource, memory.known_resources)
+
 
 class ProductionTests(AgentTestCase):
     """基础生产顺序和自动人口上限。"""

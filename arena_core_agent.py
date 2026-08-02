@@ -88,8 +88,6 @@ ROAM_VANGUARDS_PER_RANGER = 2
 MAX_AUTO_POPULATION = 19
 UNIT_VISION_RADIUS = 5
 TEMPORARY_BLOCK_TICKS = 8
-RESOURCE_CONFIRM_RADIUS = 0
-RESOURCE_MISSING_CONFIRM_TICKS = 2
 RESOURCE_REASSIGN_MIN_GAIN = 4
 # 距离仍是资源匹配的主要成本，同时用历史负载打散连续任务。
 RESOURCE_DISTANCE_COST = 10
@@ -482,7 +480,6 @@ class AgentMemory:
     worker_harvests: dict[UUID, int] = field(default_factory=dict)
     expanded_low_yield: set[UUID] = field(default_factory=set)
     worker_resource_target: dict[UUID, Pos] = field(default_factory=dict)
-    resource_missing_confirmations: dict[Pos, int] = field(default_factory=dict)
     resource_deferred_until: dict[Pos, int] = field(default_factory=dict)
     worker_intercept_goal: dict[UUID, tuple[Pos, int]] = field(default_factory=dict)
 
@@ -751,14 +748,10 @@ class AgentMemory:
         self,
         visible_resources: set[Pos],
         workers,
-        occupied_enemy_cells: set[Pos],
+        friendly_positions: tuple[Pos, ...],
         events,
     ) -> bool:
-        """合并资源目击，并保守确认已经消失的资源标记。
-
-        只有负责该资源的 Worker 连续两个 Tick 站在资源格上，才能确认资源
-        消失。路过的 Ranger 或其他 Worker 不能删除标记；敌方占位时暂停确认。
-        """
+        """合并资源目击，并由任意进入视野的友军确认资源消失。"""
         before = set(self.known_resources)
         worker_by_id = {worker.id: worker for worker in workers}
 
@@ -777,42 +770,23 @@ class AgentMemory:
                     harvested = tuple(worker.position)
             if harvested is not None:
                 self.known_resources.discard(harvested)
-                self.resource_missing_confirmations.pop(harvested, None)
                 self.resource_deferred_until.pop(harvested, None)
                 for worker_id, resource in list(self.worker_resource_target.items()):
                     if resource == harvested:
                         self.worker_resource_target.pop(worker_id, None)
 
         self.known_resources.update(visible_resources)
-        for resource in visible_resources:
-            self.resource_missing_confirmations.pop(resource, None)
-
-        claim_owner = {
-            resource: worker_id
-            for worker_id, resource in self.worker_resource_target.items()
-        }
         for resource in tuple(self.known_resources - visible_resources):
-            worker_id = claim_owner.get(resource)
-            worker = worker_by_id.get(worker_id)
-            can_confirm = (
-                worker is not None
-                and worker.cargo == 0
-                and not any(
-                    manhattan(enemy_cell, resource) <= 1
-                    for enemy_cell in occupied_enemy_cells
-                )
-                and manhattan(tuple(worker.position), resource)
-                <= RESOURCE_CONFIRM_RADIUS
-            )
-            if not can_confirm:
-                self.resource_missing_confirmations.pop(resource, None)
+            if not any(
+                manhattan(resource, friendly) <= UNIT_VISION_RADIUS
+                for friendly in friendly_positions
+            ):
                 continue
-            confirmations = self.resource_missing_confirmations.get(resource, 0) + 1
-            self.resource_missing_confirmations[resource] = confirmations
-            if confirmations >= RESOURCE_MISSING_CONFIRM_TICKS:
-                self.known_resources.discard(resource)
-                self.resource_missing_confirmations.pop(resource, None)
-                if worker_id is not None:
+
+            self.known_resources.discard(resource)
+            self.resource_deferred_until.pop(resource, None)
+            for worker_id, target in list(self.worker_resource_target.items()):
+                if target == resource:
                     self.worker_resource_target.pop(worker_id, None)
         return self.known_resources != before
 
@@ -2129,27 +2103,22 @@ def plan_turn(
     sectors_changed = sectors_changed or memory.worker_sector != sectors_before
     memory.observe_worker_harvests(turn.events, workers)
     memory.sync_ranger_coverage(bool(turn.rangers), workers)
+    friendly_positions = tuple(tuple(unit.position) for unit in turn.units)
     visible_resources: set[Pos] = {tuple(position) for position in turn.resource_cells}
     obstacle_resource_conflicts = memory.known_resources & memory.known_obstacles
     resources_changed = bool(obstacle_resource_conflicts)
     if obstacle_resource_conflicts:
         memory.known_resources.difference_update(obstacle_resource_conflicts)
         for resource in obstacle_resource_conflicts:
-            memory.resource_missing_confirmations.pop(resource, None)
             memory.resource_deferred_until.pop(resource, None)
         for worker_id, resource in list(memory.worker_resource_target.items()):
             if resource in obstacle_resource_conflicts:
                 memory.worker_resource_target.pop(worker_id, None)
-    visible_enemy_cells = {
-        tuple(enemy.position)
-        for enemy in turn.visible_enemies
-        if enemy.kind in {"UNIT", "CORE"}
-    }
     resources_changed = (
         memory.observe_resources(
             visible_resources,
             workers,
-            visible_enemy_cells,
+            friendly_positions,
             turn.events,
         )
         or resources_changed
@@ -2170,7 +2139,6 @@ def plan_turn(
         for enemy_id, sighting in memory.known_combat_threats.items()
         if sighting[1] >= turn.tick - COMBAT_THREAT_MEMORY_TICKS
     }
-    friendly_positions = tuple(tuple(unit.position) for unit in turn.units)
     enemy_cores_changed = memory.observe_enemy_cores(
         turn.visible_enemies,
         friendly_positions,
@@ -2495,8 +2463,6 @@ def main() -> int:
                         f"known_resources={len(memory.known_resources)} "
                         f"resource_targets={len(memory.worker_resource_target)} "
                         f"target_map=[{target_summary}] "
-                        f"resource_confirmations="
-                        f"{len(memory.resource_missing_confirmations)} "
                         f"resource_deferred={len(memory.resource_deferred_until)} "
                         f"temporary_blocks={len(memory.temporary_blocked_cells)} "
                         f"expanded_low_yield="
