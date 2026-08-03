@@ -12,6 +12,7 @@ from arena_hero import (
     CoreView,
     PlayerState,
     PlayerStatus,
+    ResolutionEvent,
     TerrainView,
     UnitType,
     UnitView,
@@ -745,10 +746,10 @@ class CombatTests(AgentTestCase):
     def test_static_worker_in_diagonal_roam_area_is_not_filtered_out(self):
         units = [
             controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (25, 25)),
+            controlled_unit(202, UnitType.VANGUARD, (20, 20)),
             controlled_unit(203, UnitType.RANGER, (1, 0)),
         ]
-        enemies = [enemy_unit(401, UnitType.WORKER, (26, 25))]
+        enemies = [enemy_unit(401, UnitType.WORKER, (21, 20))]
 
         plan, actions, _ = self.plan(make_turn(units, enemies=enemies))
 
@@ -757,7 +758,7 @@ class CombatTests(AgentTestCase):
 
     def test_enemy_core_diagonal_outskirts_are_valid_roam_goals(self):
         memory = agent.AgentMemory(
-            known_enemy_cores={UUID(int=400): ((25, 25), 100)},
+            known_enemy_cores={UUID(int=400): ((20, 20), 100)},
         )
 
         goal = memory.roam_goal_for(
@@ -767,17 +768,17 @@ class CombatTests(AgentTestCase):
             set(),
         )
 
-        self.assertIn(goal, {(25, 21), (29, 25), (25, 29), (21, 25)})
+        self.assertIn(goal, {(20, 16), (24, 20), (20, 24), (16, 20)})
 
     def test_roaming_ranger_can_reposition_in_diagonal_area(self):
         units = [
             controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (25, 24)),
+            controlled_unit(202, UnitType.VANGUARD, (20, 19)),
             controlled_unit(203, UnitType.RANGER, (0, 2)),
-            controlled_unit(204, UnitType.RANGER, (25, 25)),
+            controlled_unit(204, UnitType.RANGER, (20, 20)),
         ]
-        enemies = [enemy_unit(401, UnitType.VANGUARD, (28, 25))]
-        memory = agent.AgentMemory(known_obstacles={(27, 25)})
+        enemies = [enemy_unit(401, UnitType.VANGUARD, (23, 20))]
+        memory = agent.AgentMemory(known_obstacles={(22, 20)})
 
         plan, actions, _ = self.plan(
             make_turn(units, enemies=enemies),
@@ -1075,18 +1076,18 @@ class ExpeditionTests(AgentTestCase):
             home_ranger_id=UUID(int=301),
         )
 
-    def test_expedition_launch_requires_nineteen_population_and_over_fifty(self):
+    def test_expedition_launch_requires_full_roster_and_eighty_resources(self):
         roster = self.full_roster()
         memory = self.role_memory()
-        self.plan(make_turn(roster[:-1], resources=51), memory)
+        self.plan(make_turn(roster[:-1], resources=80), memory)
         self.assertFalse(memory.expedition_active)
 
         memory = self.role_memory()
-        self.plan(make_turn(roster, resources=50), memory)
+        self.plan(make_turn(roster, resources=79), memory)
         self.assertFalse(memory.expedition_active)
 
         memory = self.role_memory()
-        _, actions, memory = self.plan(make_turn(roster, resources=51), memory)
+        _, actions, memory = self.plan(make_turn(roster, resources=80), memory)
         self.assertTrue(memory.expedition_active)
         self.assertEqual(len(memory.expedition_vanguard_ids), 2)
         self.assertEqual(len(memory.expedition_ranger_ids), 1)
@@ -1095,11 +1096,43 @@ class ExpeditionTests(AgentTestCase):
         self.assertTrue(any("expedition-" in action for action in actions))
 
         memory.expedition_returning = True
+        memory.expedition_cooldown_until = 400
         restored = agent.AgentMemory.restore(memory.persistent_state())
         self.assertEqual(restored.persistent_state()["version"], 4)
         self.assertEqual(restored.expedition_unit_ids, memory.expedition_unit_ids)
         self.assertEqual(restored.expedition_leader_id, memory.expedition_leader_id)
         self.assertTrue(restored.expedition_returning)
+        self.assertEqual(restored.expedition_cooldown_until, 400)
+
+    def test_home_combat_threat_blocks_expedition_launch(self):
+        enemy = enemy_unit(401, UnitType.VANGUARD, (18, 0))
+        memory = self.role_memory()
+
+        self.plan(
+            make_turn(self.full_roster(), enemies=[enemy], resources=80),
+            memory,
+        )
+
+        self.assertFalse(memory.expedition_active)
+
+    def test_roaming_units_respond_to_combat_threat_near_home(self):
+        units = [
+            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(202, UnitType.VANGUARD, (-10, 0)),
+            controlled_unit(301, UnitType.RANGER, (1, 0)),
+            controlled_unit(302, UnitType.RANGER, (-10, 2)),
+        ]
+        enemy = enemy_unit(401, UnitType.VANGUARD, (10, 0))
+
+        _, actions, _ = self.plan(
+            make_turn(units, enemies=[enemy]),
+            self.role_memory(),
+        )
+
+        response_actions = [
+            action for action in actions if "roam-home-response" in action
+        ]
+        self.assertEqual(len(response_actions), 2)
 
     def test_expedition_leader_waits_for_member_beyond_formation_radius(self):
         units = [
@@ -1336,7 +1369,7 @@ class ExpeditionTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[UUID(int=202)], MoveAction)
         self.assertTrue(any("beacon-keeper" in action for action in actions))
 
-    def test_dropped_beacon_near_home_uses_one_local_recovery_unit(self):
+    def test_dropped_beacon_near_home_is_not_picked_up(self):
         units = [
             *workers(8),
             controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
@@ -1358,14 +1391,15 @@ class ExpeditionTests(AgentTestCase):
             memory,
         )
 
-        self.assertTrue(memory.expedition_active)
-        self.assertTrue(memory.expedition_home_recovery)
-        self.assertEqual(memory.expedition_unit_ids, {UUID(int=202)})
-        self.assertIsInstance(
-            plan.unit_actions[UUID(int=202)],
-            PickupBeaconAction,
+        self.assertFalse(memory.expedition_active)
+        self.assertFalse(memory.expedition_home_recovery)
+        self.assertFalse(
+            any(
+                isinstance(action, PickupBeaconAction)
+                for action in plan.unit_actions.values()
+            )
         )
-        self.assertFalse(any("expedition reinforcement" in action for action in actions))
+        self.assertFalse(any("pickup-beacon" in action for action in actions))
 
     def test_ground_beacon_near_home_does_not_bypass_launch_threshold(self):
         units = self.full_roster()[:-1]
@@ -1389,7 +1423,7 @@ class ExpeditionTests(AgentTestCase):
             )
         )
 
-    def test_lost_home_beacon_relaunches_full_expedition_when_ready(self):
+    def test_legacy_home_recovery_state_allows_normal_launch_when_ready(self):
         units = self.full_roster()
         memory = self.role_memory()
         memory.expedition_active = True
@@ -1400,7 +1434,7 @@ class ExpeditionTests(AgentTestCase):
         plan, actions, memory = self.plan(
             make_turn(
                 units,
-                resources=60,
+                resources=80,
                 beacon_position=(4, 0),
                 beacon_status=BeaconStatus.GROUND,
             ),
@@ -1414,7 +1448,7 @@ class ExpeditionTests(AgentTestCase):
         self.assertIsNone(plan.core_action)
         self.assertTrue(any("expedition-" in action for action in actions))
 
-    def test_home_recovery_waits_for_launch_conditions_when_beacon_is_lost(self):
+    def test_legacy_home_recovery_state_clears_when_launch_is_not_ready(self):
         units = [
             controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
             controlled_unit(202, UnitType.VANGUARD, (4, 0)),
@@ -1442,44 +1476,32 @@ class ExpeditionTests(AgentTestCase):
         self.assertFalse(memory.expedition_home_recovery)
         self.assertEqual(memory.expedition_unit_ids, set())
 
-    def test_expedition_reinforcement_requires_sixty_resources(self):
+    def test_expedition_casualty_returns_survivors_and_starts_cooldown(self):
         units = [
             *workers(8),
             controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
             controlled_unit(202, UnitType.VANGUARD, (10, 0)),
             controlled_unit(204, UnitType.VANGUARD, (12, 0)),
             controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (10, 1)),
             controlled_unit(303, UnitType.RANGER, (12, 1)),
         ]
         memory = self.role_memory()
         memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202)}
+        memory.expedition_assembling = True
+        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
         memory.expedition_ranger_ids = {UUID(int=302)}
         memory.expedition_leader_id = UUID(int=202)
 
-        plan, actions, memory = self.plan(make_turn(units, resources=59), memory)
+        plan, actions, memory = self.plan(make_turn(units, resources=60), memory)
+
+        self.assertTrue(memory.expedition_returning)
+        self.assertFalse(memory.expedition_assembling)
+        self.assertEqual(memory.expedition_cooldown_until, 400)
+        self.assertIsInstance(plan.unit_actions[UUID(int=202)], MoveAction)
+        self.assertTrue(any("expedition-return" in action for action in actions))
         self.assertFalse(any("expedition reinforcement" in action for action in actions))
 
-        plan, actions, memory = self.plan(
-            make_turn(units, resources=60, tick=101),
-            memory,
-        )
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
-        self.assertTrue(any("expedition reinforcement" in action for action in actions))
-        self.assertNotIn(UUID(int=204), memory.expedition_unit_ids)
-
-        recruited_units = [
-            *units,
-            controlled_unit(999, UnitType.VANGUARD, (0, 1)),
-        ]
-        self.plan(make_turn(recruited_units, resources=50, tick=102), memory)
-        self.assertIn(UUID(int=999), memory.expedition_vanguard_ids)
-        self.assertIn(UUID(int=999), memory.expedition_reinforcement_ids)
-        self.assertNotIn(UUID(int=204), memory.expedition_unit_ids)
-
-    def test_fully_lost_expedition_rebuilds_from_core(self):
+    def test_fully_lost_expedition_resets_without_frontline_rebuild(self):
         units = [
             *workers(8),
             controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
@@ -1493,15 +1515,32 @@ class ExpeditionTests(AgentTestCase):
         memory.expedition_ranger_ids = {UUID(int=302)}
         memory.expedition_leader_id = UUID(int=202)
 
-        plan, actions, memory = self.plan(
+        _, actions, memory = self.plan(
             make_turn(units, resources=60),
             memory,
         )
 
-        self.assertTrue(memory.expedition_assembling)
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
-        self.assertTrue(any("expedition reinforcement" in action for action in actions))
+        self.assertFalse(memory.expedition_active)
+        self.assertEqual(memory.expedition_cooldown_until, 400)
+        self.assertFalse(any("expedition reinforcement" in action for action in actions))
+
+    def test_cell_unit_limit_starts_spawn_clearing_and_suppresses_production(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0))
+        event = ResolutionEvent(
+            event_id=UUID(int=900),
+            tick=100,
+            event_type="CORE_SPAWN_FAILED",
+            reason_code="CELL_UNIT_LIMIT",
+        )
+
+        plan, actions, memory = self.plan(
+            make_turn([worker], resources=10, events=[event]),
+        )
+
+        self.assertIsNone(plan.core_action)
+        self.assertEqual(memory.spawn_clear_until, 103)
+        self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
+        self.assertTrue(any("spawn-clear" in action for action in actions))
 
 
 class ExpeditionResourceTests(AgentTestCase):
