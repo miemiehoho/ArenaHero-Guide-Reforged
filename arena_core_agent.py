@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import heapq
-from itertools import combinations
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -19,7 +18,6 @@ from arena_hero import (
     ArenaHeroClient,
     ArenaHeroError,
     AuthenticationError,
-    BeaconStatus,
     ConfigurationError,
     CoreState,
     CoreView,
@@ -75,28 +73,19 @@ RESOURCE_MEMORY_RADIUS = 32
 ROAM_CHASE_STEPS = 8
 ROAM_TARGET_LOST_TICKS = 3
 ROAM_HELPER_RADIUS = 5
-MAX_EMERGENCY_VANGUARDS = 2
-CORE_PRESSURE_NUMERATOR = 9
-CORE_PRESSURE_DENOMINATOR = 10
 ROAM_AGGRESSIVE_SIZE = 3
 ROAM_CHASE_TICKS = 8
 ROAM_TRAP_CHASE_TICKS = 16
 ROAM_CHASE_COOLDOWN_TICKS = 12
 ROAM_TRAP_ALLY_RADIUS = 5
 ROAM_TRAP_MAX_EXITS = 2
-TARGET_WORKERS_CONTROL = 8
-TARGET_HOME_VANGUARDS = 1
-TARGET_ROAM_VANGUARDS = 1
-# 巡逻编成保持两个 Vanguard 配一个 Ranger，再继续补充 Ranger。
-ROAM_VANGUARDS_PER_RANGER = 2
-EXPEDITION_VANGUARDS = 2
-EXPEDITION_RANGERS = 1
-EXPEDITION_FORMATION_RADIUS = 5
-EXPEDITION_FOLLOW_DISTANCE = 2
-EXPEDITION_ENGAGE_RADIUS = 8
-EXPEDITION_CHASE_TICKS = 8
-EXPEDITION_LAUNCH_RESOURCES = 80
-EXPEDITION_COOLDOWN_TICKS = 300
+TARGET_WORKERS_CONTROL = 4
+SQUAD_VANGUARDS = 2
+SQUAD_RANGERS = 1
+SQUAD_FORMATION_RADIUS = 4
+SQUAD_FOLLOW_DISTANCE = 2
+ASSAULT_GATHER_RADIUS = 5
+ASSAULT_TARGET_MEMORY_TICKS = 6
 SPAWN_CLEAR_TICKS = 3
 # 19 是无需维护费的最后一个人口档；自动生产不得进入收费区间。
 # 用户仍可通过手动计划显式增加人口。
@@ -179,16 +168,6 @@ def decode_uuid(raw_value) -> UUID | None:
         return UUID(raw_value)
     except ValueError:
         return None
-
-
-def decode_uuids(raw_values) -> set[UUID]:
-    if not isinstance(raw_values, list):
-        return set()
-    return {
-        parsed
-        for raw_value in raw_values
-        if (parsed := decode_uuid(raw_value)) is not None
-    }
 
 
 def save_state(state: dict) -> None:
@@ -586,6 +565,24 @@ class EnemyWorkerTrack:
         )
 
 
+@dataclass(frozen=True)
+class CombatSquad:
+    squad_id: int
+    vanguard_ids: tuple[UUID, ...]
+    ranger_ids: tuple[UUID, ...]
+
+    @property
+    def unit_ids(self) -> set[UUID]:
+        return set(self.vanguard_ids) | set(self.ranger_ids)
+
+    @property
+    def complete(self) -> bool:
+        return (
+            len(self.vanguard_ids) == SQUAD_VANGUARDS
+            and len(self.ranger_ids) == SQUAD_RANGERS
+        )
+
+
 @dataclass
 class AgentMemory:
     # 世界与敌情记忆。
@@ -610,7 +607,7 @@ class AgentMemory:
     resource_deferred_until: dict[Pos, int] = field(default_factory=dict)
     worker_intercept_goal: dict[UUID, tuple[Pos, int]] = field(default_factory=dict)
 
-    # Vanguard/Ranger：家园角色、巡逻目标和追击冷却。
+    # Vanguard/Ranger：持久化 2V1R 小队、巡逻目标和统一集结状态。
     ranger_patrol_phase: dict[UUID, int] = field(default_factory=dict)
     vanguard_patrol_phase: dict[UUID, int] = field(default_factory=dict)
     roam_phase: dict[UUID, int] = field(default_factory=dict)
@@ -618,26 +615,18 @@ class AgentMemory:
     ranger_follow_vanguard: dict[UUID, UUID] = field(default_factory=dict)
     home_vanguard_id: UUID | None = None
     home_ranger_id: UUID | None = None
+    squad_assignments: dict[UUID, int] = field(default_factory=dict)
+    squad_patrol_goal: dict[int, Pos] = field(default_factory=dict)
+    assault_target_id: UUID | None = None
+    assault_target_kind: str | None = None
+    assault_target_position: Pos | None = None
+    assault_target_last_seen_tick: int = 0
+    assault_gathering: bool = False
+    assault_rally_position: Pos | None = None
     enemy_worker_tracks: dict[UUID, EnemyWorkerTrack] = field(default_factory=dict)
     roam_chase_started: dict[UUID, int] = field(default_factory=dict)
     roam_chase_cooldown_until: dict[UUID, int] = field(default_factory=dict)
 
-    # 冠军信标远征：正式成员、途中援军、生产确认和返家持标者。
-    expedition_active: bool = False
-    expedition_vanguard_ids: set[UUID] = field(default_factory=set)
-    expedition_ranger_ids: set[UUID] = field(default_factory=set)
-    expedition_reinforcement_ids: set[UUID] = field(default_factory=set)
-    expedition_leader_id: UUID | None = None
-    expedition_assembling: bool = False
-    expedition_home_recovery: bool = False
-    expedition_returning: bool = False
-    expedition_target_id: UUID | None = None
-    expedition_chase_started_tick: int = 0
-    expedition_chase_cooldown_until: dict[UUID, int] = field(default_factory=dict)
-    pending_expedition_spawn_type: UnitType | None = None
-    pending_expedition_existing_ids: set[UUID] = field(default_factory=set)
-    beacon_keeper_id: UUID | None = None
-    expedition_cooldown_until: int = 0
     spawn_clear_until: int = 0
 
     # 生命周期与持久化节流。
@@ -657,38 +646,54 @@ class AgentMemory:
                     setattr(memory, attribute, UUID(raw_id))
                 except ValueError:
                     continue
-        memory.expedition_active = state.get("expedition_active") is True
-        memory.expedition_vanguard_ids = decode_uuids(
-            state.get("expedition_vanguard_ids", [])
-        )
-        memory.expedition_ranger_ids = decode_uuids(
-            state.get("expedition_ranger_ids", [])
-        )
-        memory.expedition_reinforcement_ids = decode_uuids(
-            state.get("expedition_reinforcement_ids", [])
-        )
-        memory.expedition_leader_id = decode_uuid(
-            state.get("expedition_leader_id")
-        )
-        memory.expedition_assembling = state.get("expedition_assembling") is True
-        memory.expedition_home_recovery = (
-            state.get("expedition_home_recovery") is True
-        )
-        memory.expedition_returning = state.get("expedition_returning") is True
-        pending_type = state.get("pending_expedition_spawn_type")
-        if isinstance(pending_type, str):
-            try:
-                memory.pending_expedition_spawn_type = UnitType(pending_type)
-            except ValueError:
-                pass
-        memory.pending_expedition_existing_ids = decode_uuids(
-            state.get("pending_expedition_existing_ids", [])
-        )
-        memory.beacon_keeper_id = decode_uuid(state.get("beacon_keeper_id"))
-        for attribute in ("expedition_cooldown_until", "spawn_clear_until"):
-            value = state.get(attribute)
-            if isinstance(value, int) and value >= 0:
-                setattr(memory, attribute, value)
+        raw_squad_assignments = state.get("squad_assignments", {})
+        if isinstance(raw_squad_assignments, dict):
+            for raw_id, squad_id in raw_squad_assignments.items():
+                try:
+                    unit_id = UUID(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(squad_id, int) and squad_id >= 0:
+                    memory.squad_assignments[unit_id] = squad_id
+        raw_squad_goals = state.get("squad_patrol_goals", {})
+        if isinstance(raw_squad_goals, dict):
+            for raw_id, raw_position in raw_squad_goals.items():
+                try:
+                    squad_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    squad_id >= 0
+                    and isinstance(raw_position, list)
+                    and len(raw_position) == 2
+                    and all(isinstance(value, int) for value in raw_position)
+                ):
+                    memory.squad_patrol_goal[squad_id] = tuple(raw_position)
+        memory.assault_target_id = decode_uuid(state.get("assault_target_id"))
+        target_kind = state.get("assault_target_kind")
+        if target_kind in {"CORE", "UNIT"}:
+            memory.assault_target_kind = target_kind
+        raw_target_position = state.get("assault_target_position")
+        if (
+            isinstance(raw_target_position, list)
+            and len(raw_target_position) == 2
+            and all(isinstance(value, int) for value in raw_target_position)
+        ):
+            memory.assault_target_position = tuple(raw_target_position)
+        last_seen_tick = state.get("assault_target_last_seen_tick")
+        if isinstance(last_seen_tick, int) and last_seen_tick >= 0:
+            memory.assault_target_last_seen_tick = last_seen_tick
+        memory.assault_gathering = state.get("assault_gathering") is True
+        raw_rally = state.get("assault_rally_position")
+        if (
+            isinstance(raw_rally, list)
+            and len(raw_rally) == 2
+            and all(isinstance(value, int) for value in raw_rally)
+        ):
+            memory.assault_rally_position = tuple(raw_rally)
+        spawn_clear_until = state.get("spawn_clear_until")
+        if isinstance(spawn_clear_until, int) and spawn_clear_until >= 0:
+            memory.spawn_clear_until = spawn_clear_until
         raw_sectors = state.get("worker_sectors", {})
         if isinstance(raw_sectors, dict):
             for raw_id, sector in raw_sectors.items():
@@ -720,7 +725,7 @@ class AgentMemory:
 
     def persistent_state(self) -> dict:
         return {
-            "version": 4,
+            "version": 5,
             "known_resources": [
                 list(position) for position in sorted(self.known_resources)
             ],
@@ -747,37 +752,33 @@ class AgentMemory:
             "home_ranger_id": (
                 str(self.home_ranger_id) if self.home_ranger_id else None
             ),
-            "expedition_active": self.expedition_active,
-            "expedition_vanguard_ids": [
-                str(unit_id) for unit_id in sorted(self.expedition_vanguard_ids)
-            ],
-            "expedition_ranger_ids": [
-                str(unit_id) for unit_id in sorted(self.expedition_ranger_ids)
-            ],
-            "expedition_reinforcement_ids": [
-                str(unit_id) for unit_id in sorted(self.expedition_reinforcement_ids)
-            ],
-            "expedition_leader_id": (
-                str(self.expedition_leader_id)
-                if self.expedition_leader_id
+            "squad_assignments": {
+                str(unit_id): squad_id
+                for unit_id, squad_id in sorted(
+                    self.squad_assignments.items(),
+                    key=lambda item: str(item[0]),
+                )
+            },
+            "squad_patrol_goals": {
+                str(squad_id): list(position)
+                for squad_id, position in sorted(self.squad_patrol_goal.items())
+            },
+            "assault_target_id": (
+                str(self.assault_target_id) if self.assault_target_id else None
+            ),
+            "assault_target_kind": self.assault_target_kind,
+            "assault_target_position": (
+                list(self.assault_target_position)
+                if self.assault_target_position is not None
                 else None
             ),
-            "expedition_assembling": self.expedition_assembling,
-            "expedition_home_recovery": self.expedition_home_recovery,
-            "expedition_returning": self.expedition_returning,
-            "pending_expedition_spawn_type": (
-                self.pending_expedition_spawn_type.value
-                if self.pending_expedition_spawn_type
+            "assault_target_last_seen_tick": self.assault_target_last_seen_tick,
+            "assault_gathering": self.assault_gathering,
+            "assault_rally_position": (
+                list(self.assault_rally_position)
+                if self.assault_rally_position is not None
                 else None
             ),
-            "pending_expedition_existing_ids": [
-                str(unit_id)
-                for unit_id in sorted(self.pending_expedition_existing_ids)
-            ],
-            "beacon_keeper_id": (
-                str(self.beacon_keeper_id) if self.beacon_keeper_id else None
-            ),
-            "expedition_cooldown_until": self.expedition_cooldown_until,
             "spawn_clear_until": self.spawn_clear_until,
         }
 
@@ -793,140 +794,9 @@ class AgentMemory:
         self.scout_goal.clear()
         self.scout_path_failures.clear()
         self.roam_goal.clear()
+        self.squad_patrol_goal.clear()
         self.retreat_goal.clear()
         return True
-
-    @property
-    def expedition_unit_ids(self) -> set[UUID]:
-        return self.expedition_vanguard_ids | self.expedition_ranger_ids
-
-    def expedition_signature(self) -> tuple:
-        return (
-            self.expedition_active,
-            frozenset(self.expedition_vanguard_ids),
-            frozenset(self.expedition_ranger_ids),
-            frozenset(self.expedition_reinforcement_ids),
-            self.expedition_leader_id,
-            self.expedition_assembling,
-            self.expedition_home_recovery,
-            self.expedition_returning,
-            self.pending_expedition_spawn_type,
-            frozenset(self.pending_expedition_existing_ids),
-            self.beacon_keeper_id,
-            self.expedition_cooldown_until,
-            self.spawn_clear_until,
-        )
-
-    def activate_expedition(
-        self,
-        vanguards: Iterable[Vanguard],
-        rangers: Iterable[Ranger],
-        beacon: Pos,
-    ) -> bool:
-        """从非守家巡逻单位中选择当前最紧凑的 2V1R。"""
-        if self.expedition_active or self.beacon_keeper_id is not None:
-            return False
-        eligible_vanguards = tuple(
-            unit for unit in vanguards if unit.id != self.home_vanguard_id
-        )
-        eligible_rangers = tuple(
-            unit for unit in rangers if unit.id != self.home_ranger_id
-        )
-        candidates = []
-        for vanguard_pair in combinations(eligible_vanguards, EXPEDITION_VANGUARDS):
-            for ranger in eligible_rangers:
-                trio = (*vanguard_pair, ranger)
-                pair_distances = tuple(
-                    manhattan(tuple(first.position), tuple(second.position))
-                    for first, second in combinations(trio, 2)
-                )
-                candidates.append(
-                    (
-                        max(pair_distances),
-                        sum(pair_distances),
-                        sum(manhattan(tuple(unit.position), beacon) for unit in trio),
-                        tuple(str(unit.id) for unit in trio),
-                        vanguard_pair,
-                        ranger,
-                    )
-                )
-        if not candidates:
-            return False
-
-        _, _, _, _, vanguard_pair, ranger = min(candidates)
-        self.expedition_active = True
-        self.expedition_vanguard_ids = {unit.id for unit in vanguard_pair}
-        self.expedition_ranger_ids = {ranger.id}
-        self.expedition_reinforcement_ids.clear()
-        self.expedition_leader_id = min(
-            vanguard_pair,
-            key=lambda unit: (manhattan(tuple(unit.position), beacon), str(unit.id)),
-        ).id
-        self.expedition_assembling = False
-        self.expedition_home_recovery = False
-        self.expedition_returning = False
-        self.expedition_target_id = None
-        self.expedition_chase_started_tick = 0
-        self.expedition_chase_cooldown_until.clear()
-        for unit_id in self.expedition_unit_ids:
-            self.roam_goal.pop(unit_id, None)
-            self.roam_phase.pop(unit_id, None)
-            self.ranger_follow_vanguard.pop(unit_id, None)
-        return True
-
-    def sync_pending_expedition_spawn(
-        self,
-        vanguards: Iterable[Vanguard],
-        rangers: Iterable[Ranger],
-        events,
-    ) -> bool:
-        """将上一 Tick 为远征生产的新单位确认成援军。"""
-        unit_type = self.pending_expedition_spawn_type
-        if unit_type is None:
-            return False
-        units = vanguards if unit_type is UnitType.VANGUARD else rangers
-        candidates = sorted(
-            (
-                unit
-                for unit in units
-                if unit.id not in self.pending_expedition_existing_ids
-            ),
-            key=lambda unit: str(unit.id),
-        )
-        if candidates:
-            recruit = candidates[0]
-            if unit_type is UnitType.VANGUARD:
-                self.expedition_vanguard_ids.add(recruit.id)
-            else:
-                self.expedition_ranger_ids.add(recruit.id)
-            self.expedition_reinforcement_ids.add(recruit.id)
-            self.pending_expedition_spawn_type = None
-            self.pending_expedition_existing_ids.clear()
-            return True
-        if any(event.event_type == "CORE_SPAWN_FAILED" for event in events):
-            self.pending_expedition_spawn_type = None
-            self.pending_expedition_existing_ids.clear()
-            return True
-        return False
-
-    def reset_expedition(self) -> None:
-        self.expedition_active = False
-        self.expedition_vanguard_ids.clear()
-        self.expedition_ranger_ids.clear()
-        self.expedition_reinforcement_ids.clear()
-        self.expedition_leader_id = None
-        self.expedition_assembling = False
-        self.expedition_home_recovery = False
-        self.expedition_returning = False
-        self.expedition_target_id = None
-        self.expedition_chase_started_tick = 0
-        self.expedition_chase_cooldown_until.clear()
-        self.pending_expedition_spawn_type = None
-        self.pending_expedition_existing_ids.clear()
-
-    def complete_expedition(self, keeper_id: UUID) -> None:
-        self.reset_expedition()
-        self.beacon_keeper_id = keeper_id
 
     def prune_unit_state(self, workers, vanguards, rangers, tick: int = 0) -> bool:
         """删除死亡单位的运行时状态，并报告持久化扇区是否变化。"""
@@ -935,16 +805,7 @@ class AgentMemory:
         ranger_ids = {unit.id for unit in rangers}
         combat_ids = vanguard_ids | ranger_ids
         sectors_before = dict(self.worker_sector)
-        expedition_before = (
-            set(self.expedition_vanguard_ids),
-            set(self.expedition_ranger_ids),
-            set(self.expedition_reinforcement_ids),
-            self.expedition_leader_id,
-            self.expedition_assembling,
-            self.expedition_returning,
-            self.expedition_cooldown_until,
-            self.beacon_keeper_id,
-        )
+        squads_before = dict(self.squad_assignments)
 
         for state in (
             self.retreat_until,
@@ -975,72 +836,219 @@ class AgentMemory:
         for ranger_id, vanguard_id in tuple(self.ranger_follow_vanguard.items()):
             if ranger_id not in ranger_ids or vanguard_id not in vanguard_ids:
                 self.ranger_follow_vanguard.pop(ranger_id, None)
+        self.squad_assignments = {
+            unit_id: squad_id
+            for unit_id, squad_id in self.squad_assignments.items()
+            if unit_id in combat_ids
+        }
 
-        self.expedition_vanguard_ids.intersection_update(vanguard_ids)
-        self.expedition_ranger_ids.intersection_update(ranger_ids)
-        self.expedition_reinforcement_ids.intersection_update(combat_ids)
-        if self.expedition_leader_id not in combat_ids:
-            self.expedition_leader_id = None
-        if self.beacon_keeper_id not in combat_ids:
-            self.beacon_keeper_id = None
-        complete_roster = (
-            len(self.expedition_vanguard_ids) >= EXPEDITION_VANGUARDS
-            and len(self.expedition_ranger_ids) >= EXPEDITION_RANGERS
+        return (
+            self.worker_sector != sectors_before
+            or self.squad_assignments != squads_before
         )
-        if (
-            self.expedition_active
-            and not self.expedition_home_recovery
-            and not self.expedition_returning
-            and not complete_roster
-        ):
-            self.expedition_returning = True
-            self.expedition_assembling = False
-            self.expedition_reinforcement_ids.clear()
-            self.pending_expedition_spawn_type = None
-            self.pending_expedition_existing_ids.clear()
-            self.expedition_cooldown_until = max(
-                self.expedition_cooldown_until,
-                tick + EXPEDITION_COOLDOWN_TICKS,
+
+    def combat_squads(
+        self,
+        vanguards: Iterable[Vanguard],
+        rangers: Iterable[Ranger],
+    ) -> tuple[CombatSquad, ...]:
+        vanguard_ids = {unit.id for unit in vanguards}
+        ranger_ids = {unit.id for unit in rangers}
+        squad_ids = sorted(set(self.squad_assignments.values()))
+        return tuple(
+            CombatSquad(
+                squad_id=squad_id,
+                vanguard_ids=tuple(
+                    sorted(
+                        unit_id
+                        for unit_id, assigned_id in self.squad_assignments.items()
+                        if assigned_id == squad_id and unit_id in vanguard_ids
+                    )
+                ),
+                ranger_ids=tuple(
+                    sorted(
+                        unit_id
+                        for unit_id, assigned_id in self.squad_assignments.items()
+                        if assigned_id == squad_id and unit_id in ranger_ids
+                    )
+                ),
             )
-
-        expedition_after = (
-            set(self.expedition_vanguard_ids),
-            set(self.expedition_ranger_ids),
-            set(self.expedition_reinforcement_ids),
-            self.expedition_leader_id,
-            self.expedition_assembling,
-            self.expedition_returning,
-            self.expedition_cooldown_until,
-            self.beacon_keeper_id,
+            for squad_id in squad_ids
         )
-        return self.worker_sector != sectors_before or expedition_after != expedition_before
 
-    def sync_combat_roles(
+    def sync_combat_squads(
         self,
         vanguards,
         rangers,
         core: Pos,
-        reserved_ids: set[UUID] | None = None,
     ) -> bool:
-        before = self.home_vanguard_id, self.home_ranger_id
-        reserved_ids = reserved_ids or set()
+        """稳定维护 2V1R 编制；0 号完整小队永久负责守家。"""
+        before = (
+            dict(self.squad_assignments),
+            dict(self.squad_patrol_goal),
+            self.home_vanguard_id,
+            self.home_ranger_id,
+        )
         vanguard_by_id = {unit.id: unit for unit in vanguards}
         ranger_by_id = {unit.id: unit for unit in rangers}
-        if self.home_vanguard_id not in vanguard_by_id:
-            replacement = min(
-                (unit for unit in vanguards if unit.id not in reserved_ids),
-                key=lambda unit: (manhattan(tuple(unit.position), core), str(unit.id)),
-                default=None,
+        live_ids = set(vanguard_by_id) | set(ranger_by_id)
+        self.squad_assignments = {
+            unit_id: squad_id
+            for unit_id, squad_id in self.squad_assignments.items()
+            if unit_id in live_ids and squad_id >= 0
+        }
+
+        # v4 只保存单个守家 Vanguard/Ranger；首次升级时把它们种到 0 号队。
+        if self.home_vanguard_id in vanguard_by_id:
+            self.squad_assignments.setdefault(self.home_vanguard_id, 0)
+        if self.home_ranger_id in ranger_by_id:
+            self.squad_assignments.setdefault(self.home_ranger_id, 0)
+
+        # 清理损坏或旧版本造成的超编，超出的单位在下面重新分配。
+        for squad in self.combat_squads(vanguards, rangers):
+            for unit_id in squad.vanguard_ids[SQUAD_VANGUARDS:]:
+                self.squad_assignments.pop(unit_id, None)
+            for unit_id in squad.ranger_ids[SQUAD_RANGERS:]:
+                self.squad_assignments.pop(unit_id, None)
+
+        def role_count(squad_id: int, unit_type: UnitType) -> int:
+            role_ids = (
+                set(vanguard_by_id)
+                if unit_type is UnitType.VANGUARD
+                else set(ranger_by_id)
             )
-            self.home_vanguard_id = replacement.id if replacement else None
-        if self.home_ranger_id not in ranger_by_id:
-            replacement = min(
-                (unit for unit in rangers if unit.id not in reserved_ids),
-                key=lambda unit: (manhattan(tuple(unit.position), core), str(unit.id)),
-                default=None,
+            return sum(
+                assigned_id == squad_id and unit_id in role_ids
+                for unit_id, assigned_id in self.squad_assignments.items()
             )
-            self.home_ranger_id = replacement.id if replacement else None
-        return before != (self.home_vanguard_id, self.home_ranger_id)
+
+        def assign_role(units, unit_type: UnitType, capacity: int) -> None:
+            unassigned = sorted(
+                (unit for unit in units if unit.id not in self.squad_assignments),
+                key=lambda unit: (
+                    manhattan(tuple(unit.position), core),
+                    str(unit.id),
+                ),
+            )
+            for unit in unassigned:
+                squad_ids = sorted(set(self.squad_assignments.values()) | {0})
+                candidates = [
+                    squad_id
+                    for squad_id in squad_ids
+                    if role_count(squad_id, unit_type) < capacity
+                ]
+                if unit_type is UnitType.RANGER:
+                    full_frontline = [
+                        squad_id
+                        for squad_id in candidates
+                        if role_count(squad_id, UnitType.VANGUARD)
+                        == SQUAD_VANGUARDS
+                    ]
+                    if full_frontline:
+                        candidates = full_frontline
+                if not candidates:
+                    candidates = [max(squad_ids, default=-1) + 1]
+                self.squad_assignments[unit.id] = candidates[0]
+
+        assign_role(vanguards, UnitType.VANGUARD, SQUAD_VANGUARDS)
+        assign_role(rangers, UnitType.RANGER, SQUAD_RANGERS)
+
+        squads = self.combat_squads(vanguards, rangers)
+        home_squad = next((squad for squad in squads if squad.squad_id == 0), None)
+        self.home_vanguard_id = (
+            home_squad.vanguard_ids[0]
+            if home_squad and home_squad.vanguard_ids
+            else None
+        )
+        self.home_ranger_id = (
+            home_squad.ranger_ids[0]
+            if home_squad and home_squad.ranger_ids
+            else None
+        )
+        live_squad_ids = {squad.squad_id for squad in squads}
+        self.squad_patrol_goal = {
+            squad_id: goal
+            for squad_id, goal in self.squad_patrol_goal.items()
+            if squad_id in live_squad_ids and squad_id != 0
+        }
+        after = (
+            dict(self.squad_assignments),
+            dict(self.squad_patrol_goal),
+            self.home_vanguard_id,
+            self.home_ranger_id,
+        )
+        return before != after
+
+    def clear_assault(self) -> None:
+        self.assault_target_id = None
+        self.assault_target_kind = None
+        self.assault_target_position = None
+        self.assault_target_last_seen_tick = 0
+        self.assault_gathering = False
+        self.assault_rally_position = None
+
+    def sync_assault_target(
+        self,
+        visible_enemies,
+        core: Pos,
+        tick: int,
+    ) -> bool:
+        """发现巡逻边界内的 Core/战斗单位后触发全体巡逻队集结。"""
+        before = (
+            self.assault_target_id,
+            self.assault_target_kind,
+            self.assault_target_position,
+            self.assault_target_last_seen_tick,
+            self.assault_gathering,
+            self.assault_rally_position,
+        )
+        candidates = tuple(
+            enemy
+            for enemy in visible_enemies
+            if chebyshev(core, tuple(enemy.position)) <= ROAM_RADIUS
+            and (
+                enemy.kind == "CORE"
+                or (
+                    enemy.kind == "UNIT"
+                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                )
+            )
+        )
+        target = min(
+            candidates,
+            key=lambda enemy: (
+                manhattan(core, tuple(enemy.position)),
+                enemy.kind == "CORE",
+                str(enemy.id),
+            ),
+            default=None,
+        )
+        if target is not None:
+            if target.id != self.assault_target_id:
+                self.assault_gathering = True
+                self.assault_rally_position = None
+            self.assault_target_id = target.id
+            self.assault_target_kind = target.kind
+            self.assault_target_position = tuple(target.position)
+            self.assault_target_last_seen_tick = tick
+        elif self.assault_target_id is not None:
+            if self.assault_target_kind == "CORE":
+                sighting = self.known_enemy_cores.get(self.assault_target_id)
+            else:
+                sighting = self.known_combat_threats.get(self.assault_target_id)
+            if sighting is not None:
+                self.assault_target_position = sighting[0]
+            elif tick - self.assault_target_last_seen_tick > ASSAULT_TARGET_MEMORY_TICKS:
+                self.clear_assault()
+        after = (
+            self.assault_target_id,
+            self.assault_target_kind,
+            self.assault_target_position,
+            self.assault_target_last_seen_tick,
+            self.assault_gathering,
+            self.assault_rally_position,
+        )
+        return before != after
 
     def assign_ranger_follow_targets(
         self,
@@ -1565,6 +1573,10 @@ class PlanningContext:
     occupied: FriendlyOccupancy
     resource_assignments: dict[UUID, Pos]
     reserved_combat_ids: set[UUID]
+    combat_squads: tuple[CombatSquad, ...]
+    home_squad_ids: set[UUID]
+    field_combat_ids: set[UUID]
+    assault_target: CoreView | UnitView | None
     roaming_combat_units: tuple[Vanguard | Ranger, ...]
     roam_is_aggressive: bool
     trap_obstacles: set[Pos]
@@ -1737,7 +1749,7 @@ def roam_ranger_response_step(
         )
         if destination is not None and context.occupied.can_enter(destination):
             return destination
-    return expedition_approach_step(context, position, target, obstacles)
+    return combat_approach_step(context, position, target, obstacles)
 
 
 def full_capacity_worker_destination(
@@ -2061,7 +2073,7 @@ def plan_workers(context: PlanningContext) -> None:
         actions.append(f"{str(worker.id)[:8]} wait-scout")
 
 
-def expedition_approach_step(
+def combat_approach_step(
     context: PlanningContext,
     position: Pos,
     target: Pos,
@@ -2089,47 +2101,7 @@ def expedition_approach_step(
     return None
 
 
-def expedition_ranger_aim_step(
-    context: PlanningContext,
-    position: Pos,
-    target: Pos,
-    obstacles: set[Pos],
-    leader_position: Pos,
-) -> Pos | None:
-    firing_cells: list[tuple[int, int, Pos]] = []
-    for delta in SCOUT_VECTORS:
-        for distance in range(1, 4):
-            cell = (
-                target[0] - delta[0] * distance,
-                target[1] - delta[1] * distance,
-            )
-            if (
-                cell not in obstacles
-                and context.occupied.can_enter(cell)
-                and manhattan(cell, leader_position) <= EXPEDITION_FORMATION_RADIUS
-                and clear_ranger_shot(cell, target, context.memory.known_obstacles)
-            ):
-                firing_cells.append(
-                    (abs(distance - 3), manhattan(position, cell), cell)
-                )
-    for _, _, firing_cell in sorted(firing_cells):
-        destination = first_step_astar(
-            position,
-            firing_cell,
-            obstacles,
-            set(context.occupied),
-        )
-        if (
-            destination is not None
-            and context.occupied.can_enter(destination)
-            and manhattan(destination, leader_position)
-            <= EXPEDITION_FORMATION_RADIUS
-        ):
-            return destination
-    return None
-
-
-def expedition_move_toward(
+def combat_move_toward(
     context: PlanningContext,
     position: Pos,
     goal: Pos,
@@ -2146,370 +2118,420 @@ def expedition_move_toward(
     return destination
 
 
-def plan_expedition(context: PlanningContext) -> None:
-    """规划冠军信标远征、途中援军和返家持标者。"""
+def squad_ranger_follow_destination(
+    context: PlanningContext,
+    position: Pos,
+    leader_position: Pos,
+    mission_goal: Pos,
+    obstacles: set[Pos],
+) -> Pos | None:
+    """让 Ranger 留在 Vanguard 后侧，避免远程单位顶到行军最前方。"""
+    goal_vector = (
+        mission_goal[0] - leader_position[0],
+        mission_goal[1] - leader_position[1],
+    )
+    candidates: list[tuple[int, int, Pos]] = []
+    for delta in SCOUT_VECTORS:
+        for distance in (1, 2):
+            cell = (
+                leader_position[0] + delta[0] * distance,
+                leader_position[1] + delta[1] * distance,
+            )
+            relative = (
+                cell[0] - leader_position[0],
+                cell[1] - leader_position[1],
+            )
+            dot = relative[0] * goal_vector[0] + relative[1] * goal_vector[1]
+            if (
+                dot <= 0
+                and chebyshev(context.core_pos, cell) <= ROAM_RADIUS
+                and cell not in obstacles
+                and context.occupied.can_enter(cell)
+            ):
+                candidates.append((dot, manhattan(position, cell), cell))
+    if position in {candidate[2] for candidate in candidates}:
+        return position
+    for _, _, cell in sorted(candidates, key=lambda item: (item[0], item[1], item[2])):
+        destination = first_step_astar(
+            position,
+            cell,
+            obstacles,
+            set(context.occupied),
+        )
+        if destination is not None and context.occupied.can_enter(destination):
+            return destination
+    return ranger_follow_destination(
+        context,
+        position,
+        leader_position,
+        obstacles,
+    )
+
+
+def choose_assault_rally(
+    squads: tuple[CombatSquad, ...],
+    unit_by_id: dict[UUID, Vanguard | Ranger],
+) -> Pos | None:
+    """以完整巡逻队队长位置的 medoid 作为本轮统一集结点。"""
+    leader_positions = tuple(
+        tuple(unit_by_id[squad.vanguard_ids[0]].position)
+        for squad in squads
+        if squad.squad_id != 0
+        and squad.complete
+        and squad.vanguard_ids[0] in unit_by_id
+    )
+    return min(
+        leader_positions,
+        key=lambda candidate: (
+            sum(manhattan(candidate, other) for other in leader_positions),
+            candidate,
+        ),
+        default=None,
+    )
+
+
+def plan_field_squads(context: PlanningContext) -> None:
+    """按 2V1R 小队巡逻；发现强敌时先统一集结，再共同出击。"""
     memory = context.memory
     occupied = context.occupied
     actions = context.actions
-    combat_units = {
+    unit_by_id = {
         unit.id: unit for unit in (*context.vanguards, *context.rangers)
     }
-    beacon = context.turn.beacon
-    carrier_id = (
-        beacon.carrier_id
-        if beacon.status is BeaconStatus.CARRIED
-        and beacon.carrier_id in combat_units
-        else None
-    )
-
-    keeper = combat_units.get(memory.beacon_keeper_id)
-    if keeper is not None and carrier_id == keeper.id:
-        position: Pos = tuple(keeper.position)
-        occupied.discard(position)
-        if position == context.core_pos:
-            keeper.wait()
-            occupied.add(position)
-            actions.append(f"{str(keeper.id)[:8]} beacon-keeper hold")
-            return
-        obstacles = (
-            memory.known_obstacles
-            | context.known_enemy_core_cells
-            | context.visible_enemy_unit_cells
-            | set(memory.temporary_blocked_cells)
-        )
-        destination = expedition_move_toward(
-            context,
-            position,
-            context.core_pos,
-            obstacles,
-        )
-        if destination is not None:
-            direction = direction_between(position, destination)
-            if direction is not None:
-                keeper.move(direction)
-                occupied.add(destination)
-                actions.append(
-                    f"{str(keeper.id)[:8]} beacon-keeper {direction.value}"
-                )
-                return
-        keeper.wait()
-        occupied.add(position)
-        actions.append(f"{str(keeper.id)[:8]} beacon-keeper wait")
-        return
-
-    if not memory.expedition_active:
-        return
-
-    expedition_units = {
-        unit_id: combat_units[unit_id]
-        for unit_id in memory.expedition_unit_ids
-        if unit_id in combat_units
+    visible_enemy_by_id = {
+        enemy.id: enemy for enemy in context.turn.visible_enemies
     }
-    if not expedition_units:
-        if memory.expedition_returning:
-            memory.reset_expedition()
-        else:
-            memory.expedition_leader_id = None
+    field_squads = tuple(
+        squad for squad in context.combat_squads if squad.squad_id != 0
+    )
+    complete_field_squads = tuple(squad for squad in field_squads if squad.complete)
+    if not field_squads:
         return
 
-    frontline_ids = set(expedition_units) - memory.expedition_reinforcement_ids
-    if not frontline_ids:
-        memory.expedition_assembling = True
-        frontline_ids = set(expedition_units)
+    if memory.assault_target_id is not None and memory.assault_rally_position is None:
+        memory.assault_rally_position = choose_assault_rally(
+            complete_field_squads,
+            unit_by_id,
+        )
+    if memory.assault_gathering and memory.assault_rally_position is not None:
+        gathered_ids = set().union(
+            *(squad.unit_ids for squad in complete_field_squads),
+        ) if complete_field_squads else set()
+        if gathered_ids and all(
+            unit_id in unit_by_id
+            and manhattan(
+                tuple(unit_by_id[unit_id].position),
+                memory.assault_rally_position,
+            ) <= ASSAULT_GATHER_RADIUS
+            for unit_id in gathered_ids
+        ):
+            memory.assault_gathering = False
+            actions.append("squads assault-ready")
 
-    if carrier_id in expedition_units:
-        memory.expedition_leader_id = carrier_id
-    if memory.expedition_leader_id not in frontline_ids:
-        memory.expedition_leader_id = min(
-            (expedition_units[unit_id] for unit_id in frontline_ids),
+    static_obstacles = (
+        memory.known_obstacles
+        | context.known_enemy_core_cells
+        | set(memory.temporary_blocked_cells)
+    )
+    target_object = visible_enemy_by_id.get(memory.assault_target_id)
+    target_position = memory.assault_target_position
+    home_emergency_target = min(
+        context.home_combat_targets,
+        key=lambda enemy: (
+            manhattan(context.core_pos, tuple(enemy.position)),
+            str(enemy.id),
+        ),
+        default=None,
+    )
+    home_emergency = home_emergency_target is not None
+    if home_emergency_target is not None:
+        target_object = home_emergency_target
+        target_position = tuple(home_emergency_target.position)
+    for squad in field_squads:
+        members = [unit_by_id[unit_id] for unit_id in squad.unit_ids if unit_id in unit_by_id]
+        if not members:
+            continue
+        leader = unit_by_id.get(squad.vanguard_ids[0]) if squad.vanguard_ids else None
+        if leader is None:
+            leader = min(members, key=lambda unit: str(unit.id))
+        leader_position: Pos = tuple(leader.position)
+        squad_target_object = target_object
+        squad_target_position = target_position
+        nearby_worker = min(
+            (
+                enemy
+                for enemy in context.safe_enemy_units
+                if enemy.unit_type is UnitType.WORKER
+                and any(
+                    manhattan(tuple(unit.position), tuple(enemy.position)) <= 6
+                    for unit in members
+                )
+            ),
+            key=lambda enemy: (
+                manhattan(leader_position, tuple(enemy.position)),
+                str(enemy.id),
+            ),
+            default=None,
+        )
+        if squad_target_position is None and nearby_worker is not None:
+            squad_target_object = nearby_worker
+            squad_target_position = tuple(nearby_worker.position)
+        squad_attack_now = squad_target_position is not None and (
+            home_emergency
+            or nearby_worker is not None
+            or not memory.assault_gathering
+        )
+
+        if home_emergency:
+            mission_goal = squad_target_position
+            mission_label = "squad-home-support"
+        elif not squad.complete:
+            mission_goal = add(
+                context.core_pos,
+                HOME_PATROL_OFFSETS[squad.squad_id % len(HOME_PATROL_OFFSETS)],
+            )
+            mission_label = "squad-stage"
+        elif memory.assault_gathering and memory.assault_rally_position is not None:
+            mission_goal = memory.assault_rally_position
+            mission_label = "squad-gather"
+        elif squad_target_position is not None:
+            mission_goal = squad_target_position
+            mission_label = "squad-hunt" if nearby_worker is not None else "squad-assault"
+        else:
+            patrol_goal = memory.squad_patrol_goal.get(squad.squad_id)
+            if patrol_goal is None or leader_position == patrol_goal:
+                patrol_goal = memory.roam_goal_for(
+                    leader.id,
+                    context.core_pos,
+                    leader_position,
+                    memory.known_obstacles | context.known_enemy_core_cells,
+                )
+                memory.squad_patrol_goal[squad.squad_id] = patrol_goal
+            mission_goal = patrol_goal
+            mission_label = "squad-patrol"
+
+        lagging = squad.complete and any(
+            unit.id != leader.id
+            and manhattan(tuple(unit.position), leader_position)
+            > SQUAD_FORMATION_RADIUS
+            for unit in members
+        )
+        planned_leader_position = leader_position
+        ordered_members = sorted(
+            members,
             key=lambda unit: (
-                unit.unit_type is not UnitType.VANGUARD,
-                manhattan(tuple(unit.position), tuple(beacon.position)),
+                unit.id != leader.id,
+                unit.unit_type is UnitType.RANGER,
                 str(unit.id),
             ),
-        ).id
-    leader = expedition_units[memory.expedition_leader_id]
-    leader_position: Pos = tuple(leader.position)
-
-    for reinforcement_id in tuple(memory.expedition_reinforcement_ids):
-        reinforcement = expedition_units.get(reinforcement_id)
-        if (
-            reinforcement is not None
-            and manhattan(tuple(reinforcement.position), leader_position)
-            <= EXPEDITION_FORMATION_RADIUS
-        ):
-            memory.expedition_reinforcement_ids.discard(reinforcement_id)
-            frontline_ids.add(reinforcement_id)
-
-    complete_roster = (
-        len(memory.expedition_vanguard_ids) >= EXPEDITION_VANGUARDS
-        and len(memory.expedition_ranger_ids) >= EXPEDITION_RANGERS
-    )
-    gathered = all(
-        manhattan(tuple(unit.position), leader_position)
-        <= EXPEDITION_FORMATION_RADIUS
-        for unit in expedition_units.values()
-    )
-    if memory.expedition_assembling and complete_roster and gathered:
-        memory.expedition_assembling = False
-        memory.expedition_reinforcement_ids.clear()
-        frontline_ids = set(expedition_units)
-
-    if carrier_id in expedition_units and leader_position == context.core_pos:
-        for unit in expedition_units.values():
-            position = tuple(unit.position)
+        )
+        for unit in ordered_members:
+            position: Pos = tuple(unit.position)
             occupied.discard(position)
-            unit.wait()
-            occupied.add(position)
-        actions.append(f"{str(carrier_id)[:8]} expedition-beacon-home")
-        memory.complete_expedition(carrier_id)
-        return
 
-    if memory.expedition_returning and leader_position == context.core_pos:
-        for unit in expedition_units.values():
-            position = tuple(unit.position)
-            occupied.discard(position)
-            unit.wait()
-            occupied.add(position)
-        actions.append(f"{str(leader.id)[:8]} expedition-return-home")
-        memory.reset_expedition()
-        return
+            adjacent_vanguards = tuple(
+                enemy
+                for enemy in context.combat_enemies
+                if enemy.unit_type is UnitType.VANGUARD
+                and manhattan(position, tuple(enemy.position)) == 1
+            )
+            if unit.unit_type is UnitType.RANGER and adjacent_vanguards:
+                destination = choose_flee_step(
+                    position,
+                    (tuple(enemy.position) for enemy in adjacent_vanguards),
+                    context.core_pos,
+                    memory.known_obstacles | context.known_enemy_core_cells,
+                    occupied.occupied_cells() | context.visible_enemy_unit_cells,
+                    True,
+                )
+                if destination is not None:
+                    direction = direction_between(position, destination)
+                    if direction is not None:
+                        unit.move(direction)
+                        occupied.add(destination)
+                        actions.append(
+                            f"{str(unit.id)[:8]} squad-ranger-disengage "
+                            f"{direction.value}"
+                        )
+                        continue
 
-    active_units = tuple(
-        expedition_units[unit_id]
-        for unit_id in frontline_ids
-        if unit_id not in memory.expedition_reinforcement_ids
-    )
-    active_positions = tuple(tuple(unit.position) for unit in active_units)
-    memory.expedition_chase_cooldown_until = {
-        enemy_id: expiry
-        for enemy_id, expiry in memory.expedition_chase_cooldown_until.items()
-        if expiry > context.turn.tick
-    }
-    eligible_enemies = tuple(
-        enemy
-        for enemy in context.safe_enemy_units
-        if memory.expedition_chase_cooldown_until.get(enemy.id, 0)
-        <= context.turn.tick
-        if any(
-            manhattan(tuple(enemy.position), position)
-            <= EXPEDITION_ENGAGE_RADIUS
-            for position in active_positions
-        )
-    )
-    visible_enemy_by_id = {enemy.id: enemy for enemy in eligible_enemies}
-    target_enemy = visible_enemy_by_id.get(memory.expedition_target_id)
-    chase_expired = (
-        target_enemy is not None
-        and context.turn.tick - memory.expedition_chase_started_tick
-        >= EXPEDITION_CHASE_TICKS
-    )
-    if chase_expired:
-        memory.expedition_chase_cooldown_until[target_enemy.id] = (
-            context.turn.tick + EXPEDITION_CHASE_TICKS
-        )
-        visible_enemy_by_id.pop(target_enemy.id, None)
-        eligible_enemies = tuple(
-            enemy for enemy in eligible_enemies if enemy.id != target_enemy.id
-        )
-        target_enemy = None
-    if target_enemy is None:
-        def target_key(enemy: UnitView):
-            enemy_position = tuple(enemy.position)
-            immediate = any(
-                (
-                    unit.unit_type is UnitType.VANGUARD
-                    and manhattan(tuple(unit.position), enemy_position) == 1
+            incoming_threats = tuple(
+                enemy
+                for enemy in context.combat_enemies
+                if (
+                    enemy.unit_type is UnitType.VANGUARD
+                    and manhattan(position, tuple(enemy.position)) == 1
                 )
                 or (
-                    unit.unit_type is UnitType.RANGER
+                    enemy.unit_type is UnitType.RANGER
                     and clear_ranger_shot(
-                        tuple(unit.position),
-                        enemy_position,
+                        tuple(enemy.position),
+                        position,
                         memory.known_obstacles,
                     )
                 )
-                for unit in active_units
             )
-            return (
-                enemy.id != beacon.carrier_id,
-                not immediate,
-                enemy.unit_type is UnitType.WORKER,
-                min(manhattan(position, enemy_position) for position in active_positions),
-                str(enemy.id),
+            shootable_threat = min(
+                (
+                    enemy
+                    for enemy in incoming_threats
+                    if unit.unit_type is UnitType.RANGER
+                    and clear_ranger_shot(
+                        position,
+                        tuple(enemy.position),
+                        memory.known_obstacles,
+                    )
+                ),
+                key=lambda enemy: manhattan(position, tuple(enemy.position)),
+                default=None,
             )
+            if shootable_threat is not None:
+                unit.shoot(shootable_threat)
+                occupied.add(position)
+                actions.append(f"{str(unit.id)[:8]} squad-self-defense-shoot")
+                continue
+            ranged_attacker = min(
+                (
+                    enemy
+                    for enemy in incoming_threats
+                    if enemy.unit_type is UnitType.RANGER
+                ),
+                key=lambda enemy: manhattan(position, tuple(enemy.position)),
+                default=None,
+            )
+            if unit.unit_type is UnitType.VANGUARD and ranged_attacker is not None:
+                destination = combat_approach_step(
+                    context,
+                    position,
+                    tuple(ranged_attacker.position),
+                    static_obstacles | context.visible_enemy_unit_cells,
+                )
+                if destination is not None:
+                    direction = direction_between(position, destination)
+                    if direction is not None:
+                        unit.move(direction)
+                        occupied.add(destination)
+                        actions.append(
+                            f"{str(unit.id)[:8]} squad-counter-fire "
+                            f"{direction.value}"
+                        )
+                        continue
 
-        target_enemy = min(eligible_enemies, key=target_key, default=None)
-        memory.expedition_target_id = target_enemy.id if target_enemy else None
-        memory.expedition_chase_started_tick = (
-            context.turn.tick if target_enemy else 0
-        )
-
-    target_position = tuple(target_enemy.position) if target_enemy else None
-    expedition_obstacles = (
-        memory.known_obstacles
-        | context.known_enemy_core_cells
-        | context.visible_enemy_unit_cells
-        | set(memory.temporary_blocked_cells)
-    )
-    own_carrier = carrier_id in expedition_units
-    mission_goal = (
-        context.core_pos
-        if own_carrier or memory.expedition_returning
-        else tuple(beacon.position)
-    )
-    lagging = any(
-        manhattan(tuple(unit.position), leader_position)
-        > EXPEDITION_FORMATION_RADIUS
-        for unit in active_units
-        if unit.id != leader.id
-    )
-
-    ordered_units = sorted(
-        expedition_units.values(),
-        key=lambda unit: (
-            unit.id != leader.id,
-            unit.id in memory.expedition_reinforcement_ids,
-            unit.unit_type is UnitType.RANGER,
-            str(unit.id),
-        ),
-    )
-    planned_leader_position = leader_position
-    for unit in ordered_units:
-        position: Pos = tuple(unit.position)
-        occupied.discard(position)
-        is_reinforcement = unit.id in memory.expedition_reinforcement_ids
-
-        if target_enemy is not None and not is_reinforcement:
-            if (
-                unit.unit_type is UnitType.VANGUARD
-                and manhattan(position, target_position) == 1
-            ):
-                direction = direction_between(position, target_position)
+            adjacent_enemy = min(
+                (
+                    enemy
+                    for enemy in context.safe_enemy_units
+                    if manhattan(position, tuple(enemy.position)) == 1
+                ),
+                key=lambda enemy: (
+                    enemy.unit_type is UnitType.WORKER,
+                    str(enemy.id),
+                ),
+                default=None,
+            )
+            if unit.unit_type is UnitType.VANGUARD and adjacent_enemy is not None:
+                direction = direction_between(position, tuple(adjacent_enemy.position))
                 if direction is not None:
                     unit.sweep(direction)
                     occupied.add(position)
                     actions.append(
-                        f"{str(unit.id)[:8]} expedition-sweep "
-                        f"{target_enemy.unit_type.value} {direction.value}"
+                        f"{str(unit.id)[:8]} squad-self-defense {direction.value}"
                     )
                     continue
-            if unit.unit_type is UnitType.RANGER and clear_ranger_shot(
-                position,
-                target_position,
-                memory.known_obstacles,
+
+            if (
+                unit.unit_type is UnitType.VANGUARD
+                and squad_target_object is not None
+                and squad_attack_now
+                and manhattan(position, squad_target_position) == 1
             ):
-                unit.shoot(target_enemy)
-                occupied.add(position)
-                actions.append(
-                    f"{str(unit.id)[:8]} expedition-shoot "
-                    f"{target_enemy.unit_type.value}"
+                direction = direction_between(position, squad_target_position)
+                if direction is not None:
+                    unit.sweep(direction)
+                    occupied.add(position)
+                    actions.append(
+                        f"{str(unit.id)[:8]} squad-assault-sweep {direction.value}"
+                    )
+                    continue
+            if (
+                unit.unit_type is UnitType.RANGER
+                and squad_target_object is not None
+                and squad_attack_now
+                and clear_ranger_shot(
+                    position,
+                    squad_target_position,
+                    memory.known_obstacles,
                 )
+            ):
+                unit.shoot(squad_target_object)
+                occupied.add(position)
+                actions.append(f"{str(unit.id)[:8]} squad-assault-shoot")
                 continue
 
-        if is_reinforcement:
-            destination = expedition_move_toward(
-                context,
-                position,
-                planned_leader_position,
-                expedition_obstacles - {planned_leader_position},
-            )
-            label = "expedition-reinforce"
-        elif unit.id == leader.id:
-            if memory.expedition_assembling or lagging:
-                destination = None
-            elif (
-                target_enemy is None
-                and position == tuple(beacon.position)
-                and beacon.status is BeaconStatus.GROUND
-            ):
-                memory.expedition_returning = True
-                mission_goal = context.core_pos
-                destination = expedition_move_toward(
-                    context,
-                    position,
-                    mission_goal,
-                    expedition_obstacles - {mission_goal},
-                )
-            elif target_position is not None:
-                if unit.unit_type is UnitType.RANGER:
-                    destination = expedition_ranger_aim_step(
-                        context,
-                        position,
-                        target_position,
-                        expedition_obstacles,
-                        position,
-                    )
-                else:
-                    destination = expedition_approach_step(
-                        context,
-                        position,
-                        target_position,
-                        expedition_obstacles,
-                    )
-            else:
-                destination = expedition_move_toward(
-                    context,
-                    position,
-                    mission_goal,
-                    expedition_obstacles - {mission_goal},
-                )
-            label = (
-                "expedition-return"
-                if memory.expedition_returning
-                else "expedition-lead"
-            )
-        else:
-            leader_distance = manhattan(position, planned_leader_position)
-            if target_position is not None and leader_distance <= EXPEDITION_FORMATION_RADIUS:
-                if unit.unit_type is UnitType.RANGER:
-                    destination = expedition_ranger_aim_step(
-                        context,
-                        position,
-                        target_position,
-                        expedition_obstacles,
-                        planned_leader_position,
-                    )
-                else:
-                    destination = expedition_approach_step(
-                        context,
-                        position,
-                        target_position,
-                        expedition_obstacles,
-                    )
-                if (
-                    destination is not None
-                    and manhattan(destination, planned_leader_position)
-                    > EXPEDITION_FORMATION_RADIUS
-                ):
-                    destination = None
-                label = "expedition-engage"
-            elif leader_distance > EXPEDITION_FOLLOW_DISTANCE:
-                destination = expedition_move_toward(
+            destination: Pos | None = None
+            if unit.id == leader.id:
+                if not lagging:
+                    if squad_attack_now:
+                        destination = combat_approach_step(
+                            context,
+                            position,
+                            squad_target_position,
+                            static_obstacles | context.visible_enemy_unit_cells,
+                        )
+                    else:
+                        destination = combat_move_toward(
+                            context,
+                            position,
+                            mission_goal,
+                            static_obstacles | context.visible_enemy_unit_cells,
+                        )
+            elif unit.unit_type is UnitType.RANGER:
+                destination = squad_ranger_follow_destination(
                     context,
                     position,
                     planned_leader_position,
-                    expedition_obstacles - {planned_leader_position},
+                    mission_goal,
+                    static_obstacles | context.visible_enemy_unit_cells,
                 )
-                label = "expedition-follow"
-            else:
-                destination = None
-                label = "expedition-hold"
+            elif manhattan(position, planned_leader_position) > SQUAD_FOLLOW_DISTANCE:
+                destination = combat_move_toward(
+                    context,
+                    position,
+                    planned_leader_position,
+                    (static_obstacles | context.visible_enemy_unit_cells)
+                    - {planned_leader_position},
+                )
+            elif squad_attack_now:
+                destination = combat_approach_step(
+                    context,
+                    position,
+                    squad_target_position,
+                    static_obstacles | context.visible_enemy_unit_cells,
+                )
+                if (
+                    destination is not None
+                    and manhattan(destination, planned_leader_position)
+                    > SQUAD_FORMATION_RADIUS
+                ):
+                    destination = None
 
-        if destination is not None and destination != position:
-            direction = direction_between(position, destination)
-            if direction is not None:
-                unit.move(direction)
-                occupied.add(destination)
-                if unit.id == leader.id:
-                    planned_leader_position = destination
-                actions.append(
-                    f"{str(unit.id)[:8]} {label} {direction.value}"
-                )
-                continue
-        unit.wait()
-        occupied.add(position)
-        actions.append(f"{str(unit.id)[:8]} {label}-wait")
+            if destination is not None and destination != position:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    unit.move(direction)
+                    occupied.add(destination)
+                    if unit.id == leader.id:
+                        planned_leader_position = destination
+                    actions.append(
+                        f"{str(unit.id)[:8]} {mission_label} "
+                        f"team={squad.squad_id} {direction.value}"
+                    )
+                    continue
+            unit.wait()
+            occupied.add(position)
+            actions.append(
+                f"{str(unit.id)[:8]} {mission_label}-hold team={squad.squad_id}"
+            )
 
 
 def plan_vanguards(context: PlanningContext) -> None:
@@ -2529,7 +2551,7 @@ def plan_vanguards(context: PlanningContext) -> None:
             continue
         position: Pos = tuple(vanguard.position)
         occupied.discard(position)
-        is_home_guard = vanguard.id == memory.home_vanguard_id
+        is_home_guard = vanguard.id in context.home_squad_ids
 
         if context.spawn_clearing and not context.home_combat_targets:
             destination = core_clear_destination(
@@ -2605,7 +2627,7 @@ def plan_vanguards(context: PlanningContext) -> None:
                             f"{direction.value}"
                         )
                         continue
-                destination = expedition_approach_step(
+                destination = combat_approach_step(
                     context,
                     position,
                     target_position,
@@ -2959,7 +2981,7 @@ def plan_rangers(context: PlanningContext) -> None:
         visible_entity_cells = {
             tuple(enemy.position) for enemy in context.turn.visible_enemies
         }
-        is_home_guard = ranger.id == memory.home_ranger_id
+        is_home_guard = ranger.id in context.home_squad_ids
 
         if context.spawn_clearing and not context.home_combat_targets:
             destination = core_clear_destination(
@@ -2974,6 +2996,31 @@ def plan_rangers(context: PlanningContext) -> None:
                     occupied.add(destination)
                     actions.append(
                         f"{str(ranger.id)[:8]} spawn-clear {direction.value}"
+                    )
+                    continue
+
+        adjacent_vanguards = tuple(
+            enemy
+            for enemy in context.combat_enemies
+            if enemy.unit_type is UnitType.VANGUARD
+            and manhattan(position, tuple(enemy.position)) == 1
+        )
+        if adjacent_vanguards:
+            destination = choose_flee_step(
+                position,
+                (tuple(enemy.position) for enemy in adjacent_vanguards),
+                context.core_pos,
+                memory.known_obstacles | context.known_enemy_core_cells,
+                occupied.occupied_cells() | context.visible_enemy_unit_cells,
+                True,
+            )
+            if destination is not None:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    ranger.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(ranger.id)[:8]} ranger-disengage {direction.value}"
                     )
                     continue
 
@@ -3445,83 +3492,60 @@ def plan_core_production(
     if not core_available or turn.state.population >= MAX_AUTO_POPULATION:
         return
 
-    # 控制模式：家园守军、Worker、基础巡逻队，最后才用高库存扩军。
+    # 控制模式：固定四个 Worker，其余人口严格补成 2V1R 小队。
     if mode == "control":
-        local_defenders = sum(
-            manhattan(tuple(unit.position), context.core_pos) <= HOME_ENGAGE_RADIUS
-            for unit in (*context.vanguards, *context.rangers)
-        )
-        emergency_gap = max(0, len(context.home_combat_targets) - local_defenders)
-        max_control_vanguards = (
-            TARGET_HOME_VANGUARDS
-            + TARGET_ROAM_VANGUARDS
-            + MAX_EMERGENCY_VANGUARDS
-        )
-        roaming_vanguard_count = sum(
-            unit.id != memory.home_vanguard_id
-            and unit.id not in context.reserved_combat_ids
-            for unit in context.vanguards
-        )
-        roaming_ranger_count = sum(
-            unit.id != memory.home_ranger_id
-            and unit.id not in context.reserved_combat_ids
-            for unit in context.rangers
-        )
-        core_pressure_active = (
-            turn.resources * CORE_PRESSURE_DENOMINATOR
-            >= turn.resource_capacity * CORE_PRESSURE_NUMERATOR
-        )
         spawn_type: UnitType | None = None
         spawn_reason = ""
-        if memory.home_vanguard_id is None and turn.resources >= 10:
-            spawn_type = UnitType.VANGUARD
-            spawn_reason = "restore home Vanguard"
-        elif memory.home_ranger_id is None and turn.resources >= 12:
-            spawn_type = UnitType.RANGER
-            spawn_reason = "restore home Ranger"
-        elif (
-            emergency_gap > 0
-            and len(context.vanguards) < max_control_vanguards
-            and turn.resources >= 10
-        ):
-            spawn_type = UnitType.VANGUARD
-            spawn_reason = f"emergency gap={emergency_gap}"
-        elif len(context.workers) < TARGET_WORKERS_CONTROL and turn.resources >= 5:
+        if len(context.workers) < TARGET_WORKERS_CONTROL and turn.resources >= 5:
             spawn_type = UnitType.WORKER
             spawn_reason = (
                 f"expand Workers {len(context.workers) + 1}/"
                 f"{TARGET_WORKERS_CONTROL}"
             )
-        elif (
-            roaming_vanguard_count < TARGET_ROAM_VANGUARDS
-            and turn.resources >= 10
-        ):
-            spawn_type = UnitType.VANGUARD
-            spawn_reason = "restore roaming Vanguard"
-        elif core_pressure_active:
-            next_pressure_type = (
-                UnitType.VANGUARD
-                if roaming_vanguard_count
-                < ROAM_VANGUARDS_PER_RANGER * (roaming_ranger_count + 1)
-                else UnitType.RANGER
+        else:
+            home_squad = next(
+                (squad for squad in context.combat_squads if squad.squad_id == 0),
+                CombatSquad(0, (), ()),
             )
-            pressure_cost = 10 if next_pressure_type is UnitType.VANGUARD else 12
-            if turn.resources >= pressure_cost:
-                spawn_type = next_pressure_type
+            incomplete = (
+                home_squad
+                if not home_squad.complete
+                else next(
+                    (squad for squad in context.combat_squads if not squad.complete),
+                    None,
+                )
+            )
+            if incomplete is None:
+                next_squad_id = max(
+                    (squad.squad_id for squad in context.combat_squads),
+                    default=-1,
+                ) + 1
+                missing_type = UnitType.VANGUARD
+                squad_id = next_squad_id
+            elif len(incomplete.vanguard_ids) < SQUAD_VANGUARDS:
+                missing_type = UnitType.VANGUARD
+                squad_id = incomplete.squad_id
+            else:
+                missing_type = UnitType.RANGER
+                squad_id = incomplete.squad_id
+            cost = 10 if missing_type is UnitType.VANGUARD else 12
+            if turn.resources >= cost:
+                spawn_type = missing_type
                 spawn_reason = (
-                    f"core pressure {turn.resources}/{turn.resource_capacity} "
-                    f"roam={roaming_vanguard_count}V:{roaming_ranger_count}R"
+                    f"fill squad={squad_id} "
+                    f"{len(incomplete.vanguard_ids) if incomplete else 0}V:"
+                    f"{len(incomplete.ranger_ids) if incomplete else 0}R"
                 )
         if spawn_type is not None:
             turn.core.spawn(spawn_type)
             actions.append(f"core spawn {spawn_type.value} ({spawn_reason})")
         return
 
-    # 采集模式：先保证五个 Worker，再按容量或防御缺口补 Vanguard。
+    # 采集模式也不再自动超过四个 Worker。
     if mode == "harvest":
         spawned_worker = False
-        if len(context.workers) < 5:
-            worker_threshold = 5 if len(context.workers) < 4 else 15
+        if len(context.workers) < TARGET_WORKERS_CONTROL:
+            worker_threshold = 5
             if turn.resources >= worker_threshold:
                 turn.core.spawn(UnitType.WORKER)
                 spawned_worker = True
@@ -3564,70 +3588,31 @@ def plan_turn(
     vanguards = sorted(turn.vanguards, key=lambda unit: str(unit.id))
     rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
     memory.sync_core_position(core_pos)
-    expedition_changed = memory.sync_pending_expedition_spawn(
-        vanguards,
-        rangers,
-        turn.events,
-    )
     sectors_changed = memory.prune_unit_state(
         workers,
         vanguards,
         rangers,
         turn.tick,
     )
-    expedition_changed = expedition_changed or sectors_changed
-    friendly_combat_ids = {unit.id for unit in (*vanguards, *rangers)}
-    if (
-        memory.beacon_keeper_id is not None
-        and (
-            turn.beacon.status is not BeaconStatus.CARRIED
-            or turn.beacon.carrier_id != memory.beacon_keeper_id
-            or memory.beacon_keeper_id not in friendly_combat_ids
-        )
-    ):
-        memory.beacon_keeper_id = None
-        expedition_changed = True
-    if memory.expedition_home_recovery:
-        memory.reset_expedition()
-        expedition_changed = True
-    reserved_before_activation = memory.expedition_unit_ids | {
-        unit_id for unit_id in (memory.beacon_keeper_id,) if unit_id is not None
-    }
-    roles_changed = memory.sync_combat_roles(
+    squads_changed = memory.sync_combat_squads(
         vanguards,
         rangers,
         core_pos,
-        reserved_before_activation,
     )
-    beacon_pos: Pos = tuple(turn.beacon.position)
-    launch_blocked_by_home_threat = any(
-        enemy.kind == "UNIT"
-        and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-        and manhattan(core_pos, tuple(enemy.position))
-        <= ROAM_HOME_RESPONSE_RADIUS
-        for enemy in turn.visible_enemies
+    combat_squads = memory.combat_squads(vanguards, rangers)
+    home_squad = next(
+        (squad for squad in combat_squads if squad.squad_id == 0),
+        None,
     )
-    launch_ready = (
-        mode == "control"
-        and not memory.expedition_active
-        and turn.state.population >= MAX_AUTO_POPULATION
-        and turn.resources >= EXPEDITION_LAUNCH_RESOURCES
-        and len(workers) >= TARGET_WORKERS_CONTROL
-        and turn.tick >= memory.expedition_cooldown_until
-        and not launch_blocked_by_home_threat
-    )
-    if launch_ready:
-        expedition_changed = (
-            memory.activate_expedition(
-                vanguards,
-                rangers,
-                beacon_pos,
-            )
-            or expedition_changed
-        )
-    reserved_combat_ids = memory.expedition_unit_ids | {
-        unit_id for unit_id in (memory.beacon_keeper_id,) if unit_id is not None
-    }
+    home_squad_ids = home_squad.unit_ids if home_squad else set()
+    field_combat_ids = set().union(
+        *(
+            squad.unit_ids
+            for squad in combat_squads
+            if squad.squad_id != 0
+        ),
+    ) if any(squad.squad_id != 0 for squad in combat_squads) else set()
+    reserved_combat_ids = set(field_combat_ids)
     sectors_before = dict(memory.worker_sector)
     memory.sync_worker_sectors(workers)
     sectors_changed = sectors_changed or memory.worker_sector != sectors_before
@@ -3686,6 +3671,11 @@ def plan_turn(
         turn.visible_enemies,
         vision_sources,
         memory.known_obstacles,
+        turn.tick,
+    )
+    assault_changed = memory.sync_assault_target(
+        turn.visible_enemies,
+        core_pos,
         turn.tick,
     )
     memory.observe_enemy_workers(turn.visible_enemies, turn.tick)
@@ -3766,12 +3756,7 @@ def plan_turn(
     roaming_combat_units = tuple(
         unit
         for unit in (*vanguards, *rangers)
-        if unit.id
-        not in {
-            memory.home_vanguard_id,
-            memory.home_ranger_id,
-            *reserved_combat_ids,
-        }
+        if unit.id in field_combat_ids
     )
     memory.prune_roam_chases(turn.tick)
     roam_is_aggressive = len(roaming_combat_units) >= ROAM_AGGRESSIVE_SIZE
@@ -3892,6 +3877,17 @@ def plan_turn(
         occupied=occupied,
         resource_assignments=resource_assignments,
         reserved_combat_ids=reserved_combat_ids,
+        combat_squads=combat_squads,
+        home_squad_ids=home_squad_ids,
+        field_combat_ids=field_combat_ids,
+        assault_target=next(
+            (
+                enemy
+                for enemy in turn.visible_enemies
+                if enemy.id == memory.assault_target_id
+            ),
+            None,
+        ),
         roaming_combat_units=roaming_combat_units,
         roam_is_aggressive=roam_is_aggressive,
         trap_obstacles=trap_obstacles,
@@ -3902,23 +3898,18 @@ def plan_turn(
         spawn_clearing=turn.tick < memory.spawn_clear_until,
         actions=actions,
     )
-    expedition_before_planning = memory.expedition_signature()
     plan_workers(context)
-    plan_expedition(context)
+    plan_field_squads(context)
     plan_vanguards(context)
     plan_rangers(context)
     plan_core_production(context, mode, target)
-    expedition_changed = (
-        memory.expedition_signature() != expedition_before_planning
-        or expedition_changed
-    )
 
     if (
         resources_changed
-        or roles_changed
+        or squads_changed
         or sectors_changed
         or enemy_cores_changed
-        or expedition_changed
+        or assault_changed
         or turn.tick - memory.last_state_save_tick >= STATE_SAVE_INTERVAL_TICKS
     ):
         save_state(memory.persistent_state())

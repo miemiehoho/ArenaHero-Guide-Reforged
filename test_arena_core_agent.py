@@ -20,11 +20,9 @@ from arena_hero import (
 from arena_hero.actions import (
     DepositAction,
     MoveAction,
-    PickupBeaconAction,
     ShootAction,
     SpawnAction,
     SweepAction,
-    WaitAction,
 )
 from arena_hero.turn import Turn
 
@@ -293,34 +291,29 @@ class ProductionTests(AgentTestCase):
         self.assertEqual(actions, [])
         self.assertEqual(turn.plan.unit_actions, {})
 
-    def test_control_production_restores_home_vanguard_first(self):
-        units = [
-            *workers(5),
-            controlled_unit(200, UnitType.RANGER, (0, 1)),
-        ]
-        plan, actions, _ = self.plan(make_turn(units, resources=10))
+    def test_control_stops_workers_at_four_then_starts_frontline(self):
+        plan, _, _ = self.plan(make_turn(workers(3), resources=10))
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.WORKER)
+
+        plan, _, _ = self.plan(make_turn(workers(4), resources=10))
         self.assertIsInstance(plan.core_action, SpawnAction)
         self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
-        self.assertTrue(any("restore home Vanguard" in action for action in actions))
 
-    def test_control_production_restores_home_ranger_second(self):
+    def test_control_fills_each_squad_as_two_vanguards_one_ranger(self):
         units = [
-            *workers(5),
+            *workers(4),
             controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-        ]
-        plan, _, _ = self.plan(make_turn(units, resources=12))
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
-
-    def test_control_expands_workers_before_roaming_vanguard(self):
-        units = [
-            *workers(7),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.RANGER, (1, 0)),
         ]
         plan, _, _ = self.plan(make_turn(units, resources=10))
         self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.WORKER)
+        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+
+        units.append(controlled_unit(202, UnitType.VANGUARD, (1, 0)))
+        plan, actions, _ = self.plan(make_turn(units, resources=12))
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
+        self.assertTrue(any("fill squad=0" in action for action in actions))
 
     def test_automatic_population_stops_at_nineteen(self):
         units = population_workers(19)
@@ -337,10 +330,15 @@ class ProductionTests(AgentTestCase):
             self.assertFalse(any("core spawn" in action for action in actions))
 
     def test_automatic_population_can_reach_but_not_exceed_nineteen(self):
-        turn = make_turn(population_workers(18), resources=10)
+        units = [
+            *workers(4),
+            *(controlled_unit(200 + index, UnitType.VANGUARD, (index, 5)) for index in range(10)),
+            *(controlled_unit(300 + index, UnitType.RANGER, (index, 7)) for index in range(4)),
+        ]
+        turn = make_turn(units, resources=12)
         plan, _, _ = self.plan(turn)
         self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
 
 
 class WorkerTests(AgentTestCase):
@@ -350,22 +348,25 @@ class WorkerTests(AgentTestCase):
         units = [
             controlled_unit(100, UnitType.WORKER, (8, 0)),
             controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (20, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
+            controlled_unit(202, UnitType.VANGUARD, (1, 0)),
+            controlled_unit(203, UnitType.VANGUARD, (20, 0)),
+            controlled_unit(204, UnitType.VANGUARD, (20, 1)),
+            controlled_unit(301, UnitType.RANGER, (1, 1)),
+            controlled_unit(302, UnitType.RANGER, (20, 2)),
         ]
         memory = agent.AgentMemory()
         self.plan(make_turn(units, tick=100, core_position=(0, 0)), memory)
         old_worker_goal = memory.scout_goal[UUID(int=100)]
-        old_roam_goal = memory.roam_goal[UUID(int=202)]
+        old_roam_goal = memory.squad_patrol_goal[1]
 
         self.plan(make_turn(units, tick=101, core_position=(10, 0)), memory)
         new_worker_goal = memory.scout_goal[UUID(int=100)]
-        new_roam_goal = memory.roam_goal[UUID(int=202)]
+        new_roam_goal = memory.squad_patrol_goal[1]
 
         self.assertNotEqual(new_worker_goal, old_worker_goal)
         self.assertNotEqual(new_roam_goal, old_roam_goal)
         self.assertEqual(memory.home_vanguard_id, UUID(int=201))
-        self.assertEqual(memory.home_ranger_id, UUID(int=203))
+        self.assertEqual(memory.home_ranger_id, UUID(int=301))
 
     def test_resource_matching_scales_to_manual_worker_population(self):
         units = population_workers(19)
@@ -517,44 +518,6 @@ class WorkerTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
 
 
-class PressureProductionTests(AgentTestCase):
-    """资源充足时的巡逻编成生产规则。"""
-
-    def test_complete_composition_banks_core(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        plan, _, _ = self.plan(make_turn(units, resources=40))
-        self.assertIsNone(plan.core_action)
-
-    def test_ninety_percent_capacity_adds_roaming_vanguard(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        plan, actions, _ = self.plan(make_turn(units, resources=50))
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
-        self.assertTrue(any("core pressure 50/55" in action for action in actions))
-
-    def test_pressure_ratio_buys_ranger_after_two_roaming_vanguards(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (11, 0)),
-            controlled_unit(205, UnitType.RANGER, (1, 0)),
-        ]
-        plan, _, _ = self.plan(make_turn(units, resources=59))
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
-
-
 class RangerCombatTests(AgentTestCase):
     """Ranger 的 v0.8 八方向射线规则。"""
 
@@ -582,947 +545,161 @@ class RangerCombatTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[UUID(int=201)], ShootAction)
 
 
-class DefensiveProductionTests(AgentTestCase):
-    """巡逻比例延续和家园紧急生产规则。"""
-
-    def test_pressure_ratio_returns_to_vanguard_after_roaming_ranger(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (11, 0)),
-            controlled_unit(204, UnitType.VANGUARD, (12, 0)),
-            controlled_unit(205, UnitType.RANGER, (1, 0)),
-            controlled_unit(206, UnitType.RANGER, (10, 1)),
-        ]
-        plan, _, _ = self.plan(make_turn(units, resources=63))
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
-
-    def test_emergency_vanguards_are_capped_at_two(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (8, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (8, 1)),
-            controlled_unit(204, UnitType.VANGUARD, (8, 2)),
-            controlled_unit(205, UnitType.RANGER, (1, 0)),
-        ]
-        enemies = [
-            enemy_unit(300 + index, UnitType.VANGUARD, (4, index)) for index in range(6)
-        ]
-        plan, _, _ = self.plan(make_turn(units, enemies=enemies, resources=50))
-        self.assertIsNone(plan.core_action)
-
-    def test_outnumbered_home_spawns_emergency_vanguard(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        enemies = [
-            enemy_unit(300, UnitType.VANGUARD, (4, 0)),
-            enemy_unit(301, UnitType.VANGUARD, (4, 1)),
-            enemy_unit(302, UnitType.RANGER, (4, 2)),
-            enemy_unit(303, UnitType.RANGER, (5, 2)),
-        ]
-        plan, actions, _ = self.plan(make_turn(units, enemies=enemies, resources=10))
-        self.assertIsInstance(plan.core_action, SpawnAction)
-        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
-        self.assertTrue(any("emergency gap=" in action for action in actions))
-
-
-class CombatTests(AgentTestCase):
-    """Core 保护、家园防守、巡逻追击和协助拦截。"""
-
-    def test_enemy_core_is_never_attacked(self):
-        units = [controlled_unit(201, UnitType.VANGUARD, (0, 0))]
-        turn = make_turn(units, enemies=[enemy_core(400, (1, 0))])
-        plan, _, _ = self.plan(turn)
-        self.assertNotIsInstance(plan.unit_actions[UUID(int=201)], SweepAction)
-
-    def test_aggressive_roaming_vanguard_sweeps_visible_core(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (1, 2)),
-            controlled_unit(203, UnitType.VANGUARD, (6, 0)),
-            controlled_unit(204, UnitType.RANGER, (0, 1)),
-            controlled_unit(205, UnitType.RANGER, (0, 3)),
-        ]
-        memory = agent.AgentMemory(
-            home_vanguard_id=UUID(int=201),
-            home_ranger_id=UUID(int=204),
-        )
-        plan, actions, _ = self.plan(
-            make_turn(units, enemies=[enemy_core(400, (2, 2))]),
-            memory,
-        )
-
-        self.assertIsInstance(
-            plan.unit_actions[UUID(int=202)],
-            SweepAction,
-        )
-        self.assertTrue(any("roam-core-sweep" in action for action in actions))
-
-    def test_aggressive_roaming_ranger_prioritizes_visible_core(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (6, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (6, 1)),
-            controlled_unit(204, UnitType.RANGER, (1, 0)),
-            controlled_unit(205, UnitType.RANGER, (0, 0)),
-        ]
-        memory = agent.AgentMemory(
-            home_vanguard_id=UUID(int=201),
-            home_ranger_id=UUID(int=204),
-        )
-        core = enemy_core(400, (2, 2))
-        plan, actions, _ = self.plan(
-            make_turn(
-                units,
-                enemies=[core, enemy_unit(401, UnitType.VANGUARD, (2, 2))],
-            ),
-            memory,
-        )
-
-        ranger_action = plan.unit_actions[UUID(int=205)]
-        self.assertIsInstance(ranger_action, ShootAction)
-        self.assertEqual(ranger_action.target_id, core.id)
-        self.assertTrue(any("roam-core-shoot" in action for action in actions))
-
-    def test_aggressive_core_priority_keeps_outnumbered_retreat(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (1, 2)),
-            controlled_unit(203, UnitType.VANGUARD, (6, 0)),
-            controlled_unit(204, UnitType.RANGER, (0, 1)),
-            controlled_unit(205, UnitType.RANGER, (0, 3)),
-        ]
-        enemies = [
-            enemy_core(400, (2, 2)),
-            enemy_unit(401, UnitType.VANGUARD, (1, 1)),
-            enemy_unit(402, UnitType.VANGUARD, (1, 3)),
-            enemy_unit(403, UnitType.RANGER, (2, 1)),
-            enemy_unit(404, UnitType.RANGER, (2, 3)),
-        ]
-        memory = agent.AgentMemory(
-            home_vanguard_id=UUID(int=201),
-            home_ranger_id=UUID(int=204),
-        )
-
-        plan, actions, _ = self.plan(make_turn(units, enemies=enemies), memory)
-
-        self.assertNotIsInstance(
-            plan.unit_actions[UUID(int=202)],
-            SweepAction,
-        )
-        self.assertFalse(any("roam-core" in action for action in actions))
-        self.assertTrue(any("roam-retreat" in action for action in actions))
-
-    def test_unit_sharing_enemy_core_cell_is_not_attacked(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(202, UnitType.RANGER, (0, -1)),
-        ]
-        enemies = [
-            enemy_core(400, (1, 0)),
-            enemy_unit(401, UnitType.WORKER, (1, 0)),
-        ]
-        plan, _, _ = self.plan(make_turn(units, enemies=enemies))
-        self.assertNotIsInstance(plan.unit_actions[UUID(int=201)], SweepAction)
-        self.assertNotIsInstance(plan.unit_actions[UUID(int=202)], ShootAction)
-
-    def test_static_enemy_worker_is_hunted_by_roaming_vanguard(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        enemies = [enemy_unit(401, UnitType.WORKER, (11, 0))]
-        plan, _, _ = self.plan(make_turn(units, enemies=enemies))
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], SweepAction)
-
-    def test_static_worker_in_diagonal_roam_area_is_not_filtered_out(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (20, 20)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        enemies = [enemy_unit(401, UnitType.WORKER, (21, 20))]
-
-        plan, actions, _ = self.plan(make_turn(units, enemies=enemies))
-
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], SweepAction)
-        self.assertTrue(any("roam-sweep WORKER" in action for action in actions))
-
-    def test_enemy_core_diagonal_outskirts_are_valid_roam_goals(self):
-        memory = agent.AgentMemory(
-            known_enemy_cores={UUID(int=400): ((20, 20), 100)},
-        )
-
-        goal = memory.roam_goal_for(
-            UUID(int=202),
-            (0, 0),
-            (0, 0),
-            set(),
-        )
-
-        self.assertIn(goal, {(20, 16), (24, 20), (20, 24), (16, 20)})
-
-    def test_roaming_ranger_can_reposition_in_diagonal_area(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (20, 19)),
-            controlled_unit(203, UnitType.RANGER, (0, 2)),
-            controlled_unit(204, UnitType.RANGER, (20, 20)),
-        ]
-        enemies = [enemy_unit(401, UnitType.VANGUARD, (23, 20))]
-        memory = agent.AgentMemory(known_obstacles={(22, 20)})
-
-        plan, actions, _ = self.plan(
-            make_turn(units, enemies=enemies),
-            memory,
-        )
-
-        self.assertTrue(hasattr(plan.unit_actions[UUID(int=204)], "direction"))
-        self.assertTrue(any("roam-aim" in action for action in actions))
-
-    def test_roaming_rangers_follow_distinct_vanguards(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (-10, 0)),
-            controlled_unit(204, UnitType.RANGER, (1, 0)),
-            controlled_unit(205, UnitType.RANGER, (6, 0)),
-            controlled_unit(206, UnitType.RANGER, (-6, 0)),
-        ]
-        memory = agent.AgentMemory(
-            home_vanguard_id=UUID(int=201),
-            home_ranger_id=UUID(int=204),
-        )
-
-        plan, actions, memory = self.plan(make_turn(units), memory)
-
-        assignments = {
-            ranger_id: memory.ranger_follow_vanguard[ranger_id]
-            for ranger_id in (UUID(int=205), UUID(int=206))
-        }
-        self.assertEqual(
-            set(assignments.values()),
-            {UUID(int=202), UUID(int=203)},
-        )
-        self.assertIsInstance(plan.unit_actions[UUID(int=205)], MoveAction)
-        self.assertIsInstance(plan.unit_actions[UUID(int=206)], MoveAction)
-        self.assertEqual(
-            sum("roam-follow " in action for action in actions),
-            2,
-        )
-
-        starts = {UUID(int=205): (6, 0), UUID(int=206): (-6, 0)}
-        vanguard_starts = {UUID(int=202): (10, 0), UUID(int=203): (-10, 0)}
-        for ranger_id, vanguard_id in assignments.items():
-            vanguard_action = plan.unit_actions[vanguard_id]
-            ranger_action = plan.unit_actions[ranger_id]
-            self.assertIsInstance(vanguard_action, MoveAction)
-            planned_vanguard = agent.add(
-                vanguard_starts[vanguard_id],
-                vanguard_action.direction.delta,
-            )
-            ranger_destination = agent.add(
-                starts[ranger_id],
-                ranger_action.direction.delta,
-            )
-            self.assertLess(
-                agent.manhattan(ranger_destination, planned_vanguard),
-                agent.manhattan(starts[ranger_id], planned_vanguard),
-            )
-
-    def test_ranger_follow_assignments_remain_stable(self):
-        memory = agent.AgentMemory()
-        first_rangers = (
-            controlled_unit(205, UnitType.RANGER, (9, 0)),
-            controlled_unit(206, UnitType.RANGER, (-9, 0)),
-        )
-        vanguards = (
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (-10, 0)),
-        )
-        initial = memory.assign_ranger_follow_targets(first_rangers, vanguards)
-
-        moved_rangers = (
-            controlled_unit(205, UnitType.RANGER, (-9, 0)),
-            controlled_unit(206, UnitType.RANGER, (9, 0)),
-        )
-        updated = memory.assign_ranger_follow_targets(moved_rangers, vanguards)
-
-        self.assertEqual(updated, initial)
-        self.assertEqual(len(set(updated.values())), 2)
-
-    def test_ranger_follow_targets_balance_when_vanguards_are_fewer(self):
-        memory = agent.AgentMemory()
-        rangers = tuple(
-            controlled_unit(unit_id, UnitType.RANGER, (8 + unit_id - 205, 0))
-            for unit_id in (205, 206, 207)
-        )
-        vanguards = (
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (-10, 0)),
-        )
-
-        assignments = memory.assign_ranger_follow_targets(rangers, vanguards)
-        target_counts = sorted(
-            list(assignments.values()).count(vanguard.id)
-            for vanguard in vanguards
-        )
-
-        self.assertEqual(target_counts, [1, 2])
-
-    def test_home_patrol_move_stays_inside_seven_by_seven_square(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(202, UnitType.RANGER, (0, 1)),
-        ]
-        plan, _, memory = self.plan(make_turn(units))
-        for unit_id in (UUID(int=201), UUID(int=202)):
-            action = plan.unit_actions[unit_id]
-            if hasattr(action, "direction"):
-                start = (0, 0) if unit_id.int == 201 else (0, 1)
-                destination = agent.add(start, action.direction.delta)
-                self.assertLessEqual(agent.chebyshev(destination, (0, 0)), 3)
-        self.assertEqual(memory.home_vanguard_id, UUID(int=201))
-        self.assertEqual(memory.home_ranger_id, UUID(int=202))
-
-    def test_moving_worker_without_helper_is_not_chased(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        enemy = enemy_unit(401, UnitType.WORKER, (11, 0))
-        memory = agent.AgentMemory()
-        memory.enemy_worker_tracks[enemy.id] = agent.EnemyWorkerTrack(
-            position=(10, 0),
-            previous_position=(9, 0),
-            first_seen_position=(9, 0),
-            first_seen_tick=98,
-            last_seen_tick=99,
-            previous_seen_tick=98,
-        )
-        _, actions, _ = self.plan(
-            make_turn(units, enemies=[enemy], tick=100),
-            memory,
-        )
-        self.assertTrue(
-            any(action.startswith("00000000 roam-patrol") for action in actions)
-        )
-        self.assertFalse(any("roam-hunt" in action for action in actions))
-
-    def test_three_roamers_chase_moving_worker_without_helper(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (9, 1)),
-            controlled_unit(204, UnitType.VANGUARD, (9, 2)),
-            controlled_unit(205, UnitType.RANGER, (1, 0)),
-        ]
-        enemy = enemy_unit(401, UnitType.WORKER, (11, 0))
-        memory = agent.AgentMemory()
-        memory.enemy_worker_tracks[enemy.id] = agent.EnemyWorkerTrack(
-            position=(10, 0),
-            previous_position=(9, 0),
-            first_seen_position=(9, 0),
-            first_seen_tick=98,
-            last_seen_tick=99,
-            previous_seen_tick=98,
-        )
-        plan, actions, _ = self.plan(
-            make_turn(units, enemies=[enemy], tick=100),
-            memory,
-        )
-        self.assertTrue(any("roam-hunt" in action for action in actions))
-        self.assertTrue(
-            any(
-                isinstance(plan.unit_actions[UUID(int=unit_id)], SweepAction)
-                for unit_id in (202, 203, 204)
-            )
-        )
-
-    def test_three_roamers_engage_equal_enemy_combat_force(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (9, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (9, 1)),
-            controlled_unit(204, UnitType.VANGUARD, (9, 2)),
-            controlled_unit(205, UnitType.RANGER, (1, 0)),
-        ]
-        enemies = [
-            enemy_unit(401, UnitType.VANGUARD, (10, 0)),
-            enemy_unit(402, UnitType.VANGUARD, (10, 1)),
-            enemy_unit(403, UnitType.RANGER, (10, 2)),
-        ]
-        plan, _, _ = self.plan(make_turn(units, enemies=enemies, tick=100))
-        self.assertTrue(
-            any(
-                isinstance(plan.unit_actions[UUID(int=unit_id)], SweepAction)
-                for unit_id in (202, 203, 204)
-            )
-        )
-
-    def test_chase_stops_after_eight_ticks_without_trap(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (10, 1)),
-            controlled_unit(204, UnitType.VANGUARD, (10, 2)),
-            controlled_unit(205, UnitType.RANGER, (1, 0)),
-        ]
-        enemy = enemy_unit(401, UnitType.WORKER, (20, 0))
-        memory = agent.AgentMemory()
-        memory.enemy_worker_tracks[enemy.id] = agent.EnemyWorkerTrack(
-            position=(19, 0),
-            previous_position=(18, 0),
-            first_seen_position=(18, 0),
-            first_seen_tick=91,
-            last_seen_tick=99,
-            previous_seen_tick=98,
-        )
-        memory.roam_chase_started[enemy.id] = 92
-        _, actions, memory = self.plan(
-            make_turn(units, enemies=[enemy], tick=100),
-            memory,
-        )
-        self.assertFalse(any("roam-hunt" in action for action in actions))
-        self.assertGreater(memory.roam_chase_cooldown_until[enemy.id], 100)
-
-    def test_confirmed_trap_extends_chase_to_sixteen_ticks(self):
-        target_id = UUID(int=401)
-        memory = agent.AgentMemory()
-        memory.roam_chase_started[target_id] = 92
-        self.assertTrue(memory.can_continue_roam_chase(target_id, 100, True))
-        self.assertFalse(memory.can_continue_roam_chase(target_id, 108, True))
-
-    def test_moving_worker_recruits_idle_explorer_to_intercept(self):
-        worker_units = workers(8)
-        worker_units[0] = controlled_unit(100, UnitType.WORKER, (11, 2))
-        units = [
-            *worker_units,
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (9, 0)),
-            controlled_unit(203, UnitType.RANGER, (1, 0)),
-        ]
-        enemy = enemy_unit(401, UnitType.WORKER, (11, 0))
-        memory = agent.AgentMemory()
-        memory.enemy_worker_tracks[enemy.id] = agent.EnemyWorkerTrack(
-            position=(10, 0),
-            previous_position=(9, 0),
-            first_seen_position=(9, 0),
-            first_seen_tick=98,
-            last_seen_tick=99,
-            previous_seen_tick=98,
-        )
-        _, actions, _ = self.plan(
-            make_turn(units, enemies=[enemy], tick=100),
-            memory,
-        )
-        self.assertTrue(any(" intercept " in action for action in actions))
-
-    def test_enemy_worker_track_expires_after_three_unseen_ticks(self):
-        enemy_id = UUID(int=401)
-        memory = agent.AgentMemory()
-        memory.enemy_worker_tracks[enemy_id] = agent.EnemyWorkerTrack(
-            position=(10, 0),
-            previous_position=None,
-            first_seen_position=(10, 0),
-            first_seen_tick=100,
-            last_seen_tick=100,
-            previous_seen_tick=100,
-        )
-        memory.observe_enemy_workers((), 102)
-        self.assertIn(enemy_id, memory.enemy_worker_tracks)
-        memory.observe_enemy_workers((), 103)
-        self.assertNotIn(enemy_id, memory.enemy_worker_tracks)
-
-
-class ExpeditionTests(AgentTestCase):
-    """冠军信标远征的触发、编队、战斗、返航和补员。"""
+class SquadStrategyTests(AgentTestCase):
+    """2V1R 编制、独立巡逻、统一集结和守家紧急旁路。"""
 
     @staticmethod
-    def full_roster():
+    def roster():
         return [
-            *workers(8),
-            *(
-                controlled_unit(
-                    201 + index,
-                    UnitType.VANGUARD,
-                    (10 + index, index % 2),
-                )
-                for index in range(7)
-            ),
-            *(
-                controlled_unit(
-                    301 + index,
-                    UnitType.RANGER,
-                    (10 + index, 3),
-                )
-                for index in range(4)
-            ),
+            *workers(4),
+            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
+            controlled_unit(202, UnitType.VANGUARD, (1, 0)),
+            controlled_unit(301, UnitType.RANGER, (1, 1)),
+            controlled_unit(203, UnitType.VANGUARD, (10, 0)),
+            controlled_unit(204, UnitType.VANGUARD, (10, 1)),
+            controlled_unit(302, UnitType.RANGER, (9, 0)),
+            controlled_unit(205, UnitType.VANGUARD, (-10, 0)),
+            controlled_unit(206, UnitType.VANGUARD, (-10, 1)),
+            controlled_unit(303, UnitType.RANGER, (-9, 0)),
         ]
 
     @staticmethod
-    def role_memory():
+    def squad_memory():
         return agent.AgentMemory(
-            home_vanguard_id=UUID(int=201),
-            home_ranger_id=UUID(int=301),
+            squad_assignments={
+                UUID(int=201): 0,
+                UUID(int=202): 0,
+                UUID(int=301): 0,
+                UUID(int=203): 1,
+                UUID(int=204): 1,
+                UUID(int=302): 1,
+                UUID(int=205): 2,
+                UUID(int=206): 2,
+                UUID(int=303): 2,
+            },
         )
 
-    def test_expedition_launch_requires_full_roster_and_eighty_resources(self):
-        roster = self.full_roster()
-        memory = self.role_memory()
-        self.plan(make_turn(roster[:-1], resources=80), memory)
-        self.assertFalse(memory.expedition_active)
+    def test_squads_are_stable_persisted_two_vanguards_one_ranger(self):
+        _, _, memory = self.plan(make_turn(self.roster()), self.squad_memory())
 
-        memory = self.role_memory()
-        self.plan(make_turn(roster, resources=79), memory)
-        self.assertFalse(memory.expedition_active)
+        squads = memory.combat_squads(
+            [unit for unit in self.roster() if unit.unit_type is UnitType.VANGUARD],
+            [unit for unit in self.roster() if unit.unit_type is UnitType.RANGER],
+        )
+        self.assertEqual(len(squads), 3)
+        self.assertTrue(all(squad.complete for squad in squads))
+        self.assertEqual(squads[0].unit_ids, {UUID(int=201), UUID(int=202), UUID(int=301)})
 
-        memory = self.role_memory()
-        _, actions, memory = self.plan(make_turn(roster, resources=80), memory)
-        self.assertTrue(memory.expedition_active)
-        self.assertEqual(len(memory.expedition_vanguard_ids), 2)
-        self.assertEqual(len(memory.expedition_ranger_ids), 1)
-        self.assertNotIn(memory.home_vanguard_id, memory.expedition_unit_ids)
-        self.assertNotIn(memory.home_ranger_id, memory.expedition_unit_ids)
-        self.assertTrue(any("expedition-" in action for action in actions))
-
-        memory.expedition_returning = True
-        memory.expedition_cooldown_until = 400
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 4)
-        self.assertEqual(restored.expedition_unit_ids, memory.expedition_unit_ids)
-        self.assertEqual(restored.expedition_leader_id, memory.expedition_leader_id)
-        self.assertTrue(restored.expedition_returning)
-        self.assertEqual(restored.expedition_cooldown_until, 400)
+        self.assertEqual(restored.persistent_state()["version"], 5)
+        self.assertEqual(restored.squad_assignments, memory.squad_assignments)
 
-    def test_home_combat_threat_blocks_expedition_launch(self):
-        enemy = enemy_unit(401, UnitType.VANGUARD, (18, 0))
-        memory = self.role_memory()
+    def test_complete_field_squads_patrol_independently_without_global_gather(self):
+        _, actions, memory = self.plan(make_turn(self.roster()), self.squad_memory())
 
-        self.plan(
-            make_turn(self.full_roster(), enemies=[enemy], resources=80),
-            memory,
+        self.assertFalse(memory.assault_gathering)
+        self.assertIn(1, memory.squad_patrol_goal)
+        self.assertIn(2, memory.squad_patrol_goal)
+        self.assertTrue(any("squad-patrol" in action and "team=1" in action for action in actions))
+        self.assertTrue(any("squad-patrol" in action and "team=2" in action for action in actions))
+        self.assertFalse(any("squad-gather" in action for action in actions))
+
+    def test_enemy_core_discovery_gathers_all_field_squads_before_attack(self):
+        _, actions, memory = self.plan(
+            make_turn(self.roster(), enemies=[enemy_core(400, (20, 0))]),
+            self.squad_memory(),
         )
 
-        self.assertFalse(memory.expedition_active)
+        self.assertTrue(memory.assault_gathering)
+        self.assertIsNotNone(memory.assault_rally_position)
+        self.assertTrue(any("squad-gather" in action and "team=1" in action for action in actions))
+        self.assertTrue(any("squad-gather" in action and "team=2" in action for action in actions))
+        self.assertFalse(any("squad-assault-sweep" in action for action in actions))
 
-    def test_roaming_units_respond_to_combat_threat_near_home(self):
+    def test_gathered_field_squads_switch_to_joint_assault(self):
+        units = self.roster()
+        positions = {
+            203: (8, 0), 204: (8, 1), 302: (7, 0),
+            205: (9, 0), 206: (9, 1), 303: (8, 2),
+        }
         units = [
-            controlled_unit(201, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(202, UnitType.VANGUARD, (-10, 0)),
-            controlled_unit(301, UnitType.RANGER, (1, 0)),
-            controlled_unit(302, UnitType.RANGER, (-10, 2)),
+            controlled_unit(unit.id.int, unit.unit_type, positions.get(unit.id.int, tuple(unit.position)))
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in units
         ]
-        enemy = enemy_unit(401, UnitType.VANGUARD, (10, 0))
 
-        _, actions, _ = self.plan(
-            make_turn(units, enemies=[enemy]),
-            self.role_memory(),
+        _, actions, memory = self.plan(
+            make_turn(units, enemies=[enemy_core(400, (20, 0))]),
+            self.squad_memory(),
         )
 
-        response_actions = [
-            action for action in actions if "roam-home-response" in action
-        ]
-        self.assertEqual(len(response_actions), 2)
+        self.assertFalse(memory.assault_gathering)
+        self.assertTrue(any("squads assault-ready" in action for action in actions))
+        self.assertTrue(any("squad-assault" in action and "team=1" in action for action in actions))
+        self.assertTrue(any("squad-assault" in action and "team=2" in action for action in actions))
 
-    def test_expedition_leader_waits_for_member_beyond_formation_radius(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (6, 0)),
-            controlled_unit(301, UnitType.RANGER, (0, -1)),
-            controlled_unit(302, UnitType.RANGER, (1, 0)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
+    def test_gather_wait_is_interrupted_by_incoming_ranger_fire(self):
+        memory = self.squad_memory()
+        enemy = enemy_unit(401, UnitType.RANGER, (13, 0))
 
         plan, actions, _ = self.plan(
-            make_turn(units, beacon_position=(20, 0)),
+            make_turn(self.roster(), enemies=[enemy, enemy_core(400, (20, 0))]),
             memory,
         )
 
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], WaitAction)
         self.assertIsInstance(plan.unit_actions[UUID(int=203)], MoveAction)
-        self.assertTrue(any("expedition-follow" in action for action in actions))
+        self.assertTrue(any("squad-counter-fire" in action for action in actions))
 
-    def test_expedition_attacks_without_outnumbered_retreat(self):
+    def test_ranger_disengages_when_enemy_vanguard_is_adjacent(self):
         units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (0, 2)),
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                (10, 2) if unit.id == UUID(int=302) else tuple(unit.position),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
         ]
-        enemies = [enemy_unit(401, UnitType.WORKER, (1, 0))]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        plan, actions, _ = self.plan(make_turn(units, enemies=enemies), memory)
-
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], SweepAction)
-        self.assertTrue(any("expedition-sweep" in action for action in actions))
-        self.assertFalse(any("retreat" in action for action in actions))
-
-    def test_expedition_ranger_shoots_and_prioritizes_beacon_carrier(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (1, 1)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (0, 1)),
-        ]
-        carrier = enemy_unit(401, UnitType.VANGUARD, (0, 4))
-        nearby_worker = enemy_unit(402, UnitType.WORKER, (1, 0))
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
+        enemy = enemy_unit(401, UnitType.VANGUARD, (10, 3))
 
         plan, actions, _ = self.plan(
-            make_turn(
-                units,
-                enemies=[carrier, nearby_worker],
-                beacon_position=(0, 4),
-                beacon_status=BeaconStatus.CARRIED,
-                beacon_carrier_id=carrier.id,
-            ),
-            memory,
+            make_turn(units, enemies=[enemy]),
+            self.squad_memory(),
         )
 
-        ranger_action = plan.unit_actions[UUID(int=302)]
-        self.assertIsInstance(ranger_action, ShootAction)
-        self.assertEqual(ranger_action.target_id, carrier.id)
-        self.assertTrue(any("expedition-shoot" in action for action in actions))
+        self.assertIsInstance(plan.unit_actions[UUID(int=302)], MoveAction)
+        self.assertTrue(any("squad-ranger-disengage" in action for action in actions))
 
-    def test_expedition_stops_chasing_same_target_after_eight_ticks(self):
+    def test_destroyed_home_squad_triggers_support_and_rebuild(self):
         units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (1, 0)),
+            unit
+            for unit in self.roster()
+            if unit.id not in {UUID(int=201), UUID(int=202), UUID(int=301)}
         ]
-        enemy = enemy_unit(401, UnitType.VANGUARD, (5, 0))
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-        memory.expedition_target_id = enemy.id
-        memory.expedition_chase_started_tick = 92
+        enemy = enemy_unit(401, UnitType.VANGUARD, (4, 0))
 
+        plan, actions, memory = self.plan(
+            make_turn(units, enemies=[enemy], resources=10),
+            self.squad_memory(),
+        )
+
+        self.assertEqual(memory.home_vanguard_id, None)
+        self.assertTrue(any("squad-home-support" in action for action in actions))
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertTrue(any("fill squad=0" in action for action in actions))
+
+    def test_enemy_outside_roam_boundary_does_not_trigger_gather(self):
         _, actions, memory = self.plan(
-            make_turn(
-                units,
-                enemies=[enemy],
-                tick=100,
-                beacon_position=(0, 20),
-            ),
-            memory,
+            make_turn(self.roster(), enemies=[enemy_core(400, (25, 0))]),
+            self.squad_memory(),
         )
 
-        self.assertFalse(any("expedition-engage" in action for action in actions))
-        self.assertGreater(memory.expedition_chase_cooldown_until[enemy.id], 100)
-
-    def test_expedition_turns_home_without_picking_up_ground_beacon(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (5, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (5, 1)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (4, 0)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        plan, actions, memory = self.plan(
-            make_turn(
-                units,
-                beacon_position=(5, 0),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-        leader_action = plan.unit_actions[UUID(int=202)]
-        self.assertIsInstance(leader_action, MoveAction)
-        self.assertEqual(leader_action.direction.value, "LEFT")
-        self.assertTrue(memory.expedition_returning)
-        self.assertTrue(any("expedition-return" in action for action in actions))
-        self.assertFalse(
-            any(
-                isinstance(action, PickupBeaconAction)
-                for action in plan.unit_actions.values()
-            )
-        )
-
-        plan, actions, _ = self.plan(
-            make_turn(
-                units,
-                tick=101,
-                beacon_position=(5, 0),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], MoveAction)
-        self.assertTrue(any("expedition-return" in action for action in actions))
-
-    def test_expedition_releases_members_after_returning_without_beacon(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (1, 0)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_returning = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        plan, actions, memory = self.plan(
-            make_turn(
-                units,
-                beacon_position=(5, 0),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], WaitAction)
-        self.assertTrue(any("expedition-return-home" in action for action in actions))
-        self.assertFalse(memory.expedition_active)
-        self.assertFalse(memory.expedition_returning)
-        self.assertIsNone(memory.beacon_keeper_id)
-        self.assertEqual(memory.expedition_unit_ids, set())
-
-    def test_beacon_carrier_at_core_becomes_persistent_keeper(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (0, 1)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (1, 0)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        plan, _, memory = self.plan(
-            make_turn(
-                units,
-                beacon_position=(0, 0),
-                beacon_status=BeaconStatus.CARRIED,
-                beacon_carrier_id=UUID(int=202),
-            ),
-            memory,
-        )
-
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], WaitAction)
-        self.assertFalse(memory.expedition_active)
-        self.assertEqual(memory.beacon_keeper_id, UUID(int=202))
-        self.assertEqual(memory.expedition_unit_ids, set())
-
-    def test_beacon_keeper_follows_relocated_core(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (0, 0)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-        ]
-        memory = self.role_memory()
-        memory.beacon_keeper_id = UUID(int=202)
-
-        plan, actions, _ = self.plan(
-            make_turn(
-                units,
-                core_position=(2, 0),
-                beacon_position=(0, 0),
-                beacon_status=BeaconStatus.CARRIED,
-                beacon_carrier_id=UUID(int=202),
-            ),
-            memory,
-        )
-
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], MoveAction)
-        self.assertTrue(any("beacon-keeper" in action for action in actions))
-
-    def test_dropped_beacon_near_home_is_not_picked_up(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (1, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (8, 0)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (7, 0)),
-        ]
-        memory = self.role_memory()
-        memory.beacon_keeper_id = UUID(int=999)
-
-        plan, actions, memory = self.plan(
-            make_turn(
-                units,
-                resources=60,
-                beacon_position=(1, 0),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-
-        self.assertFalse(memory.expedition_active)
-        self.assertFalse(memory.expedition_home_recovery)
-        self.assertFalse(
-            any(
-                isinstance(action, PickupBeaconAction)
-                for action in plan.unit_actions.values()
-            )
-        )
-        self.assertFalse(any("pickup-beacon" in action for action in actions))
-
-    def test_ground_beacon_near_home_does_not_bypass_launch_threshold(self):
-        units = self.full_roster()[:-1]
-        memory = self.role_memory()
-
-        plan, _, memory = self.plan(
-            make_turn(
-                units,
-                resources=50,
-                beacon_position=tuple(units[8].position),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-
-        self.assertFalse(memory.expedition_active)
-        self.assertFalse(
-            any(
-                isinstance(action, PickupBeaconAction)
-                for action in plan.unit_actions.values()
-            )
-        )
-
-    def test_legacy_home_recovery_state_allows_normal_launch_when_ready(self):
-        units = self.full_roster()
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_home_recovery = True
-        memory.expedition_vanguard_ids = {UUID(int=202)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        plan, actions, memory = self.plan(
-            make_turn(
-                units,
-                resources=80,
-                beacon_position=(4, 0),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-
-        self.assertFalse(memory.expedition_home_recovery)
-        self.assertTrue(memory.expedition_active)
-        self.assertEqual(len(memory.expedition_vanguard_ids), 2)
-        self.assertEqual(len(memory.expedition_ranger_ids), 1)
-        self.assertIsNone(plan.core_action)
-        self.assertTrue(any("expedition-" in action for action in actions))
-
-    def test_legacy_home_recovery_state_clears_when_launch_is_not_ready(self):
-        units = [
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (4, 0)),
-            controlled_unit(203, UnitType.VANGUARD, (8, 0)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(302, UnitType.RANGER, (7, 0)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_home_recovery = True
-        memory.expedition_vanguard_ids = {UUID(int=202)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        _, _, memory = self.plan(
-            make_turn(
-                units,
-                resources=50,
-                beacon_position=(4, 0),
-                beacon_status=BeaconStatus.GROUND,
-            ),
-            memory,
-        )
-
-        self.assertFalse(memory.expedition_active)
-        self.assertFalse(memory.expedition_home_recovery)
-        self.assertEqual(memory.expedition_unit_ids, set())
-
-    def test_expedition_casualty_returns_survivors_and_starts_cooldown(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(202, UnitType.VANGUARD, (10, 0)),
-            controlled_unit(204, UnitType.VANGUARD, (12, 0)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(303, UnitType.RANGER, (12, 1)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_assembling = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        plan, actions, memory = self.plan(make_turn(units, resources=60), memory)
-
-        self.assertTrue(memory.expedition_returning)
-        self.assertFalse(memory.expedition_assembling)
-        self.assertEqual(memory.expedition_cooldown_until, 400)
-        self.assertIsInstance(plan.unit_actions[UUID(int=202)], MoveAction)
-        self.assertTrue(any("expedition-return" in action for action in actions))
-        self.assertFalse(any("expedition reinforcement" in action for action in actions))
-
-    def test_fully_lost_expedition_resets_without_frontline_rebuild(self):
-        units = [
-            *workers(8),
-            controlled_unit(201, UnitType.VANGUARD, (-1, 0)),
-            controlled_unit(204, UnitType.VANGUARD, (12, 0)),
-            controlled_unit(301, UnitType.RANGER, (-1, 1)),
-            controlled_unit(303, UnitType.RANGER, (12, 1)),
-        ]
-        memory = self.role_memory()
-        memory.expedition_active = True
-        memory.expedition_vanguard_ids = {UUID(int=202), UUID(int=203)}
-        memory.expedition_ranger_ids = {UUID(int=302)}
-        memory.expedition_leader_id = UUID(int=202)
-
-        _, actions, memory = self.plan(
-            make_turn(units, resources=60),
-            memory,
-        )
-
-        self.assertFalse(memory.expedition_active)
-        self.assertEqual(memory.expedition_cooldown_until, 400)
-        self.assertFalse(any("expedition reinforcement" in action for action in actions))
+        self.assertIsNone(memory.assault_target_id)
+        self.assertFalse(memory.assault_gathering)
+        self.assertFalse(any("squad-gather" in action for action in actions))
 
     def test_cell_unit_limit_starts_spawn_clearing_and_suppresses_production(self):
         worker = controlled_unit(100, UnitType.WORKER, (0, 0))
@@ -1543,7 +720,7 @@ class ExpeditionTests(AgentTestCase):
         self.assertTrue(any("spawn-clear" in action for action in actions))
 
 
-class ExpeditionResourceTests(AgentTestCase):
+class ResourceMemoryTests(AgentTestCase):
     def test_resource_pool_keeps_radius_32_and_prunes_radius_33(self):
         inside = (32, 32)
         outside = (33, 0)
