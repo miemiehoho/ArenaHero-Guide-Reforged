@@ -10,6 +10,7 @@ from arena_hero import (
     ChampionBeacon,
     CoreState,
     CoreView,
+    Direction,
     PlayerState,
     PlayerStatus,
     ResolutionEvent,
@@ -19,6 +20,7 @@ from arena_hero import (
 )
 from arena_hero.actions import (
     DepositAction,
+    HealAction,
     MoveAction,
     ShootAction,
     SpawnAction,
@@ -38,13 +40,14 @@ def controlled_unit(
     position: tuple[int, int],
     *,
     cargo: int = 0,
+    hp: int = 10,
 ):
     kwargs = {
         "kind": "UNIT",
         "id": UUID(int=unit_id),
         "controlled": True,
         "position": position,
-        "hp": 10,
+        "hp": hp,
         "unit_type": unit_type,
     }
     if unit_type is UnitType.WORKER:
@@ -89,7 +92,16 @@ def make_turn(
     resource_cells=(),
     obstacle_cells=(),
     events=(),
+    core_state: CoreState = CoreState.NORMAL,
 ):
+    core_kwargs = {}
+    if core_state is CoreState.MOVING:
+        core_kwargs = {
+            "move_direction": Direction.RIGHT,
+            "move_progress": 1,
+            "move_required_ticks": 3,
+            "destination": (core_position[0] + 1, core_position[1]),
+        }
     core = CoreView(
         kind="CORE",
         id=CORE_ID,
@@ -98,7 +110,8 @@ def make_turn(
         position=core_position,
         hp=100,
         shield=10,
-        state=CoreState.NORMAL,
+        state=core_state,
+        **core_kwargs,
     )
     terrain = []
     if resource_cells:
@@ -620,6 +633,125 @@ class WorkerTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
 
 
+class HealingTests(AgentTestCase):
+    """空闲残血单位返家、支付治疗和 Core 入口防堵。"""
+
+    def test_idle_worker_returns_to_stationary_core_when_full_heal_is_affordable(self):
+        worker = controlled_unit(100, UnitType.WORKER, (1, 0), hp=1)
+
+        plan, actions, _ = self.plan(make_turn([worker], resources=1))
+
+        action = plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction.value, "LEFT")
+        self.assertTrue(any("worker-heal-return amount=1" in item for item in actions))
+
+    def test_idle_worker_on_core_queues_full_heal(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), hp=1)
+
+        plan, actions, _ = self.plan(make_turn([worker], resources=1))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], HealAction)
+        self.assertTrue(any("worker-heal amount=1" in item for item in actions))
+
+    def test_moving_core_does_not_start_unit_healing(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), hp=1)
+
+        plan, actions, _ = self.plan(
+            make_turn(
+                [worker],
+                resources=1,
+                core_state=CoreState.MOVING,
+            ),
+        )
+
+        self.assertNotIsInstance(plan.unit_actions[worker.id], HealAction)
+        self.assertFalse(any("worker-heal" in item for item in actions))
+
+    def test_worker_with_resource_assignment_does_not_abandon_it_to_heal(self):
+        worker = controlled_unit(100, UnitType.WORKER, (1, 0), hp=1)
+
+        plan, actions, memory = self.plan(
+            make_turn(
+                [worker],
+                resources=1,
+                resource_cells=[(2, 0)],
+            ),
+        )
+
+        action = plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction.value, "RIGHT")
+        self.assertEqual(memory.worker_resource_target[worker.id], (2, 0))
+        self.assertFalse(any("worker-heal" in item for item in actions))
+
+    def test_loaded_worker_deposits_before_healing(self):
+        worker = controlled_unit(
+            100,
+            UnitType.WORKER,
+            (0, 0),
+            cargo=1,
+            hp=1,
+        )
+
+        plan, actions, _ = self.plan(make_turn([worker], resources=1))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
+        self.assertTrue(any("deposit 1" in item for item in actions))
+        self.assertFalse(any("worker-heal" in item for item in actions))
+
+    def test_insufficient_resources_keep_damaged_worker_out_of_core(self):
+        worker = controlled_unit(100, UnitType.WORKER, (1, 0), hp=1)
+
+        plan, actions, _ = self.plan(make_turn([worker], resources=0))
+
+        action = plan.unit_actions[worker.id]
+        self.assertNotIsInstance(action, HealAction)
+        if isinstance(action, MoveAction):
+            self.assertNotEqual(action.direction.value, "LEFT")
+        self.assertTrue(any("worker-heal-defer" in item for item in actions))
+
+    def test_one_resource_allows_only_one_damaged_worker_into_core(self):
+        first = controlled_unit(100, UnitType.WORKER, (1, 0), hp=1)
+        second = controlled_unit(101, UnitType.WORKER, (-1, 0), hp=1)
+
+        plan, _, _ = self.plan(make_turn([first, second], resources=1))
+
+        first_action = plan.unit_actions[first.id]
+        second_action = plan.unit_actions[second.id]
+        self.assertIsInstance(first_action, MoveAction)
+        self.assertEqual(first_action.direction.value, "LEFT")
+        self.assertFalse(
+            isinstance(second_action, MoveAction)
+            and second_action.direction.value == "RIGHT"
+        )
+
+    def test_idle_home_vanguard_heals_but_enemy_contact_still_has_priority(self):
+        vanguard = controlled_unit(201, UnitType.VANGUARD, (0, 0), hp=3)
+
+        heal_plan, heal_actions, _ = self.plan(
+            make_turn([vanguard], resources=1),
+        )
+        self.assertIsInstance(heal_plan.unit_actions[vanguard.id], HealAction)
+        self.assertTrue(any("guard-heal amount=1" in item for item in heal_actions))
+
+        enemy = enemy_unit(400, UnitType.VANGUARD, (1, 0))
+        combat_plan, combat_actions, _ = self.plan(
+            make_turn([vanguard], enemies=[enemy], resources=1),
+        )
+        self.assertIsInstance(combat_plan.unit_actions[vanguard.id], SweepAction)
+        self.assertFalse(any("guard-heal" in item for item in combat_actions))
+
+    def test_healing_reservation_prevents_unaffordable_core_spawn(self):
+        vanguard = controlled_unit(201, UnitType.VANGUARD, (0, 0), hp=1)
+        units = [*workers(4), vanguard]
+
+        plan, _, _ = self.plan(make_turn(units, resources=10))
+
+        self.assertIsInstance(plan.unit_actions[vanguard.id], HealAction)
+        self.assertIsNone(plan.core_action)
+
+
 class OuterScoutTests(AgentTestCase):
     """高库存时四名 Worker 的 32-64 格方环扫描。"""
 
@@ -909,6 +1041,34 @@ class SquadStrategyTests(AgentTestCase):
         self.assertTrue(any("squad-patrol" in action and "team=1" in action for action in actions))
         self.assertTrue(any("squad-patrol" in action and "team=2" in action for action in actions))
         self.assertFalse(any("squad-gather" in action for action in actions))
+
+    def test_idle_damaged_field_squad_member_returns_home_to_heal(self):
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                tuple(unit.position),
+                hp=3 if unit.id == UUID(int=203) else unit.hp,
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+
+        plan, actions, _ = self.plan(
+            make_turn(units, resources=1),
+            self.squad_memory(),
+        )
+
+        action = plan.unit_actions[UUID(int=203)]
+        self.assertIsInstance(action, MoveAction)
+        self.assertEqual(action.direction.value, "LEFT")
+        self.assertTrue(
+            any(
+                "squad-heal team=1-return amount=1" in item
+                for item in actions
+            )
+        )
 
     def test_squad_ranger_can_follow_beyond_old_core_roam_boundary(self):
         positions = {

@@ -114,6 +114,11 @@ UNIT_VISION_RADII: dict[UnitType, int] = {
     UnitType.VANGUARD: 4,
     UnitType.RANGER: 5,
 }
+UNIT_MAX_HP: dict[UnitType, int] = {
+    UnitType.WORKER: 2,
+    UnitType.VANGUARD: 4,
+    UnitType.RANGER: 2,
+}
 TEMPORARY_BLOCK_TICKS = 8
 RESOURCE_REASSIGN_MIN_GAIN = 4
 # 距离仍是资源匹配的主要成本，同时用历史负载打散连续任务。
@@ -1843,7 +1848,121 @@ class PlanningContext:
     blocker_worker_id: UUID | None
     spawn_clearing: bool
     outer_scout_active: bool
+    healing_resources: int
     actions: list[str]
+
+
+def idle_heal_clear_destination(
+    context: PlanningContext,
+    unit_id: UUID,
+    position: Pos,
+    obstacles: set[Pos],
+) -> Pos | None:
+    """钱不够或 Core 格已满时，让残血空闲单位离开入口。"""
+    start_index = unit_id.int % len(DIRECTION_STEPS)
+    rotated_steps = (
+        DIRECTION_STEPS[start_index:]
+        + DIRECTION_STEPS[:start_index]
+    )
+    candidates = []
+    for order, (_, delta) in enumerate(rotated_steps):
+        candidate = add(position, delta)
+        if (
+            candidate == context.core_pos
+            or candidate in obstacles
+            or not context.occupied.can_enter(candidate)
+        ):
+            continue
+        candidates.append(
+            (
+                -manhattan(candidate, context.core_pos),
+                context.occupied.count(candidate),
+                order,
+                candidate,
+            )
+        )
+    return min(candidates, default=(None, None, None, None))[3]
+
+
+def plan_idle_healing(
+    context: PlanningContext,
+    unit,
+    obstacles: set[Pos],
+    label: str,
+) -> bool:
+    """为无战斗或资源任务的残血单位规划返家和一次补满治疗。"""
+    max_hp = UNIT_MAX_HP[unit.unit_type]
+    deficit = max(0, max_hp - unit.hp)
+    if deficit == 0 or context.turn.core.view.state is not CoreState.NORMAL:
+        return False
+
+    position: Pos = tuple(unit.position)
+    distance = manhattan(position, context.core_pos)
+    if context.healing_resources < deficit:
+        # 距离入口至多一步时主动避开 Core，防止下一步误入后长期占位。
+        if distance <= 1:
+            destination = idle_heal_clear_destination(
+                context,
+                unit.id,
+                position,
+                obstacles,
+            )
+            if destination is not None:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    unit.move(direction)
+                    context.occupied.add(destination)
+                    context.actions.append(
+                        f"{str(unit.id)[:8]} {label}-defer "
+                        f"need={deficit} have={context.healing_resources} "
+                        f"{direction.value}"
+                    )
+                    return True
+            unit.wait()
+            context.occupied.add(position)
+            context.actions.append(
+                f"{str(unit.id)[:8]} {label}-defer-hold "
+                f"need={deficit} have={context.healing_resources}"
+            )
+            return True
+        return False
+
+    if position == context.core_pos:
+        context.healing_resources -= deficit
+        unit.heal()
+        context.occupied.add(position)
+        context.actions.append(
+            f"{str(unit.id)[:8]} {label} amount={deficit}"
+        )
+        return True
+
+    if distance == 1:
+        if not context.occupied.can_enter(context.core_pos):
+            return False
+        destination = context.core_pos
+    else:
+        blocked = context.occupied.full_cells()
+        blocked.discard(context.core_pos)
+        destination = first_step_astar(
+            position,
+            context.core_pos,
+            obstacles,
+            blocked,
+        )
+        if destination is None or not context.occupied.can_enter(destination):
+            return False
+
+    direction = direction_between(position, destination)
+    if direction is None:
+        return False
+    context.healing_resources -= deficit
+    unit.move(direction)
+    context.occupied.add(destination)
+    context.actions.append(
+        f"{str(unit.id)[:8]} {label}-return amount={deficit} "
+        f"{direction.value}"
+    )
+    return True
 
 
 def visible_roam_core_for(
@@ -2195,6 +2314,24 @@ def plan_workers(context: PlanningContext) -> None:
             actions.append(f"{str(worker.id)[:8]} wait-return")
             continue
 
+        assigned_resource = context.resource_assignments.get(worker.id)
+        active_intercept = (
+            worker.id == context.blocker_worker_id
+            and worker.id in memory.worker_intercept_goal
+        )
+        if (
+            worker.cargo == 0
+            and assigned_resource is None
+            and not active_intercept
+            and plan_idle_healing(
+                context,
+                worker,
+                context.navigation_obstacles,
+                "worker-heal",
+            )
+        ):
+            continue
+
         # 状态 4：19 人口且 Core 资源达到 80 后，四名 Worker 在 32-64 格
         # 方环上错位顺时针扫描；资源下降后由模式切换恢复正常任务。
         if context.outer_scout_active:
@@ -2266,7 +2403,6 @@ def plan_workers(context: PlanningContext) -> None:
             continue
 
         # 状态 7：静态资源任务跨 Tick 保留，途中不因发现新资源而改派。
-        assigned_resource = context.resource_assignments.get(worker.id)
         if assigned_resource is not None and position == assigned_resource:
             worker.wait()
             occupied.add(position)
@@ -2834,6 +2970,11 @@ def plan_field_squads(context: PlanningContext) -> None:
             or nearby_worker is not None
             or nearby_combat_threat
         )
+        squad_idle_for_healing = (
+            not squad_in_combat
+            and squad_target_position is None
+            and not memory.assault_gathering
+        )
         engaged_vanguard_targets = tuple(
             enemy
             for enemy in context.combat_enemies
@@ -3005,6 +3146,14 @@ def plan_field_squads(context: PlanningContext) -> None:
         for unit in ordered_members:
             position: Pos = tuple(unit.position)
             occupied.discard(position)
+
+            if squad_idle_for_healing and plan_idle_healing(
+                context,
+                unit,
+                static_obstacles | context.visible_enemy_unit_cells,
+                f"squad-heal team={squad.squad_id}",
+            ):
+                continue
 
             adjacent_vanguards = tuple(
                 enemy
@@ -3533,6 +3682,14 @@ def plan_vanguards(context: PlanningContext) -> None:
                     actions.append(f"{str(vanguard.id)[:8]} roam-hunt-wait")
                 continue
 
+            if plan_idle_healing(
+                context,
+                vanguard,
+                combat_navigation_obstacles,
+                "vanguard-heal",
+            ):
+                continue
+
             patrol_goal = roam_core_reacquire_goal(context, position)
             if patrol_goal is None:
                 patrol_goal = memory.roam_goal_for(
@@ -3620,6 +3777,14 @@ def plan_vanguards(context: PlanningContext) -> None:
                 vanguard.wait()
                 occupied.add(position)
                 actions.append(f"{str(vanguard.id)[:8]} defend-wait")
+            continue
+
+        if plan_idle_healing(
+            context,
+            vanguard,
+            combat_navigation_obstacles,
+            "guard-heal",
+        ):
             continue
 
         patrol_phase = memory.vanguard_patrol_phase.get(vanguard.id, 4)
@@ -4007,6 +4172,14 @@ def plan_rangers(context: PlanningContext) -> None:
             if moved:
                 continue
 
+            if plan_idle_healing(
+                context,
+                ranger,
+                ranger_navigation_obstacles | context.visible_enemy_unit_cells,
+                "ranger-heal",
+            ):
+                continue
+
             follow_target_id = follow_assignments.get(ranger.id)
             follow_target_position = vanguard_positions.get(follow_target_id)
             if follow_target_position is not None:
@@ -4154,6 +4327,14 @@ def plan_rangers(context: PlanningContext) -> None:
         if moved:
             continue
 
+        if plan_idle_healing(
+            context,
+            ranger,
+            ranger_navigation_obstacles | context.visible_enemy_unit_cells,
+            "guard-heal",
+        ):
+            continue
+
         patrol_phase = memory.ranger_patrol_phase.get(ranger.id, 0)
         for _ in range(len(HOME_PATROL_OFFSETS)):
             patrol_goal = add(
@@ -4220,12 +4401,13 @@ def plan_core_production(
     )
     if not core_available or turn.state.population >= MAX_AUTO_POPULATION:
         return
+    available_resources = context.healing_resources
 
     # 控制模式：固定四个 Worker，其余人口严格补成 2V1R 小队。
     if mode == "control":
         spawn_type: UnitType | None = None
         spawn_reason = ""
-        if len(context.workers) < TARGET_WORKERS_CONTROL and turn.resources >= 5:
+        if len(context.workers) < TARGET_WORKERS_CONTROL and available_resources >= 5:
             spawn_type = UnitType.WORKER
             spawn_reason = (
                 f"expand Workers {len(context.workers) + 1}/"
@@ -4258,7 +4440,7 @@ def plan_core_production(
                 missing_type = UnitType.RANGER
                 squad_id = incomplete.squad_id
             cost = 10 if missing_type is UnitType.VANGUARD else 12
-            if turn.resources >= cost:
+            if available_resources >= cost:
                 spawn_type = missing_type
                 spawn_reason = (
                     f"fill squad={squad_id} "
@@ -4275,10 +4457,12 @@ def plan_core_production(
         spawned_worker = False
         if len(context.workers) < TARGET_WORKERS_CONTROL:
             worker_threshold = 5
-            if turn.resources >= worker_threshold:
+            if available_resources >= worker_threshold:
                 turn.core.spawn(UnitType.WORKER)
                 spawned_worker = True
-                actions.append(f"core spawn WORKER (reserve={turn.resources - 5})")
+                actions.append(
+                    f"core spawn WORKER (reserve={available_resources - 5})"
+                )
         if not spawned_worker:
             needs_capacity = turn.resource_capacity < target
             defense_is_thin = bool(context.home_combat_targets) and (
@@ -4286,7 +4470,7 @@ def plan_core_production(
                 or len(context.home_combat_targets)
                 > len(context.rangers) + len(context.vanguards)
             )
-            if turn.resources >= 10 and (needs_capacity or defense_is_thin):
+            if available_resources >= 10 and (needs_capacity or defense_is_thin):
                 turn.core.spawn(UnitType.VANGUARD)
                 reason = (
                     "capacity replacement"
@@ -4641,6 +4825,7 @@ def plan_turn(
         blocker_worker_id=blocker_worker_id,
         spawn_clearing=turn.tick < memory.spawn_clear_until,
         outer_scout_active=outer_scout_active,
+        healing_resources=turn.resources,
         actions=actions,
     )
     plan_workers(context)

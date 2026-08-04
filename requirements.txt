@@ -1,1 +1,1 @@
-arena-hero==0.2.4
+arena-hero==0.2.8
