@@ -580,7 +580,10 @@ class SquadStrategyTests(AgentTestCase):
         )
 
     def test_squads_are_stable_persisted_two_vanguards_one_ranger(self):
-        _, _, memory = self.plan(make_turn(self.roster()), self.squad_memory())
+        memory = self.squad_memory()
+        memory.squad_regroup_goal[1] = (12, 4)
+        memory.squad_regroup_interrupted.add(1)
+        _, _, memory = self.plan(make_turn(self.roster()), memory)
 
         squads = memory.combat_squads(
             [unit for unit in self.roster() if unit.unit_type is UnitType.VANGUARD],
@@ -591,8 +594,13 @@ class SquadStrategyTests(AgentTestCase):
         self.assertEqual(squads[0].unit_ids, {UUID(int=201), UUID(int=202), UUID(int=301)})
 
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 5)
+        self.assertEqual(restored.persistent_state()["version"], 6)
         self.assertEqual(restored.squad_assignments, memory.squad_assignments)
+        self.assertEqual(restored.squad_regroup_goal, memory.squad_regroup_goal)
+        self.assertEqual(
+            restored.squad_regroup_interrupted,
+            memory.squad_regroup_interrupted,
+        )
 
     def test_complete_field_squads_patrol_independently_without_global_gather(self):
         _, actions, memory = self.plan(make_turn(self.roster()), self.squad_memory())
@@ -603,6 +611,148 @@ class SquadStrategyTests(AgentTestCase):
         self.assertTrue(any("squad-patrol" in action and "team=1" in action for action in actions))
         self.assertTrue(any("squad-patrol" in action and "team=2" in action for action in actions))
         self.assertFalse(any("squad-gather" in action for action in actions))
+
+    def test_squad_ranger_can_follow_beyond_old_core_roam_boundary(self):
+        positions = {
+            203: (28, 0),
+            204: (28, 1),
+            302: (24, 0),
+        }
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+        memory = self.squad_memory()
+        memory.squad_patrol_goal[1] = (32, 0)
+
+        plan, _, _ = self.plan(make_turn(units), memory)
+
+        self.assertIsInstance(plan.unit_actions[UUID(int=302)], MoveAction)
+
+    def test_spread_squad_locks_reachable_regroup_area(self):
+        positions = {
+            203: (32, 0),
+            204: (33, 0),
+            302: (20, 0),
+        }
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+
+        plan, actions, memory = self.plan(make_turn(units), self.squad_memory())
+
+        self.assertIn(1, memory.squad_regroup_goal)
+        self.assertIsInstance(plan.unit_actions[UUID(int=302)], MoveAction)
+        self.assertTrue(any("regroup-start team=1" in action for action in actions))
+
+    def test_regroup_finishes_only_after_squad_returns_within_four(self):
+        memory = self.squad_memory()
+        memory.squad_regroup_goal[1] = (10, 0)
+
+        _, actions, memory = self.plan(make_turn(self.roster()), memory)
+
+        self.assertNotIn(1, memory.squad_regroup_goal)
+        self.assertTrue(any("regroup-complete team=1" in action for action in actions))
+
+    def test_combat_end_recomputes_regroup_goal_from_current_positions(self):
+        memory = self.squad_memory()
+        memory.squad_regroup_goal[1] = (0, 0)
+        combat_positions = {
+            203: (20, 0),
+            204: (21, 0),
+            302: (10, 0),
+        }
+        combat_units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                combat_positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+        self.plan(
+            make_turn(
+                combat_units,
+                enemies=[enemy_unit(401, UnitType.WORKER, (20, 2))],
+                tick=100,
+            ),
+            memory,
+        )
+        self.assertIn(1, memory.squad_regroup_interrupted)
+
+        safe_positions = {
+            203: (30, 0),
+            204: (31, 0),
+            302: (20, 0),
+        }
+        safe_units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                safe_positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+        self.plan(make_turn(safe_units, tick=101), memory)
+        self.assertEqual(memory.squad_regroup_goal[1], (0, 0))
+
+        _, actions, memory = self.plan(make_turn(safe_units, tick=102), memory)
+
+        self.assertNotEqual(memory.squad_regroup_goal[1], (0, 0))
+        self.assertNotIn(1, memory.squad_regroup_interrupted)
+        self.assertTrue(
+            any("regroup-after-combat team=1" in action for action in actions)
+        )
+
+    def test_stalled_regroup_reselects_center(self):
+        positions = {
+            203: (32, 0),
+            204: (33, 0),
+            302: (20, 0),
+        }
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+        memory = self.squad_memory()
+        memory.squad_regroup_goal[1] = (32, 0)
+        memory.squad_regroup_last_distance[1] = agent.squad_regroup_distance(
+            [
+                unit
+                for unit in units
+                if unit.id in {UUID(int=203), UUID(int=204), UUID(int=302)}
+            ],
+            (32, 0),
+        )
+        memory.squad_regroup_stall_ticks[1] = agent.SQUAD_REGROUP_STALL_TICKS - 1
+
+        _, actions, memory = self.plan(make_turn(units), memory)
+
+        self.assertNotEqual(memory.squad_regroup_goal[1], (32, 0))
+        self.assertTrue(any("regroup-repath team=1" in action for action in actions))
 
     def test_enemy_core_discovery_gathers_all_field_squads_before_attack(self):
         _, actions, memory = self.plan(

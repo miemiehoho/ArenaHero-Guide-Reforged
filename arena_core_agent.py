@@ -84,6 +84,10 @@ SQUAD_VANGUARDS = 2
 SQUAD_RANGERS = 1
 SQUAD_FORMATION_RADIUS = 4
 SQUAD_FOLLOW_DISTANCE = 2
+SQUAD_REGROUP_TRIGGER_DISTANCE = 8
+SQUAD_REGROUP_AREA_RADIUS = 2
+SQUAD_REGROUP_SAFE_TICKS = 2
+SQUAD_REGROUP_STALL_TICKS = 3
 ASSAULT_GATHER_RADIUS = 5
 ASSAULT_TARGET_MEMORY_TICKS = 6
 SPAWN_CLEAR_TICKS = 3
@@ -617,6 +621,11 @@ class AgentMemory:
     home_ranger_id: UUID | None = None
     squad_assignments: dict[UUID, int] = field(default_factory=dict)
     squad_patrol_goal: dict[int, Pos] = field(default_factory=dict)
+    squad_regroup_goal: dict[int, Pos] = field(default_factory=dict)
+    squad_regroup_interrupted: set[int] = field(default_factory=set)
+    squad_regroup_safe_ticks: dict[int, int] = field(default_factory=dict)
+    squad_regroup_last_distance: dict[int, int] = field(default_factory=dict)
+    squad_regroup_stall_ticks: dict[int, int] = field(default_factory=dict)
     assault_target_id: UUID | None = None
     assault_target_kind: str | None = None
     assault_target_position: Pos | None = None
@@ -669,6 +678,27 @@ class AgentMemory:
                     and all(isinstance(value, int) for value in raw_position)
                 ):
                     memory.squad_patrol_goal[squad_id] = tuple(raw_position)
+        raw_regroup_goals = state.get("squad_regroup_goals", {})
+        if isinstance(raw_regroup_goals, dict):
+            for raw_id, raw_position in raw_regroup_goals.items():
+                try:
+                    squad_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    squad_id > 0
+                    and isinstance(raw_position, list)
+                    and len(raw_position) == 2
+                    and all(isinstance(value, int) for value in raw_position)
+                ):
+                    memory.squad_regroup_goal[squad_id] = tuple(raw_position)
+        raw_interrupted = state.get("squad_regroup_interrupted", [])
+        if isinstance(raw_interrupted, list):
+            memory.squad_regroup_interrupted = {
+                squad_id
+                for squad_id in raw_interrupted
+                if isinstance(squad_id, int) and squad_id > 0
+            }
         memory.assault_target_id = decode_uuid(state.get("assault_target_id"))
         target_kind = state.get("assault_target_kind")
         if target_kind in {"CORE", "UNIT"}:
@@ -725,7 +755,7 @@ class AgentMemory:
 
     def persistent_state(self) -> dict:
         return {
-            "version": 5,
+            "version": 6,
             "known_resources": [
                 list(position) for position in sorted(self.known_resources)
             ],
@@ -763,6 +793,11 @@ class AgentMemory:
                 str(squad_id): list(position)
                 for squad_id, position in sorted(self.squad_patrol_goal.items())
             },
+            "squad_regroup_goals": {
+                str(squad_id): list(position)
+                for squad_id, position in sorted(self.squad_regroup_goal.items())
+            },
+            "squad_regroup_interrupted": sorted(self.squad_regroup_interrupted),
             "assault_target_id": (
                 str(self.assault_target_id) if self.assault_target_id else None
             ),
@@ -795,6 +830,11 @@ class AgentMemory:
         self.scout_path_failures.clear()
         self.roam_goal.clear()
         self.squad_patrol_goal.clear()
+        self.squad_regroup_goal.clear()
+        self.squad_regroup_interrupted.clear()
+        self.squad_regroup_safe_ticks.clear()
+        self.squad_regroup_last_distance.clear()
+        self.squad_regroup_stall_ticks.clear()
         self.retreat_goal.clear()
         return True
 
@@ -886,6 +926,8 @@ class AgentMemory:
         before = (
             dict(self.squad_assignments),
             dict(self.squad_patrol_goal),
+            dict(self.squad_regroup_goal),
+            set(self.squad_regroup_interrupted),
             self.home_vanguard_id,
             self.home_ranger_id,
         )
@@ -971,9 +1013,27 @@ class AgentMemory:
             for squad_id, goal in self.squad_patrol_goal.items()
             if squad_id in live_squad_ids and squad_id != 0
         }
+        self.squad_regroup_goal = {
+            squad_id: goal
+            for squad_id, goal in self.squad_regroup_goal.items()
+            if squad_id in live_squad_ids and squad_id != 0
+        }
+        self.squad_regroup_interrupted.intersection_update(
+            live_squad_ids - {0}
+        )
+        for state in (
+            self.squad_regroup_safe_ticks,
+            self.squad_regroup_last_distance,
+            self.squad_regroup_stall_ticks,
+        ):
+            for squad_id in tuple(state):
+                if squad_id not in live_squad_ids or squad_id == 0:
+                    state.pop(squad_id, None)
         after = (
             dict(self.squad_assignments),
             dict(self.squad_patrol_goal),
+            dict(self.squad_regroup_goal),
+            set(self.squad_regroup_interrupted),
             self.home_vanguard_id,
             self.home_ranger_id,
         )
@@ -1655,6 +1715,8 @@ def ranger_follow_destination(
     position: Pos,
     vanguard_position: Pos,
     navigation_obstacles: set[Pos],
+    *,
+    core_radius: int | None = ROAM_RADIUS,
 ) -> Pos | None:
     """选择通往搭档 Vanguard 相邻格的下一步；已相邻时保持原位。"""
     movement_obstacles = (
@@ -1666,7 +1728,7 @@ def ranger_follow_destination(
     for _, delta in DIRECTION_STEPS:
         candidate = add(vanguard_position, delta)
         if (
-            chebyshev(context.core_pos, candidate) <= ROAM_RADIUS
+            (core_radius is None or chebyshev(context.core_pos, candidate) <= core_radius)
             and candidate not in movement_obstacles
             and context.occupied.can_enter(candidate)
         ):
@@ -2144,7 +2206,6 @@ def squad_ranger_follow_destination(
             dot = relative[0] * goal_vector[0] + relative[1] * goal_vector[1]
             if (
                 dot <= 0
-                and chebyshev(context.core_pos, cell) <= ROAM_RADIUS
                 and cell not in obstacles
                 and context.occupied.can_enter(cell)
             ):
@@ -2165,7 +2226,124 @@ def squad_ranger_follow_destination(
         position,
         leader_position,
         obstacles,
+        core_radius=None,
     )
+
+
+def squad_spread(members: Iterable[Vanguard | Ranger]) -> int:
+    """返回小队成员之间最大的曼哈顿距离。"""
+    positions = tuple(tuple(unit.position) for unit in members)
+    return max(
+        (
+            manhattan(left, right)
+            for index, left in enumerate(positions)
+            for right in positions[index + 1 :]
+        ),
+        default=0,
+    )
+
+
+def choose_squad_regroup_goal(
+    members: Iterable[Vanguard | Ranger],
+    obstacles: set[Pos],
+    *,
+    excluded: set[Pos] | None = None,
+) -> Pos | None:
+    """在成员坐标中位点附近选择所有人都可达的集结中心。"""
+    positions = tuple(tuple(unit.position) for unit in members)
+    if not positions:
+        return None
+    median = (
+        sorted(position[0] for position in positions)[len(positions) // 2],
+        sorted(position[1] for position in positions)[len(positions) // 2],
+    )
+    candidates = set(positions)
+    for radius in range(5):
+        for delta_x in range(-radius, radius + 1):
+            delta_y = radius - abs(delta_x)
+            candidates.add((median[0] + delta_x, median[1] + delta_y))
+            candidates.add((median[0] + delta_x, median[1] - delta_y))
+    candidates.difference_update(excluded or set())
+    candidates.difference_update(obstacles)
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            sum(manhattan(position, candidate) for position in positions),
+            max(manhattan(position, candidate) for position in positions),
+            candidate,
+        ),
+    )
+    return next(
+        (
+            candidate
+            for candidate in ordered_candidates
+            if all(
+                first_step_astar(position, candidate, obstacles, set()) is not None
+                for position in positions
+            )
+        ),
+        None,
+    )
+
+
+def squad_regroup_distance(
+    members: Iterable[Vanguard | Ranger],
+    goal: Pos,
+) -> int:
+    """衡量全队进入集结区域还需移动的总距离。"""
+    return sum(
+        max(
+            0,
+            manhattan(tuple(unit.position), goal) - SQUAD_REGROUP_AREA_RADIUS,
+        )
+        for unit in members
+    )
+
+
+def squad_regroup_destination(
+    context: PlanningContext,
+    position: Pos,
+    goal: Pos,
+    obstacles: set[Pos],
+) -> Pos | None:
+    """前往集结中心周围的空闲区域，避免成员争抢同一个格子。"""
+    if manhattan(position, goal) <= SQUAD_REGROUP_AREA_RADIUS:
+        return position
+    candidates = sorted(
+        (
+            (goal[0] + delta_x, goal[1] + delta_y)
+            for delta_x in range(
+                -SQUAD_REGROUP_AREA_RADIUS,
+                SQUAD_REGROUP_AREA_RADIUS + 1,
+            )
+            for delta_y in range(
+                -SQUAD_REGROUP_AREA_RADIUS,
+                SQUAD_REGROUP_AREA_RADIUS + 1,
+            )
+            if abs(delta_x) + abs(delta_y) <= SQUAD_REGROUP_AREA_RADIUS
+        ),
+        key=lambda cell: (manhattan(position, cell), cell),
+    )
+    for candidate in candidates:
+        if candidate in obstacles or not context.occupied.can_enter(candidate):
+            continue
+        destination = first_step_astar(
+            position,
+            candidate,
+            obstacles,
+            set(context.occupied),
+        )
+        if destination is not None and context.occupied.can_enter(destination):
+            return destination
+    return None
+
+
+def clear_squad_regroup(memory: AgentMemory, squad_id: int) -> None:
+    memory.squad_regroup_goal.pop(squad_id, None)
+    memory.squad_regroup_interrupted.discard(squad_id)
+    memory.squad_regroup_safe_ticks.pop(squad_id, None)
+    memory.squad_regroup_last_distance.pop(squad_id, None)
+    memory.squad_regroup_stall_ticks.pop(squad_id, None)
 
 
 def choose_assault_rally(
@@ -2281,10 +2459,132 @@ def plan_field_squads(context: PlanningContext) -> None:
             or nearby_worker is not None
             or not memory.assault_gathering
         )
+        spread = squad_spread(members)
+        nearby_combat_threat = any(
+            any(
+                manhattan(tuple(unit.position), tuple(enemy.position))
+                <= SQUAD_REGROUP_TRIGGER_DISTANCE
+                for unit in members
+            )
+            for enemy in context.combat_enemies
+        )
+        squad_in_combat = (
+            home_emergency
+            or nearby_worker is not None
+            or nearby_combat_threat
+        )
+        regroup_goal = memory.squad_regroup_goal.get(squad.squad_id)
+        regroup_paused = False
+        regroup_started = False
+        regroup_obstacles = static_obstacles | context.visible_enemy_unit_cells
+
+        if squad_in_combat:
+            if regroup_goal is not None or spread > SQUAD_REGROUP_TRIGGER_DISTANCE:
+                memory.squad_regroup_interrupted.add(squad.squad_id)
+                memory.squad_regroup_safe_ticks[squad.squad_id] = 0
+        elif squad.squad_id in memory.squad_regroup_interrupted:
+            safe_ticks = memory.squad_regroup_safe_ticks.get(squad.squad_id, 0) + 1
+            memory.squad_regroup_safe_ticks[squad.squad_id] = safe_ticks
+            if safe_ticks < SQUAD_REGROUP_SAFE_TICKS:
+                regroup_paused = True
+            else:
+                memory.squad_regroup_interrupted.discard(squad.squad_id)
+                memory.squad_regroup_safe_ticks.pop(squad.squad_id, None)
+                if spread <= SQUAD_FORMATION_RADIUS:
+                    clear_squad_regroup(memory, squad.squad_id)
+                    regroup_goal = None
+                    actions.append(f"squad regroup-complete team={squad.squad_id}")
+                else:
+                    regroup_goal = choose_squad_regroup_goal(
+                        members,
+                        regroup_obstacles,
+                    )
+                    if regroup_goal is not None:
+                        memory.squad_regroup_goal[squad.squad_id] = regroup_goal
+                        memory.squad_regroup_last_distance[squad.squad_id] = (
+                            squad_regroup_distance(members, regroup_goal)
+                        )
+                        memory.squad_regroup_stall_ticks[squad.squad_id] = 0
+                        regroup_started = True
+                        actions.append(
+                            f"squad regroup-after-combat team={squad.squad_id} "
+                            f"goal={regroup_goal}"
+                        )
+                    else:
+                        memory.squad_regroup_goal.pop(squad.squad_id, None)
+                        memory.squad_regroup_last_distance.pop(squad.squad_id, None)
+                        memory.squad_regroup_stall_ticks.pop(squad.squad_id, None)
+                        actions.append(
+                            f"squad regroup-retry team={squad.squad_id}"
+                        )
+        elif regroup_goal is not None and spread <= SQUAD_FORMATION_RADIUS:
+            clear_squad_regroup(memory, squad.squad_id)
+            regroup_goal = None
+            actions.append(f"squad regroup-complete team={squad.squad_id}")
+        elif regroup_goal is None and spread > SQUAD_REGROUP_TRIGGER_DISTANCE:
+            regroup_goal = choose_squad_regroup_goal(
+                members,
+                regroup_obstacles,
+            )
+            if regroup_goal is not None:
+                memory.squad_regroup_goal[squad.squad_id] = regroup_goal
+                memory.squad_regroup_last_distance[squad.squad_id] = (
+                    squad_regroup_distance(members, regroup_goal)
+                )
+                memory.squad_regroup_stall_ticks[squad.squad_id] = 0
+                regroup_started = True
+                actions.append(
+                    f"squad regroup-start team={squad.squad_id} goal={regroup_goal}"
+                )
+
+        regroup_active = (
+            regroup_goal is not None
+            and not squad_in_combat
+            and not regroup_paused
+        )
+        if regroup_active and not regroup_started:
+            regroup_distance = squad_regroup_distance(members, regroup_goal)
+            previous_distance = memory.squad_regroup_last_distance.get(
+                squad.squad_id,
+                regroup_distance + 1,
+            )
+            if regroup_distance < previous_distance:
+                memory.squad_regroup_stall_ticks[squad.squad_id] = 0
+            else:
+                memory.squad_regroup_stall_ticks[squad.squad_id] = (
+                    memory.squad_regroup_stall_ticks.get(squad.squad_id, 0) + 1
+                )
+            memory.squad_regroup_last_distance[squad.squad_id] = regroup_distance
+            if (
+                memory.squad_regroup_stall_ticks[squad.squad_id]
+                >= SQUAD_REGROUP_STALL_TICKS
+            ):
+                replacement = choose_squad_regroup_goal(
+                    members,
+                    regroup_obstacles,
+                    excluded={regroup_goal},
+                )
+                if replacement is not None:
+                    regroup_goal = replacement
+                    memory.squad_regroup_goal[squad.squad_id] = replacement
+                    memory.squad_regroup_last_distance[squad.squad_id] = (
+                        squad_regroup_distance(members, replacement)
+                    )
+                    actions.append(
+                        f"squad regroup-repath team={squad.squad_id} "
+                        f"goal={replacement}"
+                    )
+                memory.squad_regroup_stall_ticks[squad.squad_id] = 0
 
         if home_emergency:
             mission_goal = squad_target_position
             mission_label = "squad-home-support"
+        elif regroup_paused:
+            mission_goal = regroup_goal or leader_position
+            mission_label = "squad-regroup-observe"
+        elif regroup_active:
+            mission_goal = regroup_goal
+            mission_label = "squad-regroup"
         elif not squad.complete:
             mission_goal = add(
                 context.core_pos,
@@ -2310,12 +2610,6 @@ def plan_field_squads(context: PlanningContext) -> None:
             mission_goal = patrol_goal
             mission_label = "squad-patrol"
 
-        lagging = squad.complete and any(
-            unit.id != leader.id
-            and manhattan(tuple(unit.position), leader_position)
-            > SQUAD_FORMATION_RADIUS
-            for unit in members
-        )
         planned_leader_position = leader_position
         ordered_members = sorted(
             members,
@@ -2469,22 +2763,30 @@ def plan_field_squads(context: PlanningContext) -> None:
                 continue
 
             destination: Pos | None = None
-            if unit.id == leader.id:
-                if not lagging:
-                    if squad_attack_now:
-                        destination = combat_approach_step(
-                            context,
-                            position,
-                            squad_target_position,
-                            static_obstacles | context.visible_enemy_unit_cells,
-                        )
-                    else:
-                        destination = combat_move_toward(
-                            context,
-                            position,
-                            mission_goal,
-                            static_obstacles | context.visible_enemy_unit_cells,
-                        )
+            if regroup_paused:
+                destination = None
+            elif regroup_active:
+                destination = squad_regroup_destination(
+                    context,
+                    position,
+                    regroup_goal,
+                    regroup_obstacles,
+                )
+            elif unit.id == leader.id:
+                if squad_attack_now:
+                    destination = combat_approach_step(
+                        context,
+                        position,
+                        squad_target_position,
+                        static_obstacles | context.visible_enemy_unit_cells,
+                    )
+                else:
+                    destination = combat_move_toward(
+                        context,
+                        position,
+                        mission_goal,
+                        static_obstacles | context.visible_enemy_unit_cells,
+                    )
             elif unit.unit_type is UnitType.RANGER:
                 destination = squad_ranger_follow_destination(
                     context,
