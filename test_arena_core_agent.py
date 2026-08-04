@@ -1690,9 +1690,9 @@ class SquadStrategyTests(AgentTestCase):
 
 
 class ResourceMemoryTests(AgentTestCase):
-    def test_resource_pool_keeps_radius_32_and_prunes_radius_33(self):
-        inside = (32, 32)
-        outside = (33, 0)
+    def test_resource_pool_keeps_radius_36_and_prunes_radius_37(self):
+        inside = (36, 36)
+        outside = (37, 0)
         worker = controlled_unit(100, UnitType.WORKER, (0, 1))
         memory = agent.AgentMemory(
             known_resources={inside, outside},
@@ -1713,8 +1713,23 @@ class ResourceMemoryTests(AgentTestCase):
         self.assertNotEqual(memory.worker_resource_target.get(worker.id), outside)
         self.assertNotIn(outside, memory.resource_deferred_until)
 
+    def test_ring_worker_can_claim_resources_seen_beyond_radius_32(self):
+        first = controlled_unit(100, UnitType.WORKER, (32, 0))
+        second = controlled_unit(101, UnitType.WORKER, (32, 1))
+        resources = ((35, 0), (36, 1))
+
+        _, _, memory = self.plan(
+            make_turn([first, second], resource_cells=resources),
+        )
+
+        self.assertEqual(memory.known_resources, set(resources))
+        self.assertEqual(
+            set(memory.worker_resource_target.values()),
+            set(resources),
+        )
+
     def test_core_relocation_prunes_resources_outside_new_roam_square(self):
-        resource = (32, 0)
+        resource = (36, 0)
         worker = controlled_unit(100, UnitType.WORKER, (0, 1))
         memory = agent.AgentMemory(known_resources={resource})
 
