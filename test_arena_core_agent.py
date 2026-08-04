@@ -153,6 +153,44 @@ def population_workers(count: int, *, start_id: int = 1000):
     ]
 
 
+def outer_scout_roster(
+    *,
+    worker_positions: dict[int, tuple[int, int]] | None = None,
+    worker_cargo: dict[int, int] | None = None,
+):
+    """创建四名 Worker 和十五名战斗单位组成的 19 人控制阵容。"""
+    worker_positions = worker_positions or {}
+    worker_cargo = worker_cargo or {}
+    worker_units = [
+        controlled_unit(
+            worker.id.int,
+            UnitType.WORKER,
+            worker_positions.get(worker.id.int, tuple(worker.position)),
+            cargo=worker_cargo.get(worker.id.int, 0),
+        )
+        for worker in workers(4)
+    ]
+    combat_units = [
+        *(
+            controlled_unit(
+                200 + index,
+                UnitType.VANGUARD,
+                (10 + index, 10),
+            )
+            for index in range(10)
+        ),
+        *(
+            controlled_unit(
+                300 + index,
+                UnitType.RANGER,
+                (10 + index, 12),
+            )
+            for index in range(5)
+        ),
+    ]
+    return [*worker_units, *combat_units]
+
+
 class AgentTestCase(unittest.TestCase):
     """为各策略分组提供隔离的状态文件和统一规划入口。"""
 
@@ -582,6 +620,202 @@ class WorkerTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
 
 
+class OuterScoutTests(AgentTestCase):
+    """高库存时四名 Worker 的 32-64 格方环扫描。"""
+
+    def test_outer_scout_requires_population_nineteen_and_eighty_resources(self):
+        cases = (
+            (outer_scout_roster(), 79, False),
+            (outer_scout_roster()[:-1], 80, False),
+            (outer_scout_roster(), 80, True),
+        )
+
+        for units, resources, expected_active in cases:
+            with self.subTest(population=len(units), resources=resources):
+                _, actions, memory = self.plan(
+                    make_turn(units, resources=resources),
+                )
+                self.assertEqual(memory.outer_scout_active, expected_active)
+                self.assertEqual(
+                    any("outer-scout " in action for action in actions),
+                    expected_active,
+                )
+
+    def test_loaded_worker_deposits_before_outer_scout_when_core_has_capacity(self):
+        units = outer_scout_roster(
+            worker_positions={100: (0, 0)},
+            worker_cargo={100: 1},
+        )
+
+        plan, actions, memory = self.plan(make_turn(units, resources=80))
+
+        self.assertTrue(memory.outer_scout_active)
+        self.assertIsInstance(plan.unit_actions[UUID(int=100)], DepositAction)
+        self.assertTrue(any("deposit 1" in action for action in actions))
+        self.assertEqual(
+            sum("outer-scout " in action for action in actions),
+            3,
+        )
+
+    def test_loaded_worker_scans_when_core_is_full(self):
+        units = outer_scout_roster(
+            worker_positions={100: (0, 0)},
+            worker_cargo={100: 1},
+        )
+
+        plan, actions, memory = self.plan(make_turn(units, resources=95))
+
+        self.assertTrue(memory.outer_scout_active)
+        self.assertIsInstance(plan.unit_actions[UUID(int=100)], MoveAction)
+        self.assertTrue(
+            any(
+                action.startswith("00000000 outer-scout ")
+                for action in actions
+            )
+        )
+        self.assertFalse(any("capacity-" in action for action in actions))
+
+    def test_immediate_threat_overrides_outer_scout(self):
+        units = outer_scout_roster(worker_positions={100: (5, 0)})
+        threat = enemy_unit(400, UnitType.VANGUARD, (6, 0))
+
+        plan, actions, memory = self.plan(
+            make_turn(units, enemies=[threat], resources=80),
+        )
+
+        self.assertTrue(memory.outer_scout_active)
+        self.assertIsInstance(plan.unit_actions[UUID(int=100)], MoveAction)
+        self.assertTrue(any("00000000 flee " in action for action in actions))
+        self.assertNotIn(UUID(int=100), memory.outer_scout_goal)
+
+    def test_existing_retreat_overrides_outer_scout(self):
+        units = outer_scout_roster(worker_positions={100: (5, 0)})
+        memory = agent.AgentMemory(
+            retreat_until={UUID(int=100): 110},
+            retreat_goal={UUID(int=100): (9, 0)},
+        )
+
+        _, actions, memory = self.plan(
+            make_turn(units, resources=80, tick=100),
+            memory,
+        )
+
+        self.assertTrue(memory.outer_scout_active)
+        self.assertTrue(any("00000000 retreat " in action for action in actions))
+        self.assertNotIn(UUID(int=100), memory.outer_scout_goal)
+
+    def test_leaving_outer_scout_clears_progress_and_restores_resources(self):
+        units = outer_scout_roster()
+        memory = agent.AgentMemory()
+        self.plan(make_turn(units, resources=80, tick=100), memory)
+        self.assertTrue(memory.outer_scout_goal)
+
+        _, actions, memory = self.plan(
+            make_turn(
+                units,
+                resources=79,
+                tick=101,
+                resource_cells=[(6, 0)],
+            ),
+            memory,
+        )
+
+        self.assertFalse(memory.outer_scout_active)
+        self.assertFalse(memory.outer_scout_ring_index)
+        self.assertFalse(memory.outer_scout_step)
+        self.assertFalse(memory.outer_scout_goal)
+        self.assertFalse(memory.outer_scout_path_failures)
+        self.assertIn((6, 0), memory.worker_resource_target.values())
+        self.assertTrue(any("workers outer-scout-complete" in action for action in actions))
+
+    def test_four_workers_start_at_unique_quarter_ring_offsets(self):
+        units = outer_scout_roster()
+
+        _, _, memory = self.plan(make_turn(units, resources=80))
+
+        worker_ids = [UUID(int=value) for value in range(100, 104)]
+        route = agent.square_ring_waypoints((0, 0), 32)
+        expected = {
+            worker_id: route[(sector * len(route)) // len(agent.SCOUT_VECTORS)]
+            for worker_id, sector in zip(worker_ids, (0, 2, 4, 6))
+        }
+        self.assertEqual(
+            {worker_id: memory.outer_scout_goal[worker_id] for worker_id in worker_ids},
+            expected,
+        )
+        self.assertEqual(len(set(expected.values())), 4)
+
+    def test_square_ring_route_is_clockwise_and_covers_outer_annulus(self):
+        route = agent.square_ring_waypoints((0, 0), 32)
+        corners = ((-32, -32), (32, -32), (32, 32), (-32, 32))
+        corner_indices = [route.index(corner) for corner in corners]
+
+        self.assertEqual(corner_indices, sorted(corner_indices))
+        self.assertTrue(
+            all(
+                agent.chebyshev(first, second)
+                <= agent.OUTER_SCOUT_WAYPOINT_STEP
+                for first, second in zip(route, route[1:] + route[:1])
+            )
+        )
+
+        waypoints = {
+            waypoint
+            for radius in agent.OUTER_SCOUT_RADII
+            for waypoint in agent.square_ring_waypoints((0, 0), radius)
+        }
+        missing = {
+            (x, y)
+            for x in range(-64, 65)
+            for y in range(-64, 65)
+            if 32 <= agent.chebyshev((0, 0), (x, y)) <= 64
+            and min(agent.chebyshev((x, y), waypoint) for waypoint in waypoints) > 3
+        }
+        self.assertFalse(missing)
+
+    def test_blocked_outer_goal_is_skipped(self):
+        worker_id = UUID(int=100)
+        memory = agent.AgentMemory(worker_sector={worker_id: 0})
+        route = agent.square_ring_waypoints((0, 0), 32)
+
+        goal = memory.outer_scout_goal_for(
+            worker_id,
+            (0, 0),
+            (5, 0),
+            {route[0]},
+        )
+
+        self.assertEqual(goal, route[1])
+        self.assertEqual(memory.outer_scout_step[worker_id], 1)
+
+    def test_three_path_failures_advance_outer_goal(self):
+        units = outer_scout_roster(worker_positions={100: (5, 0)})
+        obstacles = ((4, 0), (6, 0), (5, -1), (5, 1))
+        memory = agent.AgentMemory()
+
+        for tick in range(100, 103):
+            _, actions, memory = self.plan(
+                make_turn(
+                    units,
+                    resources=80,
+                    tick=tick,
+                    obstacle_cells=obstacles,
+                ),
+                memory,
+            )
+            self.assertTrue(
+                any(
+                    action.startswith("00000000 outer-scout-hold")
+                    for action in actions
+                )
+            )
+
+        worker_id = UUID(int=100)
+        self.assertEqual(memory.outer_scout_step[worker_id], 1)
+        self.assertNotIn(worker_id, memory.outer_scout_goal)
+        self.assertNotIn(worker_id, memory.outer_scout_path_failures)
+
+
 class RangerCombatTests(AgentTestCase):
     """Ranger 的 v0.8 八方向射线规则。"""
 
@@ -828,6 +1062,28 @@ class SquadStrategyTests(AgentTestCase):
         self.assertFalse(memory.assault_guarded)
         self.assertIsNone(memory.assault_rally_position)
         self.assertTrue(any("squad-assault" in action for action in actions))
+        self.assertFalse(
+            any(
+                "squad-assault" in action and "team=2" in action
+                for action in actions
+            )
+        )
+
+    def test_unguarded_core_at_home_distance_64_launches_distant_field_squad(self):
+        _, actions, memory = self.plan(
+            make_turn(self.roster(), enemies=[enemy_core(400, (64, 0))]),
+            self.squad_memory(),
+        )
+
+        self.assertEqual(memory.assault_target_position, (64, 0))
+        self.assertFalse(memory.assault_guarded)
+        self.assertFalse(memory.assault_gathering)
+        self.assertTrue(
+            any(
+                "squad-assault" in action and "team=1" in action
+                for action in actions
+            )
+        )
         self.assertFalse(
             any(
                 "squad-assault" in action and "team=2" in action

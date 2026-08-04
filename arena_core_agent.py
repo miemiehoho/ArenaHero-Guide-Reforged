@@ -70,6 +70,14 @@ HOME_VANGUARD_CHASE_RADIUS = 6
 ROAM_HOME_RESPONSE_RADIUS = 18
 ROAM_RADIUS = 24
 RESOURCE_MEMORY_RADIUS = 32
+OUTER_SCOUT_RESOURCE_THRESHOLD = 80
+OUTER_SCOUT_RADII: tuple[int, ...] = (32, 39, 46, 53, 60, 64)
+OUTER_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
+    *OUTER_SCOUT_RADII,
+    *reversed(OUTER_SCOUT_RADII[1:-1]),
+)
+OUTER_SCOUT_WAYPOINT_STEP = 7
+OUTER_SCOUT_PATH_FAILURES = 3
 ROAM_CHASE_STEPS = 8
 ROAM_TARGET_LOST_TICKS = 3
 ROAM_HELPER_RADIUS = 5
@@ -198,6 +206,39 @@ def manhattan(a: Pos, b: Pos) -> int:
 
 def chebyshev(a: Pos, b: Pos) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def inclusive_axis_steps(start: int, end: int, step: int) -> tuple[int, ...]:
+    """生成包含两端且相邻距离不超过 step 的单调坐标。"""
+    direction = 1 if end >= start else -1
+    values = [start]
+    while abs(end - values[-1]) > step:
+        values.append(values[-1] + direction * step)
+    if values[-1] != end:
+        values.append(end)
+    return tuple(values)
+
+
+def square_ring_waypoints(
+    core: Pos,
+    radius: int,
+    step: int = OUTER_SCOUT_WAYPOINT_STEP,
+) -> tuple[Pos, ...]:
+    """从左上角开始，沿方形环顺时针生成覆盖四边和四角的目标。"""
+    left = core[0] - radius
+    right = core[0] + radius
+    top = core[1] - radius
+    bottom = core[1] + radius
+    horizontal_forward = inclusive_axis_steps(left, right, step)
+    vertical_forward = inclusive_axis_steps(top, bottom, step)
+    horizontal_reverse = inclusive_axis_steps(right, left, step)
+    vertical_reverse = inclusive_axis_steps(bottom, top, step)
+    return tuple(
+        [(x, top) for x in horizontal_forward]
+        + [(right, y) for y in vertical_forward[1:]]
+        + [(x, bottom) for x in horizontal_reverse[1:]]
+        + [(left, y) for y in vertical_reverse[1:-1]]
+    )
 
 
 def supercover_line(start: Pos, target: Pos) -> tuple[Pos, ...]:
@@ -608,6 +649,11 @@ class AgentMemory:
     scout_phase: dict[UUID, int] = field(default_factory=dict)
     scout_goal: dict[UUID, Pos] = field(default_factory=dict)
     scout_path_failures: dict[UUID, int] = field(default_factory=dict)
+    outer_scout_active: bool = False
+    outer_scout_ring_index: dict[UUID, int] = field(default_factory=dict)
+    outer_scout_step: dict[UUID, int] = field(default_factory=dict)
+    outer_scout_goal: dict[UUID, Pos] = field(default_factory=dict)
+    outer_scout_path_failures: dict[UUID, int] = field(default_factory=dict)
     worker_sector: dict[UUID, int] = field(default_factory=dict)
     productive_sector_cursor: int = 0
     ranger_coverage_active: bool = False
@@ -856,6 +902,10 @@ class AgentMemory:
         # 由旧家位置推导，必须清除。
         self.scout_goal.clear()
         self.scout_path_failures.clear()
+        self.outer_scout_ring_index.clear()
+        self.outer_scout_step.clear()
+        self.outer_scout_goal.clear()
+        self.outer_scout_path_failures.clear()
         self.roam_goal.clear()
         self.squad_patrol_goal.clear()
         self.squad_regroup_goal.clear()
@@ -883,6 +933,10 @@ class AgentMemory:
             self.scout_phase,
             self.scout_goal,
             self.scout_path_failures,
+            self.outer_scout_ring_index,
+            self.outer_scout_step,
+            self.outer_scout_goal,
+            self.outer_scout_path_failures,
             self.worker_sector,
             self.worker_harvests,
             self.worker_resource_target,
@@ -1461,6 +1515,74 @@ class AgentMemory:
         for worker in workers:
             self.scout_goal.pop(worker.id, None)
 
+    def sync_outer_scout_mode(self, active: bool) -> bool:
+        """切换高库存外圈扫描，并清理另一模式遗留的 Worker 任务。"""
+        if active == self.outer_scout_active:
+            return False
+        self.outer_scout_active = active
+        self.outer_scout_ring_index.clear()
+        self.outer_scout_step.clear()
+        self.outer_scout_goal.clear()
+        self.outer_scout_path_failures.clear()
+        if active:
+            self.worker_resource_target.clear()
+            self.worker_intercept_goal.clear()
+            self.scout_goal.clear()
+            self.scout_path_failures.clear()
+        return True
+
+    def advance_outer_scout(self, worker_id: UUID) -> None:
+        """沿当前方环顺时针前进；绕环一周后切换到下一扫描半径。"""
+        ring_index = self.outer_scout_ring_index.get(worker_id, 0)
+        radius = OUTER_SCOUT_RING_SEQUENCE[
+            ring_index % len(OUTER_SCOUT_RING_SEQUENCE)
+        ]
+        route_length = len(square_ring_waypoints((0, 0), radius))
+        step = self.outer_scout_step.get(worker_id, 0) + 1
+        if step >= route_length:
+            step = 0
+            ring_index = (ring_index + 1) % len(OUTER_SCOUT_RING_SEQUENCE)
+        self.outer_scout_ring_index[worker_id] = ring_index
+        self.outer_scout_step[worker_id] = step
+        self.outer_scout_goal.pop(worker_id, None)
+        self.outer_scout_path_failures.pop(worker_id, None)
+
+    def outer_scout_goal_for(
+        self,
+        worker_id: UUID,
+        core: Pos,
+        position: Pos,
+        obstacles: set[Pos],
+    ) -> Pos:
+        """选择外圈方环上的下一个顺时针目标，并按稳定扇区错开起点。"""
+        goal = self.outer_scout_goal.get(worker_id)
+        if goal is not None and goal not in obstacles and manhattan(position, goal) > 1:
+            return goal
+        if goal is not None:
+            self.advance_outer_scout(worker_id)
+
+        max_candidates = sum(
+            len(square_ring_waypoints((0, 0), radius))
+            for radius in OUTER_SCOUT_RING_SEQUENCE
+        )
+        for _ in range(max_candidates):
+            ring_index = self.outer_scout_ring_index.get(worker_id, 0)
+            radius = OUTER_SCOUT_RING_SEQUENCE[
+                ring_index % len(OUTER_SCOUT_RING_SEQUENCE)
+            ]
+            route = square_ring_waypoints(core, radius)
+            step = self.outer_scout_step.get(worker_id, 0)
+            sector = self.worker_sector.get(worker_id, 0) % len(SCOUT_VECTORS)
+            offset = (sector * len(route)) // len(SCOUT_VECTORS)
+            candidate = route[(step + offset) % len(route)]
+            if candidate not in obstacles:
+                self.outer_scout_goal[worker_id] = candidate
+                return candidate
+            self.advance_outer_scout(worker_id)
+
+        self.outer_scout_goal[worker_id] = core
+        return core
+
     def assign_resource_targets(
         self,
         workers,
@@ -1720,6 +1842,7 @@ class PlanningContext:
     roam_target_id: UUID | None
     blocker_worker_id: UUID | None
     spawn_clearing: bool
+    outer_scout_active: bool
     actions: list[str]
 
 
@@ -2042,32 +2165,9 @@ def plan_workers(context: PlanningContext) -> None:
                         )
                         continue
 
-        # 状态 3：Core 满仓后暂停采集和交付，分散待命并优先腾空生产格。
-        if turn.resources >= turn.resource_capacity:
-            destination, staging_goal = full_capacity_worker_destination(
-                context,
-                position,
-                worker_index,
-            )
-            if destination is not None and destination != position:
-                direction = direction_between(position, destination)
-                if direction is not None:
-                    worker.move(direction)
-                    occupied.add(destination)
-                    actions.append(
-                        f"{str(worker.id)[:8]} capacity-stage "
-                        f"{staging_goal} {direction.value}"
-                    )
-                    continue
-            worker.wait()
-            occupied.add(position)
-            actions.append(
-                f"{str(worker.id)[:8]} capacity-hold {staging_goal}"
-            )
-            continue
-
-        # 状态 4：载货后只返回当前 Core，不再执行采集或侦察。
-        if worker.cargo > 0:
+        # 状态 3：进入外圈扫描前先交付现有货物；Core 满仓时无法交付，
+        # 载货 Worker 也直接参加扫描。
+        if worker.cargo > 0 and turn.resources < turn.resource_capacity:
             if position == context.core_pos:
                 worker.deposit()
                 occupied.add(position)
@@ -2095,7 +2195,67 @@ def plan_workers(context: PlanningContext) -> None:
             actions.append(f"{str(worker.id)[:8]} wait-return")
             continue
 
-        # 状态 5：脚下有当前可见资源时立即采集。
+        # 状态 4：19 人口且 Core 资源达到 80 后，四名 Worker 在 32-64 格
+        # 方环上错位顺时针扫描；资源下降后由模式切换恢复正常任务。
+        if context.outer_scout_active:
+            goal = memory.outer_scout_goal_for(
+                worker.id,
+                context.core_pos,
+                position,
+                context.navigation_obstacles,
+            )
+            destination = first_step_astar(
+                position,
+                goal,
+                context.navigation_obstacles,
+                set(occupied),
+            )
+            if destination is not None and destination not in occupied:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    worker.move(direction)
+                    memory.outer_scout_path_failures.pop(worker.id, None)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(worker.id)[:8]} outer-scout {goal} "
+                        f"{direction.value}"
+                    )
+                    continue
+
+            failures = memory.outer_scout_path_failures.get(worker.id, 0) + 1
+            memory.outer_scout_path_failures[worker.id] = failures
+            if failures >= OUTER_SCOUT_PATH_FAILURES:
+                memory.advance_outer_scout(worker.id)
+            worker.wait()
+            occupied.add(position)
+            actions.append(f"{str(worker.id)[:8]} outer-scout-hold {goal}")
+            continue
+
+        # 状态 5：非外圈模式下，Core 满仓后分散待命并优先腾空生产格。
+        if turn.resources >= turn.resource_capacity:
+            destination, staging_goal = full_capacity_worker_destination(
+                context,
+                position,
+                worker_index,
+            )
+            if destination is not None and destination != position:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    worker.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(worker.id)[:8]} capacity-stage "
+                        f"{staging_goal} {direction.value}"
+                    )
+                    continue
+            worker.wait()
+            occupied.add(position)
+            actions.append(
+                f"{str(worker.id)[:8]} capacity-hold {staging_goal}"
+            )
+            continue
+
+        # 状态 6：脚下有当前可见资源时立即采集。
         if (
             position in context.visible_resources
             and turn.tick >= memory.resource_deferred_until.get(position, 0)
@@ -2105,7 +2265,7 @@ def plan_workers(context: PlanningContext) -> None:
             actions.append(f"{str(worker.id)[:8]} harvest")
             continue
 
-        # 状态 6：静态资源任务跨 Tick 保留，途中不因发现新资源而改派。
+        # 状态 7：静态资源任务跨 Tick 保留，途中不因发现新资源而改派。
         assigned_resource = context.resource_assignments.get(worker.id)
         if assigned_resource is not None and position == assigned_resource:
             worker.wait()
@@ -2147,7 +2307,7 @@ def plan_workers(context: PlanningContext) -> None:
             )
             continue
 
-        # 状态 7：没有资源任务时，才允许空载 Worker 临时协助拦截敌方 Worker。
+        # 状态 8：没有资源任务时，才允许空载 Worker 临时协助拦截敌方 Worker。
         intercept = memory.worker_intercept_goal.get(worker.id)
         if intercept is not None and worker.id == context.blocker_worker_id:
             intercept_goal, expiry = intercept
@@ -2174,7 +2334,7 @@ def plan_workers(context: PlanningContext) -> None:
                 actions.append(f"{str(worker.id)[:8]} intercept-hold")
                 continue
 
-        # 状态 8：其余 Worker 按固定扇区侦察。
+        # 状态 9：其余 Worker 按固定扇区侦察。
         goal = memory.goal_for(
             worker.id,
             worker_index,
@@ -2571,11 +2731,14 @@ def plan_field_squads(context: PlanningContext) -> None:
         and memory.assault_target_kind == "CORE"
         and target_position is not None
     )
-    joint_assault = (
+    assault_core_near_home = (
         assault_core_target
-        and memory.assault_guarded
         and chebyshev(context.core_pos, target_position)
         <= ASSAULT_HOME_CORE_DISTANCE
+    )
+    joint_assault = (
+        assault_core_near_home
+        and memory.assault_guarded
     )
     primary_assault_squad_id: int | None = None
     if (
@@ -2602,11 +2765,15 @@ def plan_field_squads(context: PlanningContext) -> None:
             ),
             default=None,
         )
-        if primary_squad is not None and min(
-            chebyshev(tuple(unit_by_id[unit_id].position), target_position)
-            for unit_id in primary_squad.unit_ids
-            if unit_id in unit_by_id
-        ) <= ROAM_RADIUS:
+        if primary_squad is not None and (
+            assault_core_near_home
+            or min(
+                chebyshev(tuple(unit_by_id[unit_id].position), target_position)
+                for unit_id in primary_squad.unit_ids
+                if unit_id in unit_by_id
+            )
+            <= ROAM_RADIUS
+        ):
             primary_assault_squad_id = primary_squad.squad_id
         else:
             # 远处目标只保留在记忆中，避免 Worker/守家单位把完整小队拉去
@@ -4178,6 +4345,17 @@ def plan_turn(
     sectors_before = dict(memory.worker_sector)
     memory.sync_worker_sectors(workers)
     sectors_changed = sectors_changed or memory.worker_sector != sectors_before
+    outer_scout_active = (
+        mode == "control"
+        and turn.state.population >= MAX_AUTO_POPULATION
+        and turn.resources >= OUTER_SCOUT_RESOURCE_THRESHOLD
+    )
+    if memory.sync_outer_scout_mode(outer_scout_active):
+        actions.append(
+            "workers outer-scout-active"
+            if outer_scout_active
+            else "workers outer-scout-complete"
+        )
     memory.observe_worker_harvests(turn.events, workers)
     memory.sync_ranger_coverage(bool(turn.rangers), workers)
     friendly_positions = tuple(tuple(unit.position) for unit in turn.units)
@@ -4304,16 +4482,20 @@ def plan_turn(
 
     # 资源任务跨 Tick 保留；只有空载、无资源任务且不在撤退的 Worker 才空闲。
     occupied = FriendlyOccupancy(tuple(unit.position) for unit in turn.units)
-    resource_assignments = memory.assign_resource_targets(
-        workers,
-        memory.known_resources,
-        visible_resources,
-        turn.tick,
-        navigation_obstacles,
-        memory.known_obstacles
-        | known_enemy_core_cells
-        | visible_enemy_unit_cells
-        | known_enemy_worker_cells,
+    resource_assignments = (
+        {}
+        if outer_scout_active
+        else memory.assign_resource_targets(
+            workers,
+            memory.known_resources,
+            visible_resources,
+            turn.tick,
+            navigation_obstacles,
+            memory.known_obstacles
+            | known_enemy_core_cells
+            | visible_enemy_unit_cells
+            | known_enemy_worker_cells,
+        )
     )
     roaming_combat_units = tuple(
         unit
@@ -4458,6 +4640,7 @@ def plan_turn(
         roam_target_id=roam_target_id,
         blocker_worker_id=blocker_worker_id,
         spawn_clearing=turn.tick < memory.spawn_clear_until,
+        outer_scout_active=outer_scout_active,
         actions=actions,
     )
     plan_workers(context)
