@@ -654,6 +654,14 @@ class HealingTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[worker.id], HealAction)
         self.assertTrue(any("worker-heal amount=1" in item for item in actions))
 
+    def test_full_idle_worker_exits_core_before_resuming_scouting(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), hp=2)
+
+        plan, actions, _ = self.plan(make_turn([worker], resources=0))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
+        self.assertTrue(any("worker-heal-exit" in item for item in actions))
+
     def test_moving_core_does_not_start_unit_healing(self):
         worker = controlled_unit(100, UnitType.WORKER, (0, 0), hp=1)
 
@@ -700,6 +708,21 @@ class HealingTests(AgentTestCase):
         self.assertTrue(any("deposit 1" in item for item in actions))
         self.assertFalse(any("worker-heal" in item for item in actions))
 
+    def test_loaded_full_worker_deposits_before_core_egress(self):
+        worker = controlled_unit(
+            100,
+            UnitType.WORKER,
+            (0, 0),
+            cargo=1,
+            hp=2,
+        )
+
+        plan, actions, _ = self.plan(make_turn([worker], resources=1))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
+        self.assertTrue(any("deposit 1" in item for item in actions))
+        self.assertFalse(any("worker-heal-exit" in item for item in actions))
+
     def test_insufficient_resources_keep_damaged_worker_out_of_core(self):
         worker = controlled_unit(100, UnitType.WORKER, (1, 0), hp=1)
 
@@ -741,6 +764,24 @@ class HealingTests(AgentTestCase):
         )
         self.assertIsInstance(combat_plan.unit_actions[vanguard.id], SweepAction)
         self.assertFalse(any("guard-heal" in item for item in combat_actions))
+
+    def test_healed_home_vanguard_exits_core_on_next_tick(self):
+        memory = agent.AgentMemory()
+        injured = controlled_unit(201, UnitType.VANGUARD, (0, 0), hp=3)
+        first_plan, _, memory = self.plan(
+            make_turn([injured], resources=1, tick=100),
+            memory,
+        )
+        self.assertIsInstance(first_plan.unit_actions[injured.id], HealAction)
+
+        healed = controlled_unit(201, UnitType.VANGUARD, (0, 0), hp=4)
+        second_plan, actions, _ = self.plan(
+            make_turn([healed], resources=0, tick=101),
+            memory,
+        )
+
+        self.assertIsInstance(second_plan.unit_actions[healed.id], MoveAction)
+        self.assertTrue(any("guard-heal-exit" in item for item in actions))
 
     def test_healing_reservation_prevents_unaffordable_core_spawn(self):
         vanguard = controlled_unit(201, UnitType.VANGUARD, (0, 0), hp=1)
@@ -1063,6 +1104,50 @@ class SquadStrategyTests(AgentTestCase):
         action = plan.unit_actions[UUID(int=203)]
         self.assertIsInstance(action, MoveAction)
         self.assertEqual(action.direction.value, "LEFT")
+        self.assertTrue(
+            any(
+                "squad-heal team=1-return amount=1" in item
+                for item in actions
+            )
+        )
+
+    def test_full_squad_member_exits_core_before_injured_leader_enters(self):
+        positions = {
+            203: (-1, 0),
+            204: (0, 0),
+            302: (-2, 0),
+        }
+        hit_points = {
+            203: 3,
+            204: 4,
+            302: 2,
+        }
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                positions.get(unit.id.int, tuple(unit.position)),
+                hp=hit_points.get(unit.id.int, unit.hp),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+
+        plan, actions, _ = self.plan(
+            make_turn(units, resources=1),
+            self.squad_memory(),
+        )
+
+        healed_member_action = plan.unit_actions[UUID(int=204)]
+        injured_leader_action = plan.unit_actions[UUID(int=203)]
+        self.assertIsInstance(healed_member_action, MoveAction)
+        self.assertEqual(healed_member_action.direction.value, "UP")
+        self.assertIsInstance(injured_leader_action, MoveAction)
+        self.assertEqual(injured_leader_action.direction.value, "RIGHT")
+        self.assertTrue(
+            any("squad-heal team=1-exit" in item for item in actions)
+        )
         self.assertTrue(
             any(
                 "squad-heal team=1-return amount=1" in item

@@ -1852,13 +1852,13 @@ class PlanningContext:
     actions: list[str]
 
 
-def idle_heal_clear_destination(
+def idle_core_exit_destination(
     context: PlanningContext,
     unit_id: UUID,
     position: Pos,
     obstacles: set[Pos],
 ) -> Pos | None:
-    """钱不够或 Core 格已满时，让残血空闲单位离开入口。"""
+    """为需要腾空 Core 或入口的空闲单位选择合法相邻格。"""
     start_index = unit_id.int % len(DIRECTION_STEPS)
     rotated_steps = (
         DIRECTION_STEPS[start_index:]
@@ -1884,6 +1884,40 @@ def idle_heal_clear_destination(
     return min(candidates, default=(None, None, None, None))[3]
 
 
+def plan_idle_core_egress(
+    context: PlanningContext,
+    unit,
+    obstacles: set[Pos],
+    label: str,
+) -> bool:
+    """满血空闲单位必须先离开 Core，再恢复巡逻或侦察。"""
+    max_hp = UNIT_MAX_HP[unit.unit_type]
+    position: Pos = tuple(unit.position)
+    if unit.hp < max_hp or position != context.core_pos:
+        return False
+
+    destination = idle_core_exit_destination(
+        context,
+        unit.id,
+        position,
+        obstacles,
+    )
+    if destination is not None:
+        direction = direction_between(position, destination)
+        if direction is not None:
+            unit.move(direction)
+            context.occupied.add(destination)
+            context.actions.append(
+                f"{str(unit.id)[:8]} {label}-exit {direction.value}"
+            )
+            return True
+
+    unit.wait()
+    context.occupied.add(position)
+    context.actions.append(f"{str(unit.id)[:8]} {label}-exit-hold")
+    return True
+
+
 def plan_idle_healing(
     context: PlanningContext,
     unit,
@@ -1901,7 +1935,7 @@ def plan_idle_healing(
     if context.healing_resources < deficit:
         # 距离入口至多一步时主动避开 Core，防止下一步误入后长期占位。
         if distance <= 1:
-            destination = idle_heal_clear_destination(
+            destination = idle_core_exit_destination(
                 context,
                 unit.id,
                 position,
@@ -2319,11 +2353,19 @@ def plan_workers(context: PlanningContext) -> None:
             worker.id == context.blocker_worker_id
             and worker.id in memory.worker_intercept_goal
         )
-        if (
+        worker_idle = (
             worker.cargo == 0
             and assigned_resource is None
             and not active_intercept
-            and plan_idle_healing(
+        )
+        if worker_idle and (
+            plan_idle_core_egress(
+                context,
+                worker,
+                context.navigation_obstacles,
+                "worker-heal",
+            )
+            or plan_idle_healing(
                 context,
                 worker,
                 context.navigation_obstacles,
@@ -3138,6 +3180,11 @@ def plan_field_squads(context: PlanningContext) -> None:
         ordered_members = sorted(
             members,
             key=lambda unit: (
+                not (
+                    squad_idle_for_healing
+                    and tuple(unit.position) == context.core_pos
+                    and unit.hp >= UNIT_MAX_HP[unit.unit_type]
+                ),
                 unit.id != leader.id,
                 unit.unit_type is UnitType.RANGER,
                 str(unit.id),
@@ -3147,11 +3194,19 @@ def plan_field_squads(context: PlanningContext) -> None:
             position: Pos = tuple(unit.position)
             occupied.discard(position)
 
-            if squad_idle_for_healing and plan_idle_healing(
-                context,
-                unit,
-                static_obstacles | context.visible_enemy_unit_cells,
-                f"squad-heal team={squad.squad_id}",
+            if squad_idle_for_healing and (
+                plan_idle_core_egress(
+                    context,
+                    unit,
+                    static_obstacles | context.visible_enemy_unit_cells,
+                    f"squad-heal team={squad.squad_id}",
+                )
+                or plan_idle_healing(
+                    context,
+                    unit,
+                    static_obstacles | context.visible_enemy_unit_cells,
+                    f"squad-heal team={squad.squad_id}",
+                )
             ):
                 continue
 
@@ -3682,11 +3737,19 @@ def plan_vanguards(context: PlanningContext) -> None:
                     actions.append(f"{str(vanguard.id)[:8]} roam-hunt-wait")
                 continue
 
-            if plan_idle_healing(
-                context,
-                vanguard,
-                combat_navigation_obstacles,
-                "vanguard-heal",
+            if (
+                plan_idle_core_egress(
+                    context,
+                    vanguard,
+                    combat_navigation_obstacles,
+                    "vanguard-heal",
+                )
+                or plan_idle_healing(
+                    context,
+                    vanguard,
+                    combat_navigation_obstacles,
+                    "vanguard-heal",
+                )
             ):
                 continue
 
@@ -3779,11 +3842,19 @@ def plan_vanguards(context: PlanningContext) -> None:
                 actions.append(f"{str(vanguard.id)[:8]} defend-wait")
             continue
 
-        if plan_idle_healing(
-            context,
-            vanguard,
-            combat_navigation_obstacles,
-            "guard-heal",
+        if (
+            plan_idle_core_egress(
+                context,
+                vanguard,
+                combat_navigation_obstacles,
+                "guard-heal",
+            )
+            or plan_idle_healing(
+                context,
+                vanguard,
+                combat_navigation_obstacles,
+                "guard-heal",
+            )
         ):
             continue
 
@@ -4172,11 +4243,19 @@ def plan_rangers(context: PlanningContext) -> None:
             if moved:
                 continue
 
-            if plan_idle_healing(
-                context,
-                ranger,
-                ranger_navigation_obstacles | context.visible_enemy_unit_cells,
-                "ranger-heal",
+            if (
+                plan_idle_core_egress(
+                    context,
+                    ranger,
+                    ranger_navigation_obstacles | context.visible_enemy_unit_cells,
+                    "ranger-heal",
+                )
+                or plan_idle_healing(
+                    context,
+                    ranger,
+                    ranger_navigation_obstacles | context.visible_enemy_unit_cells,
+                    "ranger-heal",
+                )
             ):
                 continue
 
@@ -4327,11 +4406,19 @@ def plan_rangers(context: PlanningContext) -> None:
         if moved:
             continue
 
-        if plan_idle_healing(
-            context,
-            ranger,
-            ranger_navigation_obstacles | context.visible_enemy_unit_cells,
-            "guard-heal",
+        if (
+            plan_idle_core_egress(
+                context,
+                ranger,
+                ranger_navigation_obstacles | context.visible_enemy_unit_cells,
+                "guard-heal",
+            )
+            or plan_idle_healing(
+                context,
+                ranger,
+                ranger_navigation_obstacles | context.visible_enemy_unit_cells,
+                "guard-heal",
+            )
         ):
             continue
 
