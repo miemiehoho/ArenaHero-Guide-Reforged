@@ -70,6 +70,13 @@ HOME_VANGUARD_CHASE_RADIUS = 6
 ROAM_HOME_RESPONSE_RADIUS = 18
 ROAM_RADIUS = 24
 RESOURCE_MEMORY_RADIUS = 32
+RESOURCE_SCOUT_RADII: tuple[int, ...] = (12, 19, 26, 32)
+RESOURCE_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
+    *RESOURCE_SCOUT_RADII,
+    *reversed(RESOURCE_SCOUT_RADII[1:-1]),
+)
+RESOURCE_SCOUT_WAYPOINT_STEP = 7
+RESOURCE_SCOUT_PATH_FAILURES = 3
 OUTER_SCOUT_RESOURCE_THRESHOLD = 80
 OUTER_SCOUT_RADII: tuple[int, ...] = (32, 39, 46, 53, 60, 64)
 OUTER_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
@@ -651,6 +658,7 @@ class AgentMemory:
     # Worker：撤退、侦察、资源搬运和临时拦截状态。
     retreat_until: dict[UUID, int] = field(default_factory=dict)
     retreat_goal: dict[UUID, Pos] = field(default_factory=dict)
+    scout_ring_index: dict[UUID, int] = field(default_factory=dict)
     scout_phase: dict[UUID, int] = field(default_factory=dict)
     scout_goal: dict[UUID, Pos] = field(default_factory=dict)
     scout_path_failures: dict[UUID, int] = field(default_factory=dict)
@@ -905,6 +913,8 @@ class AgentMemory:
 
         # 资源坐标和敌方轨迹属于世界坐标，仍然有效；侦察、巡逻和撤退目标则
         # 由旧家位置推导，必须清除。
+        self.scout_ring_index.clear()
+        self.scout_phase.clear()
         self.scout_goal.clear()
         self.scout_path_failures.clear()
         self.outer_scout_ring_index.clear()
@@ -935,6 +945,7 @@ class AgentMemory:
         for state in (
             self.retreat_until,
             self.retreat_goal,
+            self.scout_ring_index,
             self.scout_phase,
             self.scout_goal,
             self.scout_path_failures,
@@ -1480,6 +1491,7 @@ class AgentMemory:
                 )
                 self.productive_sector_cursor += 1
                 self.worker_sector[worker.id] = sector
+                self.scout_ring_index[worker.id] = 0
                 self.scout_phase[worker.id] = 0
                 self.scout_goal.pop(worker.id, None)
 
@@ -1727,6 +1739,28 @@ class AgentMemory:
             self.worker_resource_target.pop(worker_id, None)
         self.resource_deferred_until[resource] = tick + 4
 
+    def advance_scout(self, worker_id: UUID) -> None:
+        """沿普通资源方环顺时针前进；绕环一周后切换扫描半径。"""
+        ring_index = self.scout_ring_index.get(worker_id, 0)
+        radius = RESOURCE_SCOUT_RING_SEQUENCE[
+            ring_index % len(RESOURCE_SCOUT_RING_SEQUENCE)
+        ]
+        route_length = len(
+            square_ring_waypoints(
+                (0, 0),
+                radius,
+                RESOURCE_SCOUT_WAYPOINT_STEP,
+            )
+        )
+        step = self.scout_phase.get(worker_id, 0) + 1
+        if step >= route_length:
+            step = 0
+            ring_index = (ring_index + 1) % len(RESOURCE_SCOUT_RING_SEQUENCE)
+        self.scout_ring_index[worker_id] = ring_index
+        self.scout_phase[worker_id] = step
+        self.scout_goal.pop(worker_id, None)
+        self.scout_path_failures.pop(worker_id, None)
+
     def goal_for(
         self,
         worker_id: UUID,
@@ -1736,38 +1770,46 @@ class AgentMemory:
         position: Pos,
         obstacles: set[Pos],
     ) -> Pos:
-        phase = self.scout_phase.get(worker_id, 0)
         goal = self.scout_goal.get(worker_id)
         if goal is not None and goal not in obstacles and manhattan(position, goal) > 1:
             return goal
 
         if goal is not None:
-            phase += 1
+            self.advance_scout(worker_id)
 
-        # 每个 Worker 固定在自己的放射方向，减少移动视野重叠；只调整半径，
-        # 不跨入其他 Worker 的扇区。
-        base_index = self.worker_sector.get(
-            worker_id,
-            (worker_index * len(SCOUT_VECTORS)) // max(1, worker_count),
+        max_candidates = sum(
+            len(
+                square_ring_waypoints(
+                    (0, 0),
+                    radius,
+                    RESOURCE_SCOUT_WAYPOINT_STEP,
+                )
+            )
+            for radius in RESOURCE_SCOUT_RING_SEQUENCE
         )
-        vector = SCOUT_VECTORS[base_index % len(SCOUT_VECTORS)]
-        radius_cycle = (
-            (16, 21, 26, 32, 26, 21)
-            if worker_id in self.expanded_low_yield
-            else (12, 16, 20, 16)
-        )
-        for _ in range(len(radius_cycle)):
-            # 资源每四个 Tick 补充一次。循环访问有限半径，避免无限远离 Core。
-            radius = radius_cycle[phase % len(radius_cycle)]
-            goal = core[0] + vector[0] * radius, core[1] + vector[1] * radius
-            if goal not in obstacles:
-                self.scout_phase[worker_id] = phase
-                self.scout_goal[worker_id] = goal
-                return goal
-            phase += 1
+        for _ in range(max_candidates):
+            ring_index = self.scout_ring_index.get(worker_id, 0)
+            radius = RESOURCE_SCOUT_RING_SEQUENCE[
+                ring_index % len(RESOURCE_SCOUT_RING_SEQUENCE)
+            ]
+            route = square_ring_waypoints(
+                core,
+                radius,
+                RESOURCE_SCOUT_WAYPOINT_STEP,
+            )
+            step = self.scout_phase.get(worker_id, 0)
+            sector = self.worker_sector.get(
+                worker_id,
+                (worker_index * len(SCOUT_VECTORS)) // max(1, worker_count),
+            ) % len(SCOUT_VECTORS)
+            offset = (sector * len(route)) // len(SCOUT_VECTORS)
+            candidate = route[(step + offset) % len(route)]
+            if candidate not in obstacles:
+                self.scout_goal[worker_id] = candidate
+                return candidate
+            self.advance_scout(worker_id)
 
-        # 若已知障碍异常密集导致所有候选方向不可用，则回退到 Core。
-        self.scout_phase[worker_id] = phase
+        # 若所有普通方环候选点都被已知障碍覆盖，则回退到 Core。
         self.scout_goal[worker_id] = core
         return core
 
@@ -2512,7 +2554,7 @@ def plan_workers(context: PlanningContext) -> None:
                 actions.append(f"{str(worker.id)[:8]} intercept-hold")
                 continue
 
-        # 状态 9：其余 Worker 按固定扇区侦察。
+        # 状态 9：其余 Worker 在 12-32 格方环上错位顺时针扫描。
         goal = memory.goal_for(
             worker.id,
             worker_index,
@@ -2538,10 +2580,8 @@ def plan_workers(context: PlanningContext) -> None:
 
         failures = memory.scout_path_failures.get(worker.id, 0) + 1
         memory.scout_path_failures[worker.id] = failures
-        if failures >= 3:
-            memory.scout_path_failures.pop(worker.id, None)
-            memory.scout_goal.pop(worker.id, None)
-            memory.scout_phase[worker.id] = memory.scout_phase.get(worker.id, 0) + 1
+        if failures >= RESOURCE_SCOUT_PATH_FAILURES:
+            memory.advance_scout(worker.id)
 
         worker.wait()
         occupied.add(position)

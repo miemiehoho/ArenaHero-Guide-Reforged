@@ -520,6 +520,7 @@ class WorkerTests(AgentTestCase):
         dead_vanguard_id = UUID(int=998)
         memory = agent.AgentMemory(
             worker_sector={live_worker.id: 3, dead_worker_id: 7},
+            scout_ring_index={live_worker.id: 1, dead_worker_id: 2},
             worker_resource_target={live_worker.id: (10, 0), dead_worker_id: (20, 0)},
             retreat_until={dead_worker_id: 200},
             scout_goal={dead_worker_id: (30, 0)},
@@ -542,6 +543,7 @@ class WorkerTests(AgentTestCase):
             {live_worker.id: (10, 0)},
         )
         self.assertNotIn(dead_worker_id, memory.retreat_until)
+        self.assertEqual(memory.scout_ring_index, {live_worker.id: 1})
         self.assertNotIn(dead_worker_id, memory.scout_goal)
         self.assertNotIn(dead_worker_id, memory.worker_harvests)
         self.assertNotIn(dead_worker_id, memory.expanded_low_yield)
@@ -791,6 +793,135 @@ class HealingTests(AgentTestCase):
 
         self.assertIsInstance(plan.unit_actions[vanguard.id], HealAction)
         self.assertIsNone(plan.core_action)
+
+
+class ResourceScoutTests(AgentTestCase):
+    """普通资源搜索时四名 Worker 的 12-32 格方环扫描。"""
+
+    def test_four_workers_start_at_unique_quarter_ring_offsets_below_threshold(self):
+        units = outer_scout_roster()
+
+        _, actions, memory = self.plan(make_turn(units, resources=79))
+
+        worker_ids = [UUID(int=value) for value in range(100, 104)]
+        route = agent.square_ring_waypoints(
+            (0, 0),
+            12,
+            agent.RESOURCE_SCOUT_WAYPOINT_STEP,
+        )
+        expected = {
+            worker_id: route[(sector * len(route)) // len(agent.SCOUT_VECTORS)]
+            for worker_id, sector in zip(worker_ids, (0, 2, 4, 6))
+        }
+        self.assertFalse(memory.outer_scout_active)
+        self.assertFalse(any("outer-scout " in action for action in actions))
+        self.assertEqual(
+            {worker_id: memory.scout_goal[worker_id] for worker_id in worker_ids},
+            expected,
+        )
+        self.assertEqual(len(set(expected.values())), 4)
+
+    def test_resource_ring_route_is_clockwise_and_uses_expected_radii(self):
+        route = agent.square_ring_waypoints(
+            (0, 0),
+            32,
+            agent.RESOURCE_SCOUT_WAYPOINT_STEP,
+        )
+        corners = ((-32, -32), (32, -32), (32, 32), (-32, 32))
+        corner_indices = [route.index(corner) for corner in corners]
+
+        self.assertEqual(corner_indices, sorted(corner_indices))
+        self.assertTrue(
+            all(
+                agent.chebyshev(first, second)
+                <= agent.RESOURCE_SCOUT_WAYPOINT_STEP
+                for first, second in zip(route, route[1:] + route[:1])
+            )
+        )
+        self.assertEqual(agent.RESOURCE_SCOUT_RADII, (12, 19, 26, 32))
+        self.assertEqual(
+            agent.RESOURCE_SCOUT_RING_SEQUENCE,
+            (12, 19, 26, 32, 26, 19),
+        )
+
+    def test_blocked_resource_scout_goal_is_skipped(self):
+        worker_id = UUID(int=100)
+        memory = agent.AgentMemory(worker_sector={worker_id: 0})
+        route = agent.square_ring_waypoints(
+            (0, 0),
+            12,
+            agent.RESOURCE_SCOUT_WAYPOINT_STEP,
+        )
+
+        goal = memory.goal_for(
+            worker_id,
+            0,
+            4,
+            (0, 0),
+            (5, 0),
+            {route[0]},
+        )
+
+        self.assertEqual(goal, route[1])
+        self.assertEqual(memory.scout_phase[worker_id], 1)
+
+    def test_three_path_failures_advance_resource_scout_goal(self):
+        worker = controlled_unit(100, UnitType.WORKER, (5, 0))
+        obstacles = ((4, 0), (6, 0), (5, -1), (5, 1))
+        memory = agent.AgentMemory()
+
+        for tick in range(100, 103):
+            _, actions, memory = self.plan(
+                make_turn(
+                    [worker],
+                    resources=0,
+                    tick=tick,
+                    obstacle_cells=obstacles,
+                ),
+                memory,
+            )
+            self.assertTrue(any("wait-scout" in action for action in actions))
+
+        self.assertEqual(memory.scout_phase[worker.id], 1)
+        self.assertNotIn(worker.id, memory.scout_goal)
+        self.assertNotIn(worker.id, memory.scout_path_failures)
+
+    def test_resource_assignment_and_healing_override_resource_scout(self):
+        assigned = controlled_unit(100, UnitType.WORKER, (5, 0))
+        _, actions, memory = self.plan(
+            make_turn([assigned], resource_cells=[(6, 0)]),
+        )
+        self.assertIn((6, 0), memory.worker_resource_target.values())
+        self.assertNotIn(assigned.id, memory.scout_goal)
+        self.assertFalse(any(" scout " in action for action in actions))
+
+        injured = controlled_unit(100, UnitType.WORKER, (1, 0), hp=1)
+        plan, heal_actions, heal_memory = self.plan(
+            make_turn([injured], resources=1),
+        )
+        self.assertIsInstance(plan.unit_actions[injured.id], MoveAction)
+        self.assertTrue(any("worker-heal-return" in action for action in heal_actions))
+        self.assertNotIn(injured.id, heal_memory.scout_goal)
+
+    def test_leaving_outer_mode_resumes_resource_ring(self):
+        units = outer_scout_roster()
+        memory = agent.AgentMemory()
+        self.plan(make_turn(units, resources=80, tick=100), memory)
+
+        _, actions, memory = self.plan(
+            make_turn(units, resources=79, tick=101),
+            memory,
+        )
+
+        self.assertFalse(memory.outer_scout_active)
+        self.assertTrue(any("workers outer-scout-complete" in action for action in actions))
+        self.assertTrue(memory.scout_goal)
+        self.assertTrue(
+            all(
+                agent.chebyshev((0, 0), goal) == 12
+                for goal in memory.scout_goal.values()
+            )
+        )
 
 
 class OuterScoutTests(AgentTestCase):
