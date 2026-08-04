@@ -90,6 +90,9 @@ SQUAD_REGROUP_SAFE_TICKS = 2
 SQUAD_REGROUP_STALL_TICKS = 3
 ASSAULT_GATHER_RADIUS = 5
 ASSAULT_TARGET_MEMORY_TICKS = 6
+# Core 周围发现具备攻击力的敌方单位后，巡逻队在该距离外集结。
+ASSAULT_CORE_GUARD_RADIUS = 6
+ASSAULT_CORE_SAFE_DISTANCE = 6
 SPAWN_CLEAR_TICKS = 3
 # 19 是无需维护费的最后一个人口档；自动生产不得进入收费区间。
 # 用户仍可通过手动计划显式增加人口。
@@ -630,6 +633,7 @@ class AgentMemory:
     assault_target_kind: str | None = None
     assault_target_position: Pos | None = None
     assault_target_last_seen_tick: int = 0
+    assault_guarded: bool = False
     assault_gathering: bool = False
     assault_rally_position: Pos | None = None
     enemy_worker_tracks: dict[UUID, EnemyWorkerTrack] = field(default_factory=dict)
@@ -713,6 +717,7 @@ class AgentMemory:
         last_seen_tick = state.get("assault_target_last_seen_tick")
         if isinstance(last_seen_tick, int) and last_seen_tick >= 0:
             memory.assault_target_last_seen_tick = last_seen_tick
+        memory.assault_guarded = state.get("assault_guarded") is True
         memory.assault_gathering = state.get("assault_gathering") is True
         raw_rally = state.get("assault_rally_position")
         if (
@@ -755,7 +760,7 @@ class AgentMemory:
 
     def persistent_state(self) -> dict:
         return {
-            "version": 6,
+            "version": 7,
             "known_resources": [
                 list(position) for position in sorted(self.known_resources)
             ],
@@ -808,6 +813,7 @@ class AgentMemory:
                 else None
             ),
             "assault_target_last_seen_tick": self.assault_target_last_seen_tick,
+            "assault_guarded": self.assault_guarded,
             "assault_gathering": self.assault_gathering,
             "assault_rally_position": (
                 list(self.assault_rally_position)
@@ -1044,6 +1050,7 @@ class AgentMemory:
         self.assault_target_kind = None
         self.assault_target_position = None
         self.assault_target_last_seen_tick = 0
+        self.assault_guarded = False
         self.assault_gathering = False
         self.assault_rally_position = None
 
@@ -1053,44 +1060,77 @@ class AgentMemory:
         core: Pos,
         tick: int,
     ) -> bool:
-        """发现巡逻边界内的 Core/战斗单位后触发全体巡逻队集结。"""
+        """记录敌方 Core；只有发现 Core 护卫时才要求巡逻队先集结。"""
         before = (
             self.assault_target_id,
             self.assault_target_kind,
             self.assault_target_position,
             self.assault_target_last_seen_tick,
+            self.assault_guarded,
             self.assault_gathering,
             self.assault_rally_position,
         )
-        candidates = tuple(
+        visible_cores = tuple(
             enemy
             for enemy in visible_enemies
-            if chebyshev(core, tuple(enemy.position)) <= ROAM_RADIUS
-            and (
-                enemy.kind == "CORE"
-                or (
-                    enemy.kind == "UNIT"
-                    and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                )
-            )
+            if enemy.kind == "CORE"
         )
         target = min(
-            candidates,
+            visible_cores,
             key=lambda enemy: (
                 manhattan(core, tuple(enemy.position)),
-                enemy.kind == "CORE",
                 str(enemy.id),
             ),
             default=None,
         )
+        target_id = target.id if target is not None else None
+        target_position = tuple(target.position) if target is not None else None
+        if target is None and self.known_enemy_cores:
+            target_id, (target_position, _) = min(
+                self.known_enemy_cores.items(),
+                key=lambda item: (manhattan(core, item[1][0]), str(item[0])),
+            )
         if target is not None:
-            if target.id != self.assault_target_id:
-                self.assault_gathering = True
+            target_changed = target.id != self.assault_target_id
+            if target_changed:
+                self.assault_guarded = False
+                self.assault_gathering = False
                 self.assault_rally_position = None
             self.assault_target_id = target.id
             self.assault_target_kind = target.kind
             self.assault_target_position = tuple(target.position)
             self.assault_target_last_seen_tick = tick
+            has_guard = any(
+                enemy.kind == "UNIT"
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(tuple(target.position), tuple(enemy.position))
+                <= ASSAULT_CORE_GUARD_RADIUS
+                for enemy in visible_enemies
+            )
+            if has_guard:
+                if not self.assault_guarded:
+                    self.assault_rally_position = None
+                self.assault_guarded = True
+                self.assault_gathering = True
+            elif not self.assault_guarded:
+                self.assault_gathering = False
+        elif target_id is not None and target_position is not None:
+            if target_id != self.assault_target_id:
+                self.assault_guarded = False
+                self.assault_gathering = False
+                self.assault_rally_position = None
+            self.assault_target_id = target_id
+            self.assault_target_kind = "CORE"
+            self.assault_target_position = target_position
+            if any(
+                enemy.kind == "UNIT"
+                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(target_position, tuple(enemy.position))
+                <= ASSAULT_CORE_GUARD_RADIUS
+                for enemy in visible_enemies
+            ):
+                self.assault_guarded = True
+                self.assault_gathering = True
         elif self.assault_target_id is not None:
             if self.assault_target_kind == "CORE":
                 sighting = self.known_enemy_cores.get(self.assault_target_id)
@@ -1098,6 +1138,8 @@ class AgentMemory:
                 sighting = self.known_combat_threats.get(self.assault_target_id)
             if sighting is not None:
                 self.assault_target_position = sighting[0]
+            elif self.assault_target_kind == "CORE":
+                self.clear_assault()
             elif tick - self.assault_target_last_seen_tick > ASSAULT_TARGET_MEMORY_TICKS:
                 self.clear_assault()
         after = (
@@ -1105,6 +1147,7 @@ class AgentMemory:
             self.assault_target_kind,
             self.assault_target_position,
             self.assault_target_last_seen_tick,
+            self.assault_guarded,
             self.assault_gathering,
             self.assault_rally_position,
         )
@@ -2230,6 +2273,46 @@ def squad_ranger_follow_destination(
     )
 
 
+def ranger_attack_destination(
+    context: PlanningContext,
+    position: Pos,
+    target: Pos,
+    obstacles: set[Pos],
+) -> Pos | None:
+    """寻找 Ranger 可达的 1-3 格射击位，优先保留 2-3 格安全距离。"""
+    candidates: list[tuple[int, int, Pos]] = []
+    for delta_x in range(-3, 4):
+        for delta_y in range(-3, 4):
+            candidate = (target[0] + delta_x, target[1] + delta_y)
+            distance = ranger_line_distance(candidate, target)
+            if distance is None or not 1 <= distance <= 3:
+                continue
+            if (
+                candidate in obstacles
+                or candidate == target
+                or not context.occupied.can_enter(candidate)
+                or not clear_ranger_shot(candidate, target, obstacles)
+            ):
+                continue
+            candidates.append(
+                (
+                    0 if distance >= 2 else 1,
+                    manhattan(position, candidate),
+                    candidate,
+                )
+            )
+    for _, _, candidate in sorted(candidates):
+        destination = first_step_astar(
+            position,
+            candidate,
+            obstacles,
+            set(context.occupied),
+        )
+        if destination is not None and context.occupied.can_enter(destination):
+            return destination
+    return None
+
+
 def squad_spread(members: Iterable[Vanguard | Ranger]) -> int:
     """返回小队成员之间最大的曼哈顿距离。"""
     positions = tuple(tuple(unit.position) for unit in members)
@@ -2349,8 +2432,9 @@ def clear_squad_regroup(memory: AgentMemory, squad_id: int) -> None:
 def choose_assault_rally(
     squads: tuple[CombatSquad, ...],
     unit_by_id: dict[UUID, Vanguard | Ranger],
+    target_position: Pos | None = None,
 ) -> Pos | None:
-    """以完整巡逻队队长位置的 medoid 作为本轮统一集结点。"""
+    """选择远离敌方 Core 的完整巡逻队集结点。"""
     leader_positions = tuple(
         tuple(unit_by_id[squad.vanguard_ids[0]].position)
         for squad in squads
@@ -2358,10 +2442,28 @@ def choose_assault_rally(
         and squad.complete
         and squad.vanguard_ids[0] in unit_by_id
     )
+    if not leader_positions:
+        return None
+    candidates = set(leader_positions)
+    if target_position is not None:
+        for origin in leader_positions:
+            for radius in range(1, ASSAULT_CORE_SAFE_DISTANCE + 5):
+                for delta_x in range(-radius, radius + 1):
+                    delta_y = radius - abs(delta_x)
+                    candidates.add((origin[0] + delta_x, origin[1] + delta_y))
+                    candidates.add((origin[0] + delta_x, origin[1] - delta_y))
+        safe_candidates = {
+            candidate
+            for candidate in candidates
+            if manhattan(candidate, target_position) >= ASSAULT_CORE_SAFE_DISTANCE
+        }
+        if safe_candidates:
+            candidates = safe_candidates
     return min(
-        leader_positions,
+        candidates,
         key=lambda candidate: (
             sum(manhattan(candidate, other) for other in leader_positions),
+            max(manhattan(candidate, other) for other in leader_positions),
             candidate,
         ),
         default=None,
@@ -2386,10 +2488,16 @@ def plan_field_squads(context: PlanningContext) -> None:
     if not field_squads:
         return
 
-    if memory.assault_target_id is not None and memory.assault_rally_position is None:
+    if (
+        memory.assault_guarded
+        and memory.assault_gathering
+        and memory.assault_target_position is not None
+        and memory.assault_rally_position is None
+    ):
         memory.assault_rally_position = choose_assault_rally(
             complete_field_squads,
             unit_by_id,
+            memory.assault_target_position,
         )
     if memory.assault_gathering and memory.assault_rally_position is not None:
         gathered_ids = set().union(
@@ -2425,6 +2533,34 @@ def plan_field_squads(context: PlanningContext) -> None:
     if home_emergency_target is not None:
         target_object = home_emergency_target
         target_position = tuple(home_emergency_target.position)
+    primary_assault_squad_id: int | None = None
+    if (
+        not home_emergency
+        and memory.assault_target_kind == "CORE"
+        and not memory.assault_guarded
+        and target_position is not None
+    ):
+        primary_squad = min(
+            (
+                squad
+                for squad in complete_field_squads
+                if any(unit_id in unit_by_id for unit_id in squad.unit_ids)
+            ),
+            key=lambda squad: (
+                min(
+                    manhattan(
+                        tuple(unit_by_id[unit_id].position),
+                        target_position,
+                    )
+                    for unit_id in squad.unit_ids
+                    if unit_id in unit_by_id
+                ),
+                squad.squad_id,
+            ),
+            default=None,
+        )
+        if primary_squad is not None:
+            primary_assault_squad_id = primary_squad.squad_id
     for squad in field_squads:
         members = [unit_by_id[unit_id] for unit_id in squad.unit_ids if unit_id in unit_by_id]
         if not members:
@@ -2435,6 +2571,12 @@ def plan_field_squads(context: PlanningContext) -> None:
         leader_position: Pos = tuple(leader.position)
         squad_target_object = target_object
         squad_target_position = target_position
+        if (
+            primary_assault_squad_id is not None
+            and squad.squad_id != primary_assault_squad_id
+        ):
+            squad_target_object = None
+            squad_target_position = None
         nearby_worker = min(
             (
                 enemy
@@ -2472,6 +2614,28 @@ def plan_field_squads(context: PlanningContext) -> None:
             home_emergency
             or nearby_worker is not None
             or nearby_combat_threat
+        )
+        engaged_vanguard_targets = tuple(
+            enemy
+            for enemy in context.combat_enemies
+            if enemy.unit_type is UnitType.VANGUARD
+            and any(
+                friendly.unit_type is UnitType.VANGUARD
+                and manhattan(tuple(friendly.position), tuple(enemy.position)) == 1
+                for friendly in members
+            )
+        )
+        squad_support_target = min(
+            engaged_vanguard_targets,
+            key=lambda enemy: (
+                min(
+                    manhattan(tuple(friendly.position), tuple(enemy.position))
+                    for friendly in members
+                    if friendly.unit_type is UnitType.VANGUARD
+                ),
+                str(enemy.id),
+            ),
+            default=None,
         )
         regroup_goal = memory.squad_regroup_goal.get(squad.squad_id)
         regroup_paused = False
@@ -2684,6 +2848,38 @@ def plan_field_squads(context: PlanningContext) -> None:
                 occupied.add(position)
                 actions.append(f"{str(unit.id)[:8]} squad-self-defense-shoot")
                 continue
+            if (
+                unit.unit_type is UnitType.RANGER
+                and squad_support_target is not None
+            ):
+                support_position = tuple(squad_support_target.position)
+                if clear_ranger_shot(
+                    position,
+                    support_position,
+                    memory.known_obstacles,
+                ):
+                    unit.shoot(squad_support_target)
+                    occupied.add(position)
+                    actions.append(
+                        f"{str(unit.id)[:8]} squad-ranger-support-shoot"
+                    )
+                    continue
+                destination = ranger_attack_destination(
+                    context,
+                    position,
+                    support_position,
+                    static_obstacles | context.visible_enemy_unit_cells,
+                )
+                if destination is not None:
+                    direction = direction_between(position, destination)
+                    if direction is not None:
+                        unit.move(direction)
+                        occupied.add(destination)
+                        actions.append(
+                            f"{str(unit.id)[:8]} squad-ranger-support-aim "
+                            f"{direction.value}"
+                        )
+                        continue
             ranged_attacker = min(
                 (
                     enemy
@@ -2788,13 +2984,25 @@ def plan_field_squads(context: PlanningContext) -> None:
                         static_obstacles | context.visible_enemy_unit_cells,
                     )
             elif unit.unit_type is UnitType.RANGER:
-                destination = squad_ranger_follow_destination(
-                    context,
-                    position,
-                    planned_leader_position,
-                    mission_goal,
-                    static_obstacles | context.visible_enemy_unit_cells,
-                )
+                if (
+                    squad_attack_now
+                    and memory.assault_target_kind == "CORE"
+                    and squad_target_position is not None
+                ):
+                    destination = ranger_attack_destination(
+                        context,
+                        position,
+                        squad_target_position,
+                        static_obstacles | context.visible_enemy_unit_cells,
+                    )
+                if destination is None:
+                    destination = squad_ranger_follow_destination(
+                        context,
+                        position,
+                        planned_leader_position,
+                        mission_goal,
+                        static_obstacles | context.visible_enemy_unit_cells,
+                    )
             elif manhattan(position, planned_leader_position) > SQUAD_FOLLOW_DISTANCE:
                 destination = combat_move_toward(
                     context,

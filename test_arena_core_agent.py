@@ -269,11 +269,19 @@ class ResourceTests(AgentTestCase):
         enemy_id = UUID(int=400)
         memory = agent.AgentMemory(
             known_enemy_cores={enemy_id: ((5, 0), 99)},
+            assault_target_id=enemy_id,
+            assault_target_kind="CORE",
+            assault_target_position=(5, 0),
+            assault_guarded=True,
+            assault_gathering=True,
         )
 
         self.plan(make_turn([], core_position=(0, 0)), memory)
 
         self.assertNotIn(enemy_id, memory.known_enemy_cores)
+        self.assertIsNone(memory.assault_target_id)
+        self.assertFalse(memory.assault_guarded)
+        self.assertFalse(memory.assault_gathering)
 
 
 class ProductionTests(AgentTestCase):
@@ -594,7 +602,7 @@ class SquadStrategyTests(AgentTestCase):
         self.assertEqual(squads[0].unit_ids, {UUID(int=201), UUID(int=202), UUID(int=301)})
 
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 6)
+        self.assertEqual(restored.persistent_state()["version"], 7)
         self.assertEqual(restored.squad_assignments, memory.squad_assignments)
         self.assertEqual(restored.squad_regroup_goal, memory.squad_regroup_goal)
         self.assertEqual(
@@ -754,17 +762,22 @@ class SquadStrategyTests(AgentTestCase):
         self.assertNotEqual(memory.squad_regroup_goal[1], (32, 0))
         self.assertTrue(any("regroup-repath team=1" in action for action in actions))
 
-    def test_enemy_core_discovery_gathers_all_field_squads_before_attack(self):
+    def test_unguarded_enemy_core_is_attacked_without_global_gather(self):
         _, actions, memory = self.plan(
             make_turn(self.roster(), enemies=[enemy_core(400, (20, 0))]),
             self.squad_memory(),
         )
 
-        self.assertTrue(memory.assault_gathering)
-        self.assertIsNotNone(memory.assault_rally_position)
-        self.assertTrue(any("squad-gather" in action and "team=1" in action for action in actions))
-        self.assertTrue(any("squad-gather" in action and "team=2" in action for action in actions))
-        self.assertFalse(any("squad-assault-sweep" in action for action in actions))
+        self.assertFalse(memory.assault_gathering)
+        self.assertFalse(memory.assault_guarded)
+        self.assertIsNone(memory.assault_rally_position)
+        self.assertTrue(any("squad-assault" in action for action in actions))
+        self.assertFalse(
+            any(
+                "squad-assault" in action and "team=2" in action
+                for action in actions
+            )
+        )
 
     def test_gathered_field_squads_switch_to_joint_assault(self):
         units = self.roster()
@@ -780,11 +793,18 @@ class SquadStrategyTests(AgentTestCase):
         ]
 
         _, actions, memory = self.plan(
-            make_turn(units, enemies=[enemy_core(400, (20, 0))]),
+            make_turn(
+                units,
+                enemies=[
+                    enemy_core(400, (20, 0)),
+                    enemy_unit(401, UnitType.VANGUARD, (19, 2)),
+                ],
+            ),
             self.squad_memory(),
         )
 
         self.assertFalse(memory.assault_gathering)
+        self.assertTrue(memory.assault_guarded)
         self.assertTrue(any("squads assault-ready" in action for action in actions))
         self.assertTrue(any("squad-assault" in action and "team=1" in action for action in actions))
         self.assertTrue(any("squad-assault" in action and "team=2" in action for action in actions))
@@ -822,6 +842,47 @@ class SquadStrategyTests(AgentTestCase):
         self.assertIsInstance(plan.unit_actions[UUID(int=302)], MoveAction)
         self.assertTrue(any("squad-ranger-disengage" in action for action in actions))
 
+    def test_ranger_supports_vanguard_locked_with_enemy_vanguard(self):
+        positions = {
+            203: (8, 0),
+            204: (8, 1),
+            302: (8, 2),
+        }
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+        enemy = enemy_unit(401, UnitType.VANGUARD, (9, 0))
+
+        plan, actions, _ = self.plan(
+            make_turn(units, enemies=[enemy]),
+            self.squad_memory(),
+        )
+
+        self.assertIsInstance(plan.unit_actions[UUID(int=302)], MoveAction)
+        self.assertTrue(any("squad-ranger-support-aim" in action for action in actions))
+
+    def test_known_enemy_core_target_survives_memory_timeout(self):
+        core_id = UUID(int=400)
+        memory = agent.AgentMemory(
+            known_enemy_cores={core_id: ((25, 0), 100)},
+            assault_target_id=core_id,
+            assault_target_kind="CORE",
+            assault_target_position=(25, 0),
+            assault_target_last_seen_tick=100,
+        )
+
+        memory.sync_assault_target([], (0, 0), 120)
+
+        self.assertEqual(memory.assault_target_id, core_id)
+        self.assertEqual(memory.assault_target_position, (25, 0))
+
     def test_destroyed_home_squad_triggers_support_and_rebuild(self):
         units = [
             unit
@@ -841,15 +902,15 @@ class SquadStrategyTests(AgentTestCase):
         self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
         self.assertTrue(any("fill squad=0" in action for action in actions))
 
-    def test_enemy_outside_roam_boundary_does_not_trigger_gather(self):
+    def test_enemy_core_memory_is_not_limited_by_roam_boundary(self):
         _, actions, memory = self.plan(
             make_turn(self.roster(), enemies=[enemy_core(400, (25, 0))]),
             self.squad_memory(),
         )
 
-        self.assertIsNone(memory.assault_target_id)
+        self.assertIsNotNone(memory.assault_target_id)
         self.assertFalse(memory.assault_gathering)
-        self.assertFalse(any("squad-gather" in action for action in actions))
+        self.assertTrue(any("squad-assault" in action for action in actions))
 
     def test_cell_unit_limit_starts_spawn_clearing_and_suppresses_production(self):
         worker = controlled_unit(100, UnitType.WORKER, (0, 0))
