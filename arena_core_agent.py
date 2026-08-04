@@ -93,6 +93,8 @@ ASSAULT_TARGET_MEMORY_TICKS = 6
 # Core 周围发现具备攻击力的敌方单位后，巡逻队在该距离外集结。
 ASSAULT_CORE_GUARD_RADIUS = 6
 ASSAULT_CORE_SAFE_DISTANCE = 6
+# 只有当前 Core 64 格内的有护卫敌方 Core 才触发全体集结。
+ASSAULT_HOME_CORE_DISTANCE = 64
 SPAWN_CLEAR_TICKS = 3
 # 19 是无需维护费的最后一个人口档；自动生产不得进入收费区间。
 # 用户仍可通过手动计划显式增加人口。
@@ -111,6 +113,7 @@ RESOURCE_DISTANCE_COST = 10
 RESOURCE_LOAD_COST = 3
 COMBAT_THREAT_MEMORY_TICKS = 6
 STATE_SAVE_INTERVAL_TICKS = 10
+STATE_VERSION = 8
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 4
 
@@ -652,6 +655,18 @@ class AgentMemory:
             known_resources=decode_positions(state.get("known_resources", [])),
             known_obstacles=decode_positions(state.get("known_obstacles", [])),
         )
+        state_version = state.get("version")
+        restore_enemy_state = (
+            isinstance(state_version, int) and state_version >= STATE_VERSION
+        )
+        raw_core_position = state.get("core_position")
+        if (
+            restore_enemy_state
+            and isinstance(raw_core_position, list)
+            and len(raw_core_position) == 2
+            and all(isinstance(value, int) for value in raw_core_position)
+        ):
+            memory.last_core_position = tuple(raw_core_position)
         for attribute in ("home_vanguard_id", "home_ranger_id"):
             raw_id = state.get(attribute)
             if isinstance(raw_id, str):
@@ -703,29 +718,30 @@ class AgentMemory:
                 for squad_id in raw_interrupted
                 if isinstance(squad_id, int) and squad_id > 0
             }
-        memory.assault_target_id = decode_uuid(state.get("assault_target_id"))
-        target_kind = state.get("assault_target_kind")
-        if target_kind in {"CORE", "UNIT"}:
-            memory.assault_target_kind = target_kind
-        raw_target_position = state.get("assault_target_position")
-        if (
-            isinstance(raw_target_position, list)
-            and len(raw_target_position) == 2
-            and all(isinstance(value, int) for value in raw_target_position)
-        ):
-            memory.assault_target_position = tuple(raw_target_position)
-        last_seen_tick = state.get("assault_target_last_seen_tick")
-        if isinstance(last_seen_tick, int) and last_seen_tick >= 0:
-            memory.assault_target_last_seen_tick = last_seen_tick
-        memory.assault_guarded = state.get("assault_guarded") is True
-        memory.assault_gathering = state.get("assault_gathering") is True
-        raw_rally = state.get("assault_rally_position")
-        if (
-            isinstance(raw_rally, list)
-            and len(raw_rally) == 2
-            and all(isinstance(value, int) for value in raw_rally)
-        ):
-            memory.assault_rally_position = tuple(raw_rally)
+        if restore_enemy_state:
+            memory.assault_target_id = decode_uuid(state.get("assault_target_id"))
+            target_kind = state.get("assault_target_kind")
+            if target_kind in {"CORE", "UNIT"}:
+                memory.assault_target_kind = target_kind
+            raw_target_position = state.get("assault_target_position")
+            if (
+                isinstance(raw_target_position, list)
+                and len(raw_target_position) == 2
+                and all(isinstance(value, int) for value in raw_target_position)
+            ):
+                memory.assault_target_position = tuple(raw_target_position)
+            last_seen_tick = state.get("assault_target_last_seen_tick")
+            if isinstance(last_seen_tick, int) and last_seen_tick >= 0:
+                memory.assault_target_last_seen_tick = last_seen_tick
+            memory.assault_guarded = state.get("assault_guarded") is True
+            memory.assault_gathering = state.get("assault_gathering") is True
+            raw_rally = state.get("assault_rally_position")
+            if (
+                isinstance(raw_rally, list)
+                and len(raw_rally) == 2
+                and all(isinstance(value, int) for value in raw_rally)
+            ):
+                memory.assault_rally_position = tuple(raw_rally)
         spawn_clear_until = state.get("spawn_clear_until")
         if isinstance(spawn_clear_until, int) and spawn_clear_until >= 0:
             memory.spawn_clear_until = spawn_clear_until
@@ -738,29 +754,35 @@ class AgentMemory:
                     continue
                 if isinstance(sector, int):
                     memory.worker_sector[worker_id] = sector % len(SCOUT_VECTORS)
-        raw_enemy_cores = state.get("known_enemy_cores", {})
-        if isinstance(raw_enemy_cores, dict):
-            for raw_id, sighting in raw_enemy_cores.items():
-                try:
-                    enemy_id = UUID(raw_id)
-                except (TypeError, ValueError):
-                    continue
-                if (
-                    isinstance(sighting, dict)
-                    and isinstance(sighting.get("position"), list)
-                    and len(sighting["position"]) == 2
-                    and all(isinstance(value, int) for value in sighting["position"])
-                    and isinstance(sighting.get("tick"), int)
-                ):
-                    memory.known_enemy_cores[enemy_id] = (
-                        tuple(sighting["position"]),
-                        sighting["tick"],
-                    )
+        if restore_enemy_state:
+            raw_enemy_cores = state.get("known_enemy_cores", {})
+            if isinstance(raw_enemy_cores, dict):
+                for raw_id, sighting in raw_enemy_cores.items():
+                    try:
+                        enemy_id = UUID(raw_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        isinstance(sighting, dict)
+                        and isinstance(sighting.get("position"), list)
+                        and len(sighting["position"]) == 2
+                        and all(isinstance(value, int) for value in sighting["position"])
+                        and isinstance(sighting.get("tick"), int)
+                    ):
+                        memory.known_enemy_cores[enemy_id] = (
+                            tuple(sighting["position"]),
+                            sighting["tick"],
+                        )
         return memory
 
     def persistent_state(self) -> dict:
         return {
-            "version": 7,
+            "version": STATE_VERSION,
+            "core_position": (
+                list(self.last_core_position)
+                if self.last_core_position is not None
+                else None
+            ),
             "known_resources": [
                 list(position) for position in sorted(self.known_resources)
             ],
@@ -842,6 +864,8 @@ class AgentMemory:
         self.squad_regroup_last_distance.clear()
         self.squad_regroup_stall_ticks.clear()
         self.retreat_goal.clear()
+        self.known_enemy_cores.clear()
+        self.clear_assault()
         return True
 
     def prune_unit_state(self, workers, vanguards, rangers, tick: int = 0) -> bool:
@@ -1142,6 +1166,14 @@ class AgentMemory:
                 self.clear_assault()
             elif tick - self.assault_target_last_seen_tick > ASSAULT_TARGET_MEMORY_TICKS:
                 self.clear_assault()
+        if (
+            self.assault_target_kind == "CORE"
+            and self.assault_target_position is not None
+            and chebyshev(core, self.assault_target_position)
+            > ASSAULT_HOME_CORE_DISTANCE
+        ):
+            self.assault_gathering = False
+            self.assault_rally_position = None
         after = (
             self.assault_target_id,
             self.assault_target_kind,
@@ -2533,12 +2565,23 @@ def plan_field_squads(context: PlanningContext) -> None:
     if home_emergency_target is not None:
         target_object = home_emergency_target
         target_position = tuple(home_emergency_target.position)
-    primary_assault_squad_id: int | None = None
-    if (
+
+    assault_core_target = (
         not home_emergency
         and memory.assault_target_kind == "CORE"
-        and not memory.assault_guarded
         and target_position is not None
+    )
+    joint_assault = (
+        assault_core_target
+        and memory.assault_guarded
+        and chebyshev(context.core_pos, target_position)
+        <= ASSAULT_HOME_CORE_DISTANCE
+    )
+    primary_assault_squad_id: int | None = None
+    if (
+        assault_core_target
+        and not memory.assault_gathering
+        and not joint_assault
     ):
         primary_squad = min(
             (
@@ -2559,8 +2602,17 @@ def plan_field_squads(context: PlanningContext) -> None:
             ),
             default=None,
         )
-        if primary_squad is not None:
+        if primary_squad is not None and min(
+            chebyshev(tuple(unit_by_id[unit_id].position), target_position)
+            for unit_id in primary_squad.unit_ids
+            if unit_id in unit_by_id
+        ) <= ROAM_RADIUS:
             primary_assault_squad_id = primary_squad.squad_id
+        else:
+            # 远处目标只保留在记忆中，避免 Worker/守家单位把完整小队拉去
+            # 执行一条超出巡逻边界的长距离 A*。
+            target_object = None
+            target_position = None
     for squad in field_squads:
         members = [unit_by_id[unit_id] for unit_id in squad.unit_ids if unit_id in unit_by_id]
         if not members:
@@ -4097,7 +4149,7 @@ def plan_turn(
     workers = sorted(turn.workers, key=lambda worker: str(worker.id))
     vanguards = sorted(turn.vanguards, key=lambda unit: str(unit.id))
     rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
-    memory.sync_core_position(core_pos)
+    core_changed = memory.sync_core_position(core_pos)
     sectors_changed = memory.prune_unit_state(
         workers,
         vanguards,
@@ -4415,7 +4467,8 @@ def plan_turn(
     plan_core_production(context, mode, target)
 
     if (
-        resources_changed
+        core_changed
+        or resources_changed
         or squads_changed
         or sectors_changed
         or enemy_cores_changed

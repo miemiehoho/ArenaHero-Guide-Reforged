@@ -283,6 +283,62 @@ class ResourceTests(AgentTestCase):
         self.assertFalse(memory.assault_guarded)
         self.assertFalse(memory.assault_gathering)
 
+    def test_v7_state_migration_drops_enemy_core_and_assault_state(self):
+        enemy_id = UUID(int=400)
+        state = {
+            "version": 7,
+            "known_resources": [[3, 4]],
+            "known_obstacles": [[5, 6]],
+            "known_enemy_cores": {
+                str(enemy_id): {"position": [79, 114], "tick": 900},
+            },
+            "assault_target_id": str(enemy_id),
+            "assault_target_kind": "CORE",
+            "assault_target_position": [79, 114],
+            "assault_target_last_seen_tick": 900,
+            "assault_guarded": True,
+            "assault_gathering": True,
+            "assault_rally_position": [20, 20],
+            "squad_assignments": {str(UUID(int=201)): 1},
+        }
+
+        memory = agent.AgentMemory.restore(state)
+
+        self.assertEqual(memory.known_resources, {(3, 4)})
+        self.assertEqual(memory.known_obstacles, {(5, 6)})
+        self.assertEqual(memory.squad_assignments, {UUID(int=201): 1})
+        self.assertEqual(memory.known_enemy_cores, {})
+        self.assertIsNone(memory.assault_target_id)
+        self.assertIsNone(memory.assault_target_kind)
+        self.assertIsNone(memory.assault_target_position)
+        self.assertFalse(memory.assault_guarded)
+        self.assertFalse(memory.assault_gathering)
+        self.assertIsNone(memory.assault_rally_position)
+
+    def test_core_relocation_clears_enemy_core_memory_and_assault_state(self):
+        enemy_id = UUID(int=400)
+        memory = agent.AgentMemory(
+            known_enemy_cores={enemy_id: ((79, 114), 900)},
+            assault_target_id=enemy_id,
+            assault_target_kind="CORE",
+            assault_target_position=(79, 114),
+            assault_guarded=True,
+            assault_gathering=True,
+            known_resources={(3, 4)},
+            known_obstacles={(5, 6)},
+            squad_assignments={UUID(int=201): 1},
+        )
+        memory.sync_core_position((0, 0))
+        memory.sync_core_position((10, 10))
+
+        self.assertEqual(memory.known_enemy_cores, {})
+        self.assertIsNone(memory.assault_target_id)
+        self.assertFalse(memory.assault_guarded)
+        self.assertFalse(memory.assault_gathering)
+        self.assertEqual(memory.known_resources, {(3, 4)})
+        self.assertEqual(memory.known_obstacles, {(5, 6)})
+        self.assertEqual(memory.squad_assignments, {UUID(int=201): 1})
+
 
 class ProductionTests(AgentTestCase):
     """基础生产顺序和自动人口上限。"""
@@ -602,7 +658,7 @@ class SquadStrategyTests(AgentTestCase):
         self.assertEqual(squads[0].unit_ids, {UUID(int=201), UUID(int=202), UUID(int=301)})
 
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 7)
+        self.assertEqual(restored.persistent_state()["version"], 8)
         self.assertEqual(restored.squad_assignments, memory.squad_assignments)
         self.assertEqual(restored.squad_regroup_goal, memory.squad_regroup_goal)
         self.assertEqual(
@@ -808,6 +864,76 @@ class SquadStrategyTests(AgentTestCase):
         self.assertTrue(any("squads assault-ready" in action for action in actions))
         self.assertTrue(any("squad-assault" in action and "team=1" in action for action in actions))
         self.assertTrue(any("squad-assault" in action and "team=2" in action for action in actions))
+
+    def test_guarded_core_at_home_distance_64_starts_global_gather(self):
+        _, actions, memory = self.plan(
+            make_turn(
+                self.roster(),
+                enemies=[
+                    enemy_core(400, (64, 0)),
+                    enemy_unit(401, UnitType.VANGUARD, (64, 1)),
+                ],
+            ),
+            self.squad_memory(),
+        )
+
+        self.assertTrue(memory.assault_guarded)
+        self.assertTrue(memory.assault_gathering)
+        self.assertIsNotNone(memory.assault_rally_position)
+        self.assertTrue(any("squad-gather" in action for action in actions))
+        self.assertFalse(any("squad-assault" in action for action in actions))
+
+    def test_guarded_core_at_home_distance_65_only_nearby_squad_attacks(self):
+        positions = {
+            203: (41, 0),
+            204: (41, 1),
+            302: (40, 0),
+        }
+        units = [
+            controlled_unit(
+                unit.id.int,
+                unit.unit_type,
+                positions.get(unit.id.int, tuple(unit.position)),
+            )
+            if unit.unit_type is not UnitType.WORKER
+            else unit
+            for unit in self.roster()
+        ]
+
+        _, actions, memory = self.plan(
+            make_turn(
+                units,
+                enemies=[
+                    enemy_core(400, (65, 0)),
+                    enemy_unit(401, UnitType.VANGUARD, (65, 1)),
+                ],
+            ),
+            self.squad_memory(),
+        )
+
+        self.assertTrue(memory.assault_guarded)
+        self.assertFalse(memory.assault_gathering)
+        self.assertTrue(any("squad-assault" in action and "team=1" in action for action in actions))
+        self.assertFalse(any("squad-assault" in action and "team=2" in action for action in actions))
+
+    def test_far_guarded_core_without_nearby_squad_keeps_patrolling(self):
+        _, actions, memory = self.plan(
+            make_turn(
+                self.roster(),
+                enemies=[
+                    enemy_core(400, (65, 0)),
+                    enemy_unit(401, UnitType.RANGER, (65, 1)),
+                ],
+            ),
+            self.squad_memory(),
+        )
+
+        self.assertEqual(memory.assault_target_position, (65, 0))
+        self.assertTrue(memory.assault_guarded)
+        self.assertFalse(memory.assault_gathering)
+        self.assertFalse(any("squad-assault" in action for action in actions))
+        self.assertTrue(any("squad-patrol" in action and "team=1" in action for action in actions))
+        self.assertTrue(any("squad-patrol" in action and "team=2" in action for action in actions))
 
     def test_gather_wait_is_interrupted_by_incoming_ranger_fire(self):
         memory = self.squad_memory()
