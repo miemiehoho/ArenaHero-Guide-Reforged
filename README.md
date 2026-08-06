@@ -4,9 +4,13 @@
 版本为 v2；防守基线 `ecf5b65` 已保存为 annotated Tag `固若金汤正式版v1`，可直接用于回滚。
 项目使用支持单位治疗动作的官方 Arena Hero Python SDK `0.2.8`。
 
-## 友好链接
+## 友情链接
 
-- [L站（Linux.do）讨论帖](https://linux.do/t/topic/2714382)
+- [LINUX DO - 新的理想型社区](https://linux.do/)
+
+## 社区讨论
+
+- [Arena Hero 项目讨论帖](https://linux.do/t/topic/2714382)
 
 ## 当前策略
 
