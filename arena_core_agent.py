@@ -96,6 +96,13 @@ ROAM_TRAP_CHASE_TICKS = 16
 ROAM_CHASE_COOLDOWN_TICKS = 12
 ROAM_TRAP_ALLY_RADIUS = 5
 ROAM_TRAP_MAX_EXITS = 2
+SQUAD_PATROL_RADII: tuple[int, ...] = (12, 19, 26, 32)
+SQUAD_PATROL_RING_SEQUENCE: tuple[int, ...] = (
+    *SQUAD_PATROL_RADII,
+    *reversed(SQUAD_PATROL_RADII[1:-1]),
+)
+SQUAD_PATROL_WAYPOINT_STEP = 7
+SQUAD_PATROL_PATH_FAILURES = 3
 TARGET_WORKERS_CONTROL = 4
 SQUAD_VANGUARDS = 2
 SQUAD_RANGERS = 1
@@ -112,6 +119,12 @@ ASSAULT_CORE_GUARD_RADIUS = 6
 ASSAULT_CORE_SAFE_DISTANCE = 6
 # 只有当前 Core 64 格内的有护卫敌方 Core 才触发全体集结。
 ASSAULT_HOME_CORE_DISTANCE = 64
+CORE_SEARCH_RADIUS = 16
+CORE_GUESS_STEP = 16
+CORE_GUESS_MAX_FRIENDLY_DISTANCE = 24
+CORE_SEARCH_COOLDOWN_TICKS = 64
+CORE_SEARCH_MAX_TICKS = 256
+CORE_SEARCH_PATH_FAILURES = 3
 SPAWN_CLEAR_TICKS = 3
 # 19 是无需维护费的最后一个人口档；自动生产不得进入收费区间。
 # 用户仍可通过手动计划显式增加人口。
@@ -135,7 +148,7 @@ RESOURCE_DISTANCE_COST = 10
 RESOURCE_LOAD_COST = 3
 COMBAT_THREAT_MEMORY_TICKS = 6
 STATE_SAVE_INTERVAL_TICKS = 10
-STATE_VERSION = 8
+STATE_VERSION = 9
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 4
 
@@ -649,10 +662,27 @@ class CombatSquad:
 
 
 @dataclass
+class SquadSearchMission:
+    """一次性覆盖猜测点或失联 Core 周围区域。"""
+
+    kind: str
+    center: Pos
+    started_tick: int
+    source_worker_id: UUID | None = None
+    core_id: UUID | None = None
+    covered_cells: set[Pos] = field(default_factory=set)
+    unit_goals: dict[UUID, Pos] = field(default_factory=dict)
+    path_failures: dict[UUID, int] = field(default_factory=dict)
+    failed_goals: set[Pos] = field(default_factory=set)
+
+
+@dataclass
 class AgentMemory:
     # 世界与敌情记忆。
     known_obstacles: set[Pos] = field(default_factory=set)
     known_enemy_cores: dict[UUID, tuple[Pos, int]] = field(default_factory=dict)
+    enemy_core_guarded: dict[UUID, bool] = field(default_factory=dict)
+    enemy_core_missing: set[UUID] = field(default_factory=set)
     known_resources: set[Pos] = field(default_factory=set)
     temporary_blocked_cells: dict[Pos, int] = field(default_factory=dict)
     known_combat_threats: dict[UUID, tuple[Pos, int]] = field(default_factory=dict)
@@ -688,6 +718,13 @@ class AgentMemory:
     home_ranger_id: UUID | None = None
     squad_assignments: dict[UUID, int] = field(default_factory=dict)
     squad_patrol_goal: dict[int, Pos] = field(default_factory=dict)
+    squad_patrol_ring_index: dict[int, int] = field(default_factory=dict)
+    squad_patrol_step: dict[int, int] = field(default_factory=dict)
+    squad_patrol_path_failures: dict[int, int] = field(default_factory=dict)
+    squad_search_missions: dict[int, SquadSearchMission] = field(default_factory=dict)
+    squad_search_cooldown_until: dict[int, int] = field(default_factory=dict)
+    worker_guess_cooldown_until: dict[UUID, int] = field(default_factory=dict)
+    core_verification_cooldown_until: dict[UUID, int] = field(default_factory=dict)
     squad_regroup_goal: dict[int, Pos] = field(default_factory=dict)
     squad_regroup_interrupted: set[int] = field(default_factory=set)
     squad_regroup_safe_ticks: dict[int, int] = field(default_factory=dict)
@@ -717,9 +754,8 @@ class AgentMemory:
             known_obstacles=decode_positions(state.get("known_obstacles", [])),
         )
         state_version = state.get("version")
-        restore_enemy_state = (
-            isinstance(state_version, int) and state_version >= STATE_VERSION
-        )
+        restore_enemy_state = isinstance(state_version, int) and state_version >= 8
+        restore_search_state = isinstance(state_version, int) and state_version >= 9
         raw_core_position = state.get("core_position")
         if (
             restore_enemy_state
@@ -758,6 +794,22 @@ class AgentMemory:
                     and all(isinstance(value, int) for value in raw_position)
                 ):
                     memory.squad_patrol_goal[squad_id] = tuple(raw_position)
+        for state_key, target in (
+            ("squad_patrol_ring_indexes", memory.squad_patrol_ring_index),
+            ("squad_patrol_steps", memory.squad_patrol_step),
+            ("squad_patrol_path_failures", memory.squad_patrol_path_failures),
+            ("squad_search_cooldown_until", memory.squad_search_cooldown_until),
+        ):
+            raw_values = state.get(state_key, {})
+            if not restore_search_state or not isinstance(raw_values, dict):
+                continue
+            for raw_id, value in raw_values.items():
+                try:
+                    squad_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if squad_id > 0 and isinstance(value, int) and value >= 0:
+                    target[squad_id] = value
         raw_regroup_goals = state.get("squad_regroup_goals", {})
         if isinstance(raw_regroup_goals, dict):
             for raw_id, raw_position in raw_regroup_goals.items():
@@ -834,6 +886,83 @@ class AgentMemory:
                             tuple(sighting["position"]),
                             sighting["tick"],
                         )
+                        if restore_search_state:
+                            memory.enemy_core_guarded[enemy_id] = (
+                                sighting.get("guarded") is True
+                            )
+                            if sighting.get("missing") is True:
+                                memory.enemy_core_missing.add(enemy_id)
+        if restore_search_state:
+            for state_key, target in (
+                ("worker_guess_cooldown_until", memory.worker_guess_cooldown_until),
+                (
+                    "core_verification_cooldown_until",
+                    memory.core_verification_cooldown_until,
+                ),
+            ):
+                raw_values = state.get(state_key, {})
+                if not isinstance(raw_values, dict):
+                    continue
+                for raw_id, value in raw_values.items():
+                    unit_id = decode_uuid(raw_id)
+                    if unit_id is not None and isinstance(value, int) and value >= 0:
+                        target[unit_id] = value
+            raw_missions = state.get("squad_search_missions", {})
+            if isinstance(raw_missions, dict):
+                for raw_squad_id, raw_mission in raw_missions.items():
+                    try:
+                        squad_id = int(raw_squad_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if squad_id <= 0 or not isinstance(raw_mission, dict):
+                        continue
+                    center = raw_mission.get("center")
+                    started_tick = raw_mission.get("started_tick")
+                    kind = raw_mission.get("kind")
+                    if (
+                        kind not in {"guess", "verify"}
+                        or not isinstance(center, list)
+                        or len(center) != 2
+                        or not all(isinstance(value, int) for value in center)
+                        or not isinstance(started_tick, int)
+                    ):
+                        continue
+                    mission = SquadSearchMission(
+                        kind=kind,
+                        center=tuple(center),
+                        started_tick=started_tick,
+                        source_worker_id=decode_uuid(
+                            raw_mission.get("source_worker_id")
+                        ),
+                        core_id=decode_uuid(raw_mission.get("core_id")),
+                        covered_cells=decode_positions(
+                            raw_mission.get("covered_cells", [])
+                        ),
+                        failed_goals=decode_positions(
+                            raw_mission.get("failed_goals", [])
+                        ),
+                    )
+                    raw_unit_goals = raw_mission.get("unit_goals", {})
+                    if isinstance(raw_unit_goals, dict):
+                        for raw_id, raw_position in raw_unit_goals.items():
+                            unit_id = decode_uuid(raw_id)
+                            if (
+                                unit_id is not None
+                                and isinstance(raw_position, list)
+                                and len(raw_position) == 2
+                                and all(
+                                    isinstance(value, int)
+                                    for value in raw_position
+                                )
+                            ):
+                                mission.unit_goals[unit_id] = tuple(raw_position)
+                    raw_failures = raw_mission.get("path_failures", {})
+                    if isinstance(raw_failures, dict):
+                        for raw_id, value in raw_failures.items():
+                            unit_id = decode_uuid(raw_id)
+                            if unit_id is not None and isinstance(value, int):
+                                mission.path_failures[unit_id] = max(0, value)
+                    memory.squad_search_missions[squad_id] = mission
         return memory
 
     def persistent_state(self) -> dict:
@@ -851,7 +980,12 @@ class AgentMemory:
                 list(position) for position in sorted(self.known_obstacles)
             ],
             "known_enemy_cores": {
-                str(enemy_id): {"position": list(position), "tick": tick}
+                str(enemy_id): {
+                    "position": list(position),
+                    "tick": tick,
+                    "guarded": self.enemy_core_guarded.get(enemy_id, False),
+                    "missing": enemy_id in self.enemy_core_missing,
+                }
                 for enemy_id, (position, tick) in sorted(
                     self.known_enemy_cores.items(),
                     key=lambda item: str(item[0]),
@@ -880,6 +1014,76 @@ class AgentMemory:
             "squad_patrol_goals": {
                 str(squad_id): list(position)
                 for squad_id, position in sorted(self.squad_patrol_goal.items())
+            },
+            "squad_patrol_ring_indexes": {
+                str(squad_id): value
+                for squad_id, value in sorted(self.squad_patrol_ring_index.items())
+            },
+            "squad_patrol_steps": {
+                str(squad_id): value
+                for squad_id, value in sorted(self.squad_patrol_step.items())
+            },
+            "squad_patrol_path_failures": {
+                str(squad_id): value
+                for squad_id, value in sorted(
+                    self.squad_patrol_path_failures.items()
+                )
+            },
+            "squad_search_missions": {
+                str(squad_id): {
+                    "kind": mission.kind,
+                    "center": list(mission.center),
+                    "started_tick": mission.started_tick,
+                    "source_worker_id": (
+                        str(mission.source_worker_id)
+                        if mission.source_worker_id is not None
+                        else None
+                    ),
+                    "core_id": (
+                        str(mission.core_id) if mission.core_id is not None else None
+                    ),
+                    "covered_cells": [
+                        list(position) for position in sorted(mission.covered_cells)
+                    ],
+                    "unit_goals": {
+                        str(unit_id): list(position)
+                        for unit_id, position in sorted(
+                            mission.unit_goals.items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    },
+                    "path_failures": {
+                        str(unit_id): value
+                        for unit_id, value in sorted(
+                            mission.path_failures.items(),
+                            key=lambda item: str(item[0]),
+                        )
+                    },
+                    "failed_goals": [
+                        list(position) for position in sorted(mission.failed_goals)
+                    ],
+                }
+                for squad_id, mission in sorted(self.squad_search_missions.items())
+            },
+            "squad_search_cooldown_until": {
+                str(squad_id): value
+                for squad_id, value in sorted(
+                    self.squad_search_cooldown_until.items()
+                )
+            },
+            "worker_guess_cooldown_until": {
+                str(worker_id): value
+                for worker_id, value in sorted(
+                    self.worker_guess_cooldown_until.items(),
+                    key=lambda item: str(item[0]),
+                )
+            },
+            "core_verification_cooldown_until": {
+                str(core_id): value
+                for core_id, value in sorted(
+                    self.core_verification_cooldown_until.items(),
+                    key=lambda item: str(item[0]),
+                )
             },
             "squad_regroup_goals": {
                 str(squad_id): list(position)
@@ -925,14 +1129,16 @@ class AgentMemory:
         self.outer_scout_path_failures.clear()
         self.roam_goal.clear()
         self.squad_patrol_goal.clear()
+        self.squad_patrol_ring_index.clear()
+        self.squad_patrol_step.clear()
+        self.squad_patrol_path_failures.clear()
         self.squad_regroup_goal.clear()
         self.squad_regroup_interrupted.clear()
         self.squad_regroup_safe_ticks.clear()
         self.squad_regroup_last_distance.clear()
         self.squad_regroup_stall_ticks.clear()
         self.retreat_goal.clear()
-        self.known_enemy_cores.clear()
-        self.clear_assault()
+        # 敌方 Core 和彻查区域使用世界坐标，不因我方 Core 迁移失效。
         return True
 
     def prune_unit_state(self, workers, vanguards, rangers, tick: int = 0) -> bool:
@@ -983,6 +1189,27 @@ class AgentMemory:
             for unit_id, squad_id in self.squad_assignments.items()
             if unit_id in combat_ids
         }
+        for mission in self.squad_search_missions.values():
+            mission.unit_goals = {
+                unit_id: goal
+                for unit_id, goal in mission.unit_goals.items()
+                if unit_id in combat_ids
+            }
+            mission.path_failures = {
+                unit_id: failures
+                for unit_id, failures in mission.path_failures.items()
+                if unit_id in combat_ids
+            }
+        self.worker_guess_cooldown_until = {
+            worker_id: expiry
+            for worker_id, expiry in self.worker_guess_cooldown_until.items()
+            if expiry > tick
+        }
+        self.core_verification_cooldown_until = {
+            core_id: expiry
+            for core_id, expiry in self.core_verification_cooldown_until.items()
+            if expiry > tick and core_id in self.known_enemy_cores
+        }
 
         return (
             self.worker_sector != sectors_before
@@ -1028,6 +1255,9 @@ class AgentMemory:
         before = (
             dict(self.squad_assignments),
             dict(self.squad_patrol_goal),
+            dict(self.squad_patrol_ring_index),
+            dict(self.squad_patrol_step),
+            set(self.squad_search_missions),
             dict(self.squad_regroup_goal),
             set(self.squad_regroup_interrupted),
             self.home_vanguard_id,
@@ -1115,6 +1345,16 @@ class AgentMemory:
             for squad_id, goal in self.squad_patrol_goal.items()
             if squad_id in live_squad_ids and squad_id != 0
         }
+        for state in (
+            self.squad_patrol_ring_index,
+            self.squad_patrol_step,
+            self.squad_patrol_path_failures,
+            self.squad_search_missions,
+            self.squad_search_cooldown_until,
+        ):
+            for squad_id in tuple(state):
+                if squad_id not in live_squad_ids or squad_id == 0:
+                    state.pop(squad_id, None)
         self.squad_regroup_goal = {
             squad_id: goal
             for squad_id, goal in self.squad_regroup_goal.items()
@@ -1134,6 +1374,9 @@ class AgentMemory:
         after = (
             dict(self.squad_assignments),
             dict(self.squad_patrol_goal),
+            dict(self.squad_patrol_ring_index),
+            dict(self.squad_patrol_step),
+            set(self.squad_search_missions),
             dict(self.squad_regroup_goal),
             set(self.squad_regroup_interrupted),
             self.home_vanguard_id,
@@ -1181,10 +1424,19 @@ class AgentMemory:
         )
         target_id = target.id if target is not None else None
         target_position = tuple(target.position) if target is not None else None
-        if target is None and self.known_enemy_cores:
+        known_targets = {
+            enemy_id: sighting
+            for enemy_id, sighting in self.known_enemy_cores.items()
+            if enemy_id not in self.enemy_core_missing
+        }
+        if target is None and known_targets:
             target_id, (target_position, _) = min(
-                self.known_enemy_cores.items(),
-                key=lambda item: (manhattan(core, item[1][0]), str(item[0])),
+                known_targets.items(),
+                key=lambda item: (
+                    self.enemy_core_guarded.get(item[0], False),
+                    manhattan(core, item[1][0]),
+                    str(item[0]),
+                ),
             )
         if target is not None:
             target_changed = target.id != self.assault_target_id
@@ -1196,20 +1448,16 @@ class AgentMemory:
             self.assault_target_kind = target.kind
             self.assault_target_position = tuple(target.position)
             self.assault_target_last_seen_tick = tick
-            has_guard = any(
-                enemy.kind == "UNIT"
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(tuple(target.position), tuple(enemy.position))
-                <= ASSAULT_CORE_GUARD_RADIUS
-                for enemy in visible_enemies
-            )
+            has_guard = self.enemy_core_guarded.get(target.id, False)
             if has_guard:
                 if not self.assault_guarded:
                     self.assault_rally_position = None
                 self.assault_guarded = True
                 self.assault_gathering = True
-            elif not self.assault_guarded:
+            else:
+                self.assault_guarded = False
                 self.assault_gathering = False
+                self.assault_rally_position = None
         elif target_id is not None and target_position is not None:
             if target_id != self.assault_target_id:
                 self.assault_guarded = False
@@ -1218,21 +1466,22 @@ class AgentMemory:
             self.assault_target_id = target_id
             self.assault_target_kind = "CORE"
             self.assault_target_position = target_position
-            if any(
-                enemy.kind == "UNIT"
-                and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(target_position, tuple(enemy.position))
-                <= ASSAULT_CORE_GUARD_RADIUS
-                for enemy in visible_enemies
-            ):
+            if self.enemy_core_guarded.get(target_id, False):
                 self.assault_guarded = True
                 self.assault_gathering = True
+            else:
+                self.assault_guarded = False
+                self.assault_gathering = False
+                self.assault_rally_position = None
         elif self.assault_target_id is not None:
             if self.assault_target_kind == "CORE":
                 sighting = self.known_enemy_cores.get(self.assault_target_id)
             else:
                 sighting = self.known_combat_threats.get(self.assault_target_id)
-            if sighting is not None:
+            if (
+                sighting is not None
+                and self.assault_target_id not in self.enemy_core_missing
+            ):
                 self.assault_target_position = sighting[0]
             elif self.assault_target_kind == "CORE":
                 self.clear_assault()
@@ -1303,24 +1552,79 @@ class AgentMemory:
         visible_enemies,
         vision_sources: tuple[tuple[Pos, int], ...],
         obstacles: set[Pos],
+        events,
         tick: int,
     ) -> bool:
-        before = dict(self.known_enemy_cores)
+        before = (
+            dict(self.known_enemy_cores),
+            dict(self.enemy_core_guarded),
+            set(self.enemy_core_missing),
+        )
+        for event in events:
+            if (
+                event.event_type != "DESTRUCTION_PARTICIPATION"
+                or event.reason_code != "CORE"
+            ):
+                continue
+            destroyed_id = (
+                event.target_id if event.target_id in self.known_enemy_cores else None
+            )
+            if destroyed_id is None and event.position is not None:
+                destroyed_id = next(
+                    (
+                        enemy_id
+                        for enemy_id, (position, _) in self.known_enemy_cores.items()
+                        if position == tuple(event.position)
+                    ),
+                    None,
+                )
+            if destroyed_id is None:
+                continue
+            self.known_enemy_cores.pop(destroyed_id, None)
+            self.enemy_core_guarded.pop(destroyed_id, None)
+            self.enemy_core_missing.discard(destroyed_id)
+            self.core_verification_cooldown_until.pop(destroyed_id, None)
+            self.squad_search_missions = {
+                squad_id: mission
+                for squad_id, mission in self.squad_search_missions.items()
+                if mission.core_id != destroyed_id
+            }
+            if self.assault_target_id == destroyed_id:
+                self.clear_assault()
+
         visible_core_ids: set[UUID] = set()
         for enemy in visible_enemies:
             if enemy.kind != "CORE":
                 continue
             visible_core_ids.add(enemy.id)
             self.known_enemy_cores[enemy.id] = (tuple(enemy.position), tick)
+            self.enemy_core_guarded[enemy.id] = any(
+                other.kind == "UNIT"
+                and other.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+                and manhattan(tuple(enemy.position), tuple(other.position))
+                <= ASSAULT_CORE_GUARD_RADIUS
+                for other in visible_enemies
+            )
+            self.enemy_core_missing.discard(enemy.id)
+            self.core_verification_cooldown_until.pop(enemy.id, None)
+            self.squad_search_missions = {
+                squad_id: mission
+                for squad_id, mission in self.squad_search_missions.items()
+                if mission.core_id != enemy.id
+            }
 
-        # 敌方 Core 也会移动。远端目击可跨重启保留；友军重新进入该位置视野且
-        # 没看见 Core 时，再删除旧标记。
+        # 旧位置进入视野但 Core 不在时，只标记为待彻查，不直接删除记录。
         for enemy_id, (position, _) in list(self.known_enemy_cores.items()):
             if enemy_id in visible_core_ids:
                 continue
             if any_vision_source_sees(position, vision_sources, obstacles):
-                self.known_enemy_cores.pop(enemy_id, None)
-        return self.known_enemy_cores != before
+                self.enemy_core_missing.add(enemy_id)
+        after = (
+            dict(self.known_enemy_cores),
+            dict(self.enemy_core_guarded),
+            set(self.enemy_core_missing),
+        )
+        return before != after
 
     def observe_enemy_workers(self, visible_enemies, tick: int) -> None:
         for enemy in visible_enemies:
@@ -1824,6 +2128,61 @@ class AgentMemory:
         self.scout_goal[worker_id] = core
         return core
 
+    def advance_squad_patrol(self, squad_id: int, core: Pos) -> None:
+        ring_index = self.squad_patrol_ring_index.get(squad_id, 0)
+        radius = SQUAD_PATROL_RING_SEQUENCE[
+            ring_index % len(SQUAD_PATROL_RING_SEQUENCE)
+        ]
+        route = square_ring_waypoints(
+            core,
+            radius,
+            SQUAD_PATROL_WAYPOINT_STEP,
+        )
+        step = self.squad_patrol_step.get(squad_id, 0) + 1
+        if step >= len(route):
+            step = 0
+            ring_index = (ring_index + 1) % len(SQUAD_PATROL_RING_SEQUENCE)
+        self.squad_patrol_ring_index[squad_id] = ring_index
+        self.squad_patrol_step[squad_id] = step
+        self.squad_patrol_goal.pop(squad_id, None)
+        self.squad_patrol_path_failures.pop(squad_id, None)
+
+    def squad_patrol_goal_for(
+        self,
+        squad_id: int,
+        squad_index: int,
+        squad_count: int,
+        core: Pos,
+        obstacles: set[Pos],
+    ) -> Pos:
+        """按 12～32 格往返方环为完整小队选择稳定、错开的巡逻点。"""
+        goal = self.squad_patrol_goal.get(squad_id)
+        if goal is not None and goal not in obstacles:
+            return goal
+        max_candidates = sum(
+            len(square_ring_waypoints(core, radius, SQUAD_PATROL_WAYPOINT_STEP))
+            for radius in SQUAD_PATROL_RADII
+        )
+        for _ in range(max_candidates):
+            ring_index = self.squad_patrol_ring_index.get(squad_id, 0)
+            radius = SQUAD_PATROL_RING_SEQUENCE[
+                ring_index % len(SQUAD_PATROL_RING_SEQUENCE)
+            ]
+            route = square_ring_waypoints(
+                core,
+                radius,
+                SQUAD_PATROL_WAYPOINT_STEP,
+            )
+            step = self.squad_patrol_step.get(squad_id, 0)
+            offset = (squad_index * len(route)) // max(1, squad_count)
+            candidate = route[(step + offset) % len(route)]
+            if candidate not in obstacles:
+                self.squad_patrol_goal[squad_id] = candidate
+                return candidate
+            self.advance_squad_patrol(squad_id, core)
+        self.squad_patrol_goal[squad_id] = core
+        return core
+
     def roam_goal_for(
         self,
         unit_id: UUID,
@@ -1840,7 +2199,11 @@ class AgentMemory:
             phase += 1
 
         core_outskirts: list[Pos] = []
-        for enemy_position, _ in sorted(self.known_enemy_cores.values()):
+        for enemy_id, (enemy_position, _) in sorted(
+            self.known_enemy_cores.items(), key=lambda item: str(item[0])
+        ):
+            if enemy_id in self.enemy_core_missing:
+                continue
             for offset in ((0, -4), (4, 0), (0, 4), (-4, 0)):
                 candidate = add(enemy_position, offset)
                 if chebyshev(core, candidate) <= ROAM_RADIUS:
@@ -1903,6 +2266,381 @@ class PlanningContext:
     outer_scout_active: bool
     healing_resources: int
     actions: list[str]
+
+
+def core_search_cells(center: Pos) -> set[Pos]:
+    return {
+        (center[0] + dx, center[1] + dy)
+        for dx in range(-CORE_SEARCH_RADIUS, CORE_SEARCH_RADIUS + 1)
+        for dy in range(-CORE_SEARCH_RADIUS, CORE_SEARCH_RADIUS + 1)
+    }
+
+
+def search_coverage_from(
+    source: Pos,
+    radius: int,
+    area: set[Pos],
+    obstacles: set[Pos],
+) -> set[Pos]:
+    candidates = {
+        (source[0] + dx, source[1] + dy)
+        for dx in range(-radius, radius + 1)
+        for dy in range(-(radius - abs(dx)), radius - abs(dx) + 1)
+    }
+    return {
+        cell
+        for cell in candidates & area
+        if cell not in obstacles and visible_from(source, cell, radius, obstacles)
+    }
+
+
+def infer_enemy_core_guess(
+    track: EnemyWorkerTrack,
+    friendly_positions: tuple[Pos, ...],
+    obstacles: set[Pos],
+    known_resources: set[Pos] | None = None,
+) -> Pos:
+    """根据资源往返轨迹给出受友军距离约束的 Core 猜测点。"""
+    nearest = min(
+        friendly_positions,
+        key=lambda position: (manhattan(position, track.position), position),
+    )
+    if track.is_moving:
+        delta = track.movement_delta
+        previous = track.previous_position
+        nearest_resource = min(
+            known_resources or set(),
+            key=lambda resource: (
+                manhattan(previous, resource),
+                resource,
+            ),
+            default=None,
+        )
+        if nearest_resource is not None:
+            previous_distance = manhattan(previous, nearest_resource)
+            current_distance = manhattan(track.position, nearest_resource)
+            if current_distance < previous_distance:
+                delta = (-delta[0], -delta[1])
+        else:
+            outward = (
+                track.position[0] - nearest[0],
+                track.position[1] - nearest[1],
+            )
+            if delta[0] * outward[0] + delta[1] * outward[1] < 0:
+                delta = (-delta[0], -delta[1])
+    else:
+        delta = (
+            0 if track.position[0] == nearest[0] else (1 if track.position[0] > nearest[0] else -1),
+            0 if track.position[1] == nearest[1] else (1 if track.position[1] > nearest[1] else -1),
+        )
+    if delta == (0, 0):
+        delta = SCOUT_VECTORS[track.first_seen_tick % len(SCOUT_VECTORS)]
+    candidate = (
+        track.position[0] + delta[0] * CORE_GUESS_STEP,
+        track.position[1] + delta[1] * CORE_GUESS_STEP,
+    )
+    distance = chebyshev(nearest, candidate)
+    if distance > CORE_GUESS_MAX_FRIENDLY_DISTANCE:
+        scale = CORE_GUESS_MAX_FRIENDLY_DISTANCE / distance
+        candidate = (
+            nearest[0] + round((candidate[0] - nearest[0]) * scale),
+            nearest[1] + round((candidate[1] - nearest[1]) * scale),
+        )
+    if candidate in obstacles:
+        return track.position
+    return candidate
+
+
+def search_goal_for(
+    mission: SquadSearchMission,
+    unit,
+    obstacles: set[Pos],
+    reserved_goals: set[Pos],
+    reserved_coverage: set[Pos],
+) -> Pos | None:
+    """选择新增视野最多、与同队目标重叠最少的下一处彻查位置。"""
+    unit_id = unit.id
+    position: Pos = tuple(unit.position)
+    area = core_search_cells(mission.center)
+    uncovered = (area - obstacles) - mission.covered_cells
+    goal = mission.unit_goals.get(unit_id)
+    if goal is not None:
+        useful = search_coverage_from(
+            goal,
+            UNIT_VISION_RADII[unit.unit_type],
+            area,
+            obstacles,
+        ) & uncovered
+        if position != goal and goal not in obstacles and useful:
+            reserved_goals.add(goal)
+            reserved_coverage.update(useful)
+            return goal
+        mission.unit_goals.pop(unit_id, None)
+        mission.path_failures.pop(unit_id, None)
+
+    choices: list[tuple[tuple[int, int, int, Pos], Pos, set[Pos]]] = []
+    for candidate in area - obstacles - mission.failed_goals - reserved_goals:
+        coverage = search_coverage_from(
+            candidate,
+            UNIT_VISION_RADII[unit.unit_type],
+            area,
+            obstacles,
+        ) & uncovered
+        if not coverage:
+            continue
+        choices.append(
+            (
+                (
+                    -len(coverage),
+                    len(coverage & reserved_coverage),
+                    manhattan(position, candidate),
+                    candidate,
+                ),
+                candidate,
+                coverage,
+            )
+        )
+    if not choices:
+        return None
+    _, goal, coverage = min(choices, key=lambda item: item[0])
+    mission.unit_goals[unit_id] = goal
+    reserved_goals.add(goal)
+    reserved_coverage.update(coverage)
+    return goal
+
+
+def finish_search_mission(
+    context: PlanningContext,
+    squad_id: int,
+    *,
+    completed: bool,
+) -> None:
+    memory = context.memory
+    mission = memory.squad_search_missions.pop(squad_id, None)
+    if mission is None:
+        return
+    memory.squad_search_cooldown_until[squad_id] = (
+        context.turn.tick + CORE_SEARCH_COOLDOWN_TICKS
+    )
+    if mission.source_worker_id is not None:
+        memory.worker_guess_cooldown_until[mission.source_worker_id] = (
+            context.turn.tick + CORE_SEARCH_COOLDOWN_TICKS
+        )
+    if mission.core_id is not None:
+        if completed:
+            memory.known_enemy_cores.pop(mission.core_id, None)
+            memory.enemy_core_guarded.pop(mission.core_id, None)
+            memory.enemy_core_missing.discard(mission.core_id)
+            memory.core_verification_cooldown_until.pop(mission.core_id, None)
+            if memory.assault_target_id == mission.core_id:
+                memory.clear_assault()
+        else:
+            memory.core_verification_cooldown_until[mission.core_id] = (
+                context.turn.tick + CORE_SEARCH_COOLDOWN_TICKS
+            )
+    result = "complete" if completed else "inconclusive"
+    context.actions.append(
+        f"squad-search-{result} team={squad_id} kind={mission.kind} "
+        f"center={mission.center} covered={len(mission.covered_cells)}"
+    )
+
+
+def update_and_assign_search_missions(context: PlanningContext) -> bool:
+    """推进一次性覆盖任务，并为失联 Core 或 Worker 目击分配空闲小队。"""
+    memory = context.memory
+    def structural_state() -> tuple:
+        return (
+            tuple(
+                sorted(
+                    (
+                        squad_id,
+                        mission.kind,
+                        mission.center,
+                        mission.source_worker_id,
+                        mission.core_id,
+                    )
+                    for squad_id, mission in memory.squad_search_missions.items()
+                )
+            ),
+            frozenset(memory.known_enemy_cores),
+            frozenset(memory.enemy_core_missing),
+            tuple(sorted(memory.squad_search_cooldown_until.items())),
+            tuple(sorted(memory.worker_guess_cooldown_until.items(), key=lambda item: str(item[0]))),
+            tuple(sorted(memory.core_verification_cooldown_until.items(), key=lambda item: str(item[0]))),
+        )
+
+    before = structural_state()
+    unit_by_id = {
+        unit.id: unit for unit in (*context.vanguards, *context.rangers)
+    }
+    field_squads = tuple(
+        squad
+        for squad in context.combat_squads
+        if squad.squad_id != 0 and squad.complete
+    )
+    live_squad_ids = {squad.squad_id for squad in field_squads}
+    for squad_id in tuple(memory.squad_search_missions):
+        if squad_id not in live_squad_ids:
+            memory.squad_search_missions.pop(squad_id, None)
+
+    if context.visible_enemy_cores:
+        for squad_id, mission in tuple(memory.squad_search_missions.items()):
+            if mission.kind == "guess":
+                finish_search_mission(context, squad_id, completed=False)
+
+    all_friendly = tuple((*context.workers, *context.vanguards, *context.rangers))
+    for squad_id, mission in tuple(memory.squad_search_missions.items()):
+        area = core_search_cells(mission.center)
+        for unit in all_friendly:
+            mission.covered_cells.update(
+                search_coverage_from(
+                    tuple(unit.position),
+                    UNIT_VISION_RADII[unit.unit_type],
+                    area,
+                    memory.known_obstacles,
+                )
+            )
+        searchable = area - memory.known_obstacles
+        if searchable <= mission.covered_cells:
+            finish_search_mission(context, squad_id, completed=True)
+        elif context.turn.tick - mission.started_tick >= CORE_SEARCH_MAX_TICKS:
+            finish_search_mission(context, squad_id, completed=False)
+
+    active_core_ids = {
+        mission.core_id
+        for mission in memory.squad_search_missions.values()
+        if mission.core_id is not None
+    }
+    active_worker_ids = {
+        mission.source_worker_id
+        for mission in memory.squad_search_missions.values()
+        if mission.source_worker_id is not None
+    }
+
+    def eligible_squads() -> list[CombatSquad]:
+        return [
+            squad
+            for squad in field_squads
+            if squad.squad_id not in memory.squad_search_missions
+            and context.turn.tick
+            >= memory.squad_search_cooldown_until.get(squad.squad_id, 0)
+        ]
+
+    def assign_nearest(
+        center: Pos,
+        mission: SquadSearchMission,
+    ) -> bool:
+        candidates = eligible_squads()
+        if not candidates:
+            return False
+        squad = min(
+            candidates,
+            key=lambda candidate: (
+                min(
+                    manhattan(tuple(unit_by_id[unit_id].position), center)
+                    for unit_id in candidate.unit_ids
+                    if unit_id in unit_by_id
+                ),
+                candidate.squad_id,
+            ),
+        )
+        memory.squad_search_missions[squad.squad_id] = mission
+        memory.squad_patrol_goal.pop(squad.squad_id, None)
+        context.actions.append(
+            f"squad-search-start team={squad.squad_id} kind={mission.kind} "
+            f"center={mission.center}"
+        )
+        return True
+
+    for core_id in sorted(
+        memory.enemy_core_missing,
+        key=lambda enemy_id: (
+            memory.enemy_core_guarded.get(enemy_id, False),
+            min(
+                (
+                    manhattan(
+                        tuple(unit.position),
+                        memory.known_enemy_cores[enemy_id][0],
+                    )
+                    for unit in all_friendly
+                ),
+                default=sys.maxsize,
+            ),
+            str(enemy_id),
+        ),
+    ):
+        if core_id in active_core_ids:
+            continue
+        if context.turn.tick < memory.core_verification_cooldown_until.get(core_id, 0):
+            continue
+        sighting = memory.known_enemy_cores.get(core_id)
+        if sighting is None:
+            continue
+        if assign_nearest(
+            sighting[0],
+            SquadSearchMission(
+                kind="verify",
+                center=sighting[0],
+                started_tick=context.turn.tick,
+                core_id=core_id,
+            ),
+        ):
+            active_core_ids.add(core_id)
+
+    # 已有可攻击 Core 时不再从 Worker 生成低优先级猜测。
+    if any(
+        core_id not in memory.enemy_core_missing
+        for core_id in memory.known_enemy_cores
+    ):
+        return structural_state() != before
+    friendly_positions = tuple(tuple(unit.position) for unit in all_friendly)
+    if not friendly_positions:
+        return structural_state() != before
+    visible_worker_ids = {
+        enemy.id
+        for enemy in context.safe_enemy_units
+        if enemy.unit_type is UnitType.WORKER
+    }
+    tracks = sorted(
+        (
+            (worker_id, track)
+            for worker_id, track in memory.enemy_worker_tracks.items()
+            if worker_id in visible_worker_ids
+            and worker_id not in active_worker_ids
+            and context.turn.tick
+            >= memory.worker_guess_cooldown_until.get(worker_id, 0)
+        ),
+        key=lambda item: (
+            not item[1].is_moving,
+            min(manhattan(position, item[1].position) for position in friendly_positions),
+            str(item[0]),
+        ),
+    )
+    for worker_id, track in tracks:
+        if not eligible_squads():
+            break
+        center = infer_enemy_core_guess(
+            track,
+            friendly_positions,
+            memory.known_obstacles,
+            memory.known_resources,
+        )
+        if any(
+            chebyshev(center, mission.center) <= CORE_SEARCH_RADIUS
+            for mission in memory.squad_search_missions.values()
+        ):
+            continue
+        if assign_nearest(
+            center,
+            SquadSearchMission(
+                kind="guess",
+                center=center,
+                started_tick=context.turn.tick,
+                source_worker_id=worker_id,
+            ),
+        ):
+            active_worker_ids.add(worker_id)
+    return structural_state() != before
 
 
 def idle_core_exit_destination(
@@ -2084,7 +2822,9 @@ def roam_core_reacquire_goal(
         | context.visible_enemy_unit_cells
     )
     candidates: list[Pos] = []
-    for enemy_position, _ in context.memory.known_enemy_cores.values():
+    for enemy_id, (enemy_position, _) in context.memory.known_enemy_cores.items():
+        if enemy_id in context.memory.enemy_core_missing:
+            continue
         for offset in ((0, -4), (4, 0), (0, 4), (-4, 0)):
             candidate = add(enemy_position, offset)
             if (
@@ -3036,28 +3776,9 @@ def plan_field_squads(context: PlanningContext) -> None:
         ):
             squad_target_object = None
             squad_target_position = None
-        nearby_worker = min(
-            (
-                enemy
-                for enemy in context.safe_enemy_units
-                if enemy.unit_type is UnitType.WORKER
-                and any(
-                    manhattan(tuple(unit.position), tuple(enemy.position)) <= 6
-                    for unit in members
-                )
-            ),
-            key=lambda enemy: (
-                manhattan(leader_position, tuple(enemy.position)),
-                str(enemy.id),
-            ),
-            default=None,
-        )
-        if squad_target_position is None and nearby_worker is not None:
-            squad_target_object = nearby_worker
-            squad_target_position = tuple(nearby_worker.position)
+        search_mission = memory.squad_search_missions.get(squad.squad_id)
         squad_attack_now = squad_target_position is not None and (
             home_emergency
-            or nearby_worker is not None
             or not memory.assault_gathering
         )
         spread = squad_spread(members)
@@ -3071,13 +3792,13 @@ def plan_field_squads(context: PlanningContext) -> None:
         )
         squad_in_combat = (
             home_emergency
-            or nearby_worker is not None
             or nearby_combat_threat
         )
         squad_idle_for_healing = (
             not squad_in_combat
             and squad_target_position is None
             and not memory.assault_gathering
+            and search_mission is None
         )
         engaged_vanguard_targets = tuple(
             enemy
@@ -3102,6 +3823,10 @@ def plan_field_squads(context: PlanningContext) -> None:
             default=None,
         )
         regroup_goal = memory.squad_regroup_goal.get(squad.squad_id)
+        if search_mission is not None:
+            clear_squad_regroup(memory, squad.squad_id)
+            regroup_goal = None
+            spread = 0
         regroup_paused = False
         regroup_started = False
         regroup_obstacles = static_obstacles | context.visible_enemy_unit_cells
@@ -3224,17 +3949,27 @@ def plan_field_squads(context: PlanningContext) -> None:
             mission_label = "squad-gather"
         elif squad_target_position is not None:
             mission_goal = squad_target_position
-            mission_label = "squad-hunt" if nearby_worker is not None else "squad-assault"
+            mission_label = "squad-assault"
+        elif search_mission is not None:
+            mission_goal = search_mission.center
+            mission_label = "squad-search"
         else:
             patrol_goal = memory.squad_patrol_goal.get(squad.squad_id)
-            if patrol_goal is None or leader_position == patrol_goal:
-                patrol_goal = memory.roam_goal_for(
-                    leader.id,
+            if patrol_goal is not None and leader_position == patrol_goal:
+                memory.advance_squad_patrol(squad.squad_id, context.core_pos)
+                patrol_goal = None
+            if patrol_goal is None:
+                patrol_squad_ids = tuple(
+                    sorted(item.squad_id for item in complete_field_squads)
+                )
+                patrol_index = patrol_squad_ids.index(squad.squad_id)
+                patrol_goal = memory.squad_patrol_goal_for(
+                    squad.squad_id,
+                    patrol_index,
+                    len(patrol_squad_ids),
                     context.core_pos,
-                    leader_position,
                     memory.known_obstacles | context.known_enemy_core_cells,
                 )
-                memory.squad_patrol_goal[squad.squad_id] = patrol_goal
             mission_goal = patrol_goal
             mission_label = "squad-patrol"
 
@@ -3242,6 +3977,8 @@ def plan_field_squads(context: PlanningContext) -> None:
         ordered_members = sorted(
             members,
             key=lambda unit: (
+                search_mission is not None
+                and unit.unit_type is not UnitType.RANGER,
                 not (
                     squad_idle_for_healing
                     and tuple(unit.position) == context.core_pos
@@ -3252,8 +3989,13 @@ def plan_field_squads(context: PlanningContext) -> None:
                 str(unit.id),
             ),
         )
+        reserved_search_goals: set[Pos] = set()
+        reserved_search_coverage: set[Pos] = set()
+        search_goal_attempts = 0
+        search_goals_available = 0
         for unit in ordered_members:
             position: Pos = tuple(unit.position)
+            unit_search_goal: Pos | None = None
             occupied.discard(position)
 
             if squad_idle_for_healing and (
@@ -3453,6 +4195,23 @@ def plan_field_squads(context: PlanningContext) -> None:
                     regroup_goal,
                     regroup_obstacles,
                 )
+            elif search_mission is not None:
+                search_goal_attempts += 1
+                unit_search_goal = search_goal_for(
+                    search_mission,
+                    unit,
+                    static_obstacles | context.visible_enemy_unit_cells,
+                    reserved_search_goals,
+                    reserved_search_coverage,
+                )
+                if unit_search_goal is not None:
+                    search_goals_available += 1
+                    destination = combat_move_toward(
+                        context,
+                        position,
+                        unit_search_goal,
+                        static_obstacles | context.visible_enemy_unit_cells,
+                    )
             elif unit.id == leader.id:
                 if squad_attack_now:
                     destination = combat_approach_step(
@@ -3515,6 +4274,10 @@ def plan_field_squads(context: PlanningContext) -> None:
                 if direction is not None:
                     unit.move(direction)
                     occupied.add(destination)
+                    if search_mission is not None:
+                        search_mission.path_failures.pop(unit.id, None)
+                    elif mission_label == "squad-patrol" and unit.id == leader.id:
+                        memory.squad_patrol_path_failures.pop(squad.squad_id, None)
                     if unit.id == leader.id:
                         planned_leader_position = destination
                     actions.append(
@@ -3522,11 +4285,34 @@ def plan_field_squads(context: PlanningContext) -> None:
                         f"team={squad.squad_id} {direction.value}"
                     )
                     continue
+            if search_mission is not None and unit_search_goal is not None:
+                failures = search_mission.path_failures.get(unit.id, 0) + 1
+                search_mission.path_failures[unit.id] = failures
+                if failures >= CORE_SEARCH_PATH_FAILURES:
+                    search_mission.failed_goals.add(unit_search_goal)
+                    search_mission.unit_goals.pop(unit.id, None)
+                    search_mission.path_failures.pop(unit.id, None)
+                    actions.append(
+                        f"{str(unit.id)[:8]} squad-search-repath "
+                        f"team={squad.squad_id} goal={unit_search_goal}"
+                    )
+            elif mission_label == "squad-patrol" and unit.id == leader.id:
+                failures = memory.squad_patrol_path_failures.get(squad.squad_id, 0) + 1
+                memory.squad_patrol_path_failures[squad.squad_id] = failures
+                if failures >= SQUAD_PATROL_PATH_FAILURES:
+                    memory.advance_squad_patrol(squad.squad_id, context.core_pos)
+                    actions.append(f"squad-patrol-repath team={squad.squad_id}")
             unit.wait()
             occupied.add(position)
             actions.append(
                 f"{str(unit.id)[:8]} {mission_label}-hold team={squad.squad_id}"
             )
+        if (
+            search_mission is not None
+            and search_goal_attempts == len(ordered_members)
+            and search_goals_available == 0
+        ):
+            finish_search_mission(context, squad.squad_id, completed=False)
 
 
 def plan_vanguards(context: PlanningContext) -> None:
@@ -4744,6 +5530,7 @@ def plan_turn(
         turn.visible_enemies,
         vision_sources,
         memory.known_obstacles,
+        turn.events,
         turn.tick,
     )
     assault_changed = memory.sync_assault_target(
@@ -4775,7 +5562,9 @@ def plan_turn(
         ):
             memory.temporary_blocked_cells.pop(blocked_cell, None)
     known_enemy_core_cells = {
-        position for position, _ in memory.known_enemy_cores.values()
+        position
+        for enemy_id, (position, _) in memory.known_enemy_cores.items()
+        if enemy_id not in memory.enemy_core_missing
     }
     # 普通 Unit 目标排除与敌方 Core 同格的单位；激进巡逻会单独把 Core 作为目标。
     safe_enemy_units = tuple(
@@ -4838,11 +5627,6 @@ def plan_turn(
     memory.prune_roam_chases(turn.tick)
     roam_is_aggressive = len(roaming_combat_units) >= ROAM_AGGRESSIVE_SIZE
     trap_obstacles = memory.known_obstacles | known_enemy_core_cells
-    visible_enemy_workers = {
-        enemy.id: enemy
-        for enemy in safe_enemy_units
-        if enemy.unit_type is UnitType.WORKER
-    }
     memory.worker_intercept_goal = {
         worker_id: assignment
         for worker_id, assignment in memory.worker_intercept_goal.items()
@@ -4852,85 +5636,10 @@ def plan_turn(
     roam_target_enemy = None
     roam_target_id: UUID | None = None
     blocker_worker_id: UUID | None = None
-    if roaming_combat_units:
-        candidate_tracks = [
-            (enemy_id, track)
-            for enemy_id, track in memory.enemy_worker_tracks.items()
-            # 巡逻边界是以 Core 为中心的方形；对角区域不能按曼哈顿距离误判为越界。
-            if chebyshev(core_pos, track.position) <= ROAM_RADIUS
-            and manhattan(track.first_seen_position, track.position) <= ROAM_CHASE_STEPS
-            and (
-                roam_is_aggressive
-                or not any(
-                    manhattan(track.position, tuple(enemy.position)) <= 6
-                    for enemy in combat_enemies
-                )
-            )
-        ]
-        candidate_tracks.sort(
-            key=lambda item: (
-                min(
-                    manhattan(tuple(unit.position), item[1].position)
-                    for unit in roaming_combat_units
-                ),
-                item[1].position,
-            )
-        )
-        for enemy_id, track in candidate_tracks:
-            trap_possible = roam_trap_possible(
-                track.position,
-                roaming_combat_units,
-                trap_obstacles,
-                occupied.occupied_cells(),
-            )
-            helper = None
-            if track.is_moving:
-                helper = min(
-                    (
-                        worker
-                        for worker in workers
-                        if worker.cargo == 0
-                        and worker.id not in resource_assignments
-                        and turn.tick >= memory.retreat_until.get(worker.id, 0)
-                        and manhattan(tuple(worker.position), track.position)
-                        <= ROAM_HELPER_RADIUS
-                    ),
-                    key=lambda worker: (
-                        manhattan(tuple(worker.position), track.position),
-                        str(worker.id),
-                    ),
-                    default=None,
-                )
-                if helper is None and not roam_is_aggressive:
-                    continue
-                if helper is not None:
-                    intercept_goal = add(track.position, track.movement_delta)
-                    intercept_blocked = (
-                        intercept_goal in memory.known_obstacles
-                        or intercept_goal in known_enemy_core_cells
-                        or intercept_goal in visible_enemy_unit_cells
-                    )
-                    if intercept_blocked and not roam_is_aggressive:
-                        continue
-                    if not intercept_blocked:
-                        blocker_worker_id = helper.id
-                        memory.worker_intercept_goal[helper.id] = (
-                            intercept_goal,
-                            turn.tick + ROAM_TARGET_LOST_TICKS,
-                        )
-            if not memory.can_continue_roam_chase(
-                enemy_id,
-                turn.tick,
-                trap_possible,
-            ):
-                if helper is not None and blocker_worker_id == helper.id:
-                    blocker_worker_id = None
-                    memory.worker_intercept_goal.pop(helper.id, None)
-                continue
-            roam_target_track = track
-            roam_target_enemy = visible_enemy_workers.get(enemy_id)
-            roam_target_id = enemy_id
-            break
+    # v2 不再追逐 Worker；目击只用于生成敌方 Core 彻查猜测。
+    memory.worker_intercept_goal.clear()
+    memory.roam_chase_started.clear()
+    memory.roam_chase_cooldown_until.clear()
 
     context = PlanningContext(
         turn=turn,
@@ -4977,6 +5686,7 @@ def plan_turn(
         healing_resources=turn.resources,
         actions=actions,
     )
+    search_changed = update_and_assign_search_missions(context)
     plan_workers(context)
     plan_field_squads(context)
     plan_vanguards(context)
@@ -4990,6 +5700,7 @@ def plan_turn(
         or sectors_changed
         or enemy_cores_changed
         or assault_changed
+        or search_changed
         or turn.tick - memory.last_state_save_tick >= STATE_SAVE_INTERVAL_TICKS
     ):
         save_state(memory.persistent_state())
@@ -5112,6 +5823,8 @@ def main() -> int:
                         f"home_ranger="
                         f"{str(memory.home_ranger_id)[:8] if memory.home_ranger_id else 'none'} "
                         f"enemy_cores={len(memory.known_enemy_cores)} "
+                        f"enemy_cores_missing={len(memory.enemy_core_missing)} "
+                        f"squad_searches={len(memory.squad_search_missions)} "
                         f"enemy_worker_tracks={len(memory.enemy_worker_tracks)} "
                         f"events=[{events}]",
                     )

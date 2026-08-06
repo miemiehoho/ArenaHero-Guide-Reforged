@@ -55,8 +55,12 @@ def controlled_unit(
     return UnitView(**kwargs)
 
 
-def enemy_unit(unit_id: int, unit_type: UnitType, position: tuple[int, int]):
-    return UnitView(
+def enemy_unit(
+    unit_id: int,
+    unit_type: UnitType,
+    position: tuple[int, int],
+):
+    kwargs = dict(
         kind="UNIT",
         id=UUID(int=unit_id),
         controlled=False,
@@ -64,6 +68,7 @@ def enemy_unit(unit_id: int, unit_type: UnitType, position: tuple[int, int]):
         hp=10,
         unit_type=unit_type,
     )
+    return UnitView(**kwargs)
 
 
 def enemy_core(core_id: int, position: tuple[int, int]):
@@ -316,7 +321,7 @@ class ResourceTests(AgentTestCase):
 
         self.assertIn(resource, memory.known_resources)
 
-    def test_core_visibility_cleans_stale_enemy_core_with_no_units(self):
+    def test_core_visibility_marks_stale_enemy_core_for_verification(self):
         enemy_id = UUID(int=400)
         memory = agent.AgentMemory(
             known_enemy_cores={enemy_id: ((5, 0), 99)},
@@ -329,7 +334,8 @@ class ResourceTests(AgentTestCase):
 
         self.plan(make_turn([], core_position=(0, 0)), memory)
 
-        self.assertNotIn(enemy_id, memory.known_enemy_cores)
+        self.assertIn(enemy_id, memory.known_enemy_cores)
+        self.assertIn(enemy_id, memory.enemy_core_missing)
         self.assertIsNone(memory.assault_target_id)
         self.assertFalse(memory.assault_guarded)
         self.assertFalse(memory.assault_gathering)
@@ -366,7 +372,7 @@ class ResourceTests(AgentTestCase):
         self.assertFalse(memory.assault_gathering)
         self.assertIsNone(memory.assault_rally_position)
 
-    def test_core_relocation_clears_enemy_core_memory_and_assault_state(self):
+    def test_core_relocation_preserves_world_enemy_core_and_assault_state(self):
         enemy_id = UUID(int=400)
         memory = agent.AgentMemory(
             known_enemy_cores={enemy_id: ((79, 114), 900)},
@@ -382,10 +388,10 @@ class ResourceTests(AgentTestCase):
         memory.sync_core_position((0, 0))
         memory.sync_core_position((10, 10))
 
-        self.assertEqual(memory.known_enemy_cores, {})
-        self.assertIsNone(memory.assault_target_id)
-        self.assertFalse(memory.assault_guarded)
-        self.assertFalse(memory.assault_gathering)
+        self.assertEqual(memory.known_enemy_cores, {enemy_id: ((79, 114), 900)})
+        self.assertEqual(memory.assault_target_id, enemy_id)
+        self.assertTrue(memory.assault_guarded)
+        self.assertTrue(memory.assault_gathering)
         self.assertEqual(memory.known_resources, {(3, 4)})
         self.assertEqual(memory.known_obstacles, {(5, 6)})
         self.assertEqual(memory.squad_assignments, {UUID(int=201): 1})
@@ -1285,7 +1291,7 @@ class SquadStrategyTests(AgentTestCase):
         self.assertEqual(squads[0].unit_ids, {UUID(int=201), UUID(int=202), UUID(int=301)})
 
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 8)
+        self.assertEqual(restored.persistent_state()["version"], 9)
         self.assertEqual(restored.squad_assignments, memory.squad_assignments)
         self.assertEqual(restored.squad_regroup_goal, memory.squad_regroup_goal)
         self.assertEqual(
@@ -1451,7 +1457,7 @@ class SquadStrategyTests(AgentTestCase):
         self.plan(
             make_turn(
                 combat_units,
-                enemies=[enemy_unit(401, UnitType.WORKER, (20, 2))],
+                enemies=[enemy_unit(401, UnitType.VANGUARD, (20, 2))],
                 tick=100,
             ),
             memory,
@@ -1776,6 +1782,279 @@ class SquadStrategyTests(AgentTestCase):
         self.assertEqual(memory.spawn_clear_until, 103)
         self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
         self.assertTrue(any("spawn-clear" in action for action in actions))
+
+
+class V2SearchTests(AgentTestCase):
+    @staticmethod
+    def roster():
+        return SquadStrategyTests.roster()
+
+    @staticmethod
+    def squad_memory():
+        return SquadStrategyTests.squad_memory()
+
+    def test_squad_patrol_moves_from_radius_twelve_to_nineteen(self):
+        memory = agent.AgentMemory()
+        first = memory.squad_patrol_goal_for(1, 0, 1, (0, 0), set())
+        self.assertEqual(agent.chebyshev((0, 0), first), 12)
+
+        route = agent.square_ring_waypoints(
+            (0, 0),
+            12,
+            agent.SQUAD_PATROL_WAYPOINT_STEP,
+        )
+        for _ in route:
+            memory.advance_squad_patrol(1, (0, 0))
+        second = memory.squad_patrol_goal_for(1, 0, 1, (0, 0), set())
+
+        self.assertEqual(memory.squad_patrol_ring_index[1], 1)
+        self.assertEqual(agent.chebyshev((0, 0), second), 19)
+
+    def test_squad_patrol_sectors_start_at_distinct_goals(self):
+        memory = agent.AgentMemory()
+        first = memory.squad_patrol_goal_for(1, 0, 2, (0, 0), set())
+        second = memory.squad_patrol_goal_for(2, 1, 2, (0, 0), set())
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(agent.chebyshev((0, 0), first), 12)
+        self.assertEqual(agent.chebyshev((0, 0), second), 12)
+
+    def test_worker_resource_track_infers_core_on_opposite_side(self):
+        moving_away = agent.EnemyWorkerTrack(
+            position=(10, 0),
+            previous_position=(9, 0),
+            first_seen_position=(9, 0),
+            first_seen_tick=99,
+            last_seen_tick=100,
+            previous_seen_tick=99,
+        )
+        moving_toward = agent.EnemyWorkerTrack(
+            position=(10, 0),
+            previous_position=(9, 0),
+            first_seen_position=(9, 0),
+            first_seen_tick=99,
+            last_seen_tick=100,
+            previous_seen_tick=99,
+        )
+
+        away_guess = agent.infer_enemy_core_guess(
+            moving_away,
+            ((0, 0),),
+            set(),
+            {(0, 0)},
+        )
+        toward_guess = agent.infer_enemy_core_guess(
+            moving_toward,
+            ((0, 0),),
+            set(),
+            {(20, 0)},
+        )
+
+        self.assertEqual(away_guess, (24, 0))
+        self.assertEqual(toward_guess, (-6, 0))
+        self.assertLessEqual(agent.chebyshev((0, 0), away_guess), 24)
+
+    def test_single_worker_sighting_starts_search_without_chase(self):
+        memory = self.squad_memory()
+        _, actions, memory = self.plan(
+            make_turn(
+                self.roster(),
+                enemies=[enemy_unit(401, UnitType.WORKER, (12, 0))],
+            ),
+            memory,
+        )
+
+        self.assertTrue(memory.squad_search_missions)
+        self.assertTrue(any("squad-search-start" in item for item in actions))
+        self.assertFalse(any("squad-hunt" in item or "roam-chase" in item for item in actions))
+
+    def test_worker_guess_cooldown_blocks_repeated_assignment(self):
+        worker_id = UUID(int=401)
+        memory = self.squad_memory()
+        memory.worker_guess_cooldown_until[worker_id] = 164
+
+        self.plan(
+            make_turn(
+                self.roster(),
+                enemies=[enemy_unit(401, UnitType.WORKER, (12, 0))],
+                tick=100,
+            ),
+            memory,
+        )
+
+        self.assertFalse(memory.squad_search_missions)
+
+    def test_search_uses_independent_member_goals_without_regrouping(self):
+        memory = self.squad_memory()
+        memory.squad_regroup_goal[1] = (0, 0)
+        memory.squad_search_missions[1] = agent.SquadSearchMission(
+            kind="guess",
+            center=(20, 0),
+            started_tick=100,
+            source_worker_id=UUID(int=401),
+        )
+
+        _, actions, memory = self.plan(make_turn(self.roster(), tick=101), memory)
+
+        mission = memory.squad_search_missions[1]
+        self.assertEqual(len(set(mission.unit_goals.values())), 3)
+        self.assertNotIn(1, memory.squad_regroup_goal)
+        self.assertTrue(any("squad-search team=1" in item for item in actions))
+        self.assertFalse(any("squad-regroup" in item and "team=1" in item for item in actions))
+
+    def test_one_time_coverage_completes_core_verification(self):
+        core_id = UUID(int=400)
+        center = (25, 0)
+        memory = self.squad_memory()
+        memory.known_enemy_cores[core_id] = (center, 99)
+        memory.enemy_core_missing.add(core_id)
+        memory.squad_search_missions[1] = agent.SquadSearchMission(
+            kind="verify",
+            center=center,
+            started_tick=100,
+            core_id=core_id,
+            covered_cells=agent.core_search_cells(center) - {(10, 0)},
+        )
+
+        self.plan(make_turn(self.roster(), tick=101), memory)
+
+        self.assertNotIn(1, memory.squad_search_missions)
+        self.assertNotIn(core_id, memory.known_enemy_cores)
+        self.assertEqual(memory.squad_search_cooldown_until[1], 165)
+
+    def test_unguarded_missing_core_is_verified_before_guarded_core(self):
+        guarded_id = UUID(int=400)
+        unguarded_id = UUID(int=401)
+        units = [
+            unit
+            for unit in self.roster()
+            if unit.id not in {UUID(int=205), UUID(int=206), UUID(int=303)}
+        ]
+        memory = self.squad_memory()
+        for unit_id in {UUID(int=205), UUID(int=206), UUID(int=303)}:
+            memory.squad_assignments.pop(unit_id, None)
+        memory.known_enemy_cores = {
+            guarded_id: ((40, 0), 99),
+            unguarded_id: ((50, 0), 99),
+        }
+        memory.enemy_core_guarded = {guarded_id: True, unguarded_id: False}
+        memory.enemy_core_missing = {guarded_id, unguarded_id}
+
+        self.plan(make_turn(units, tick=100), memory)
+
+        self.assertEqual(memory.squad_search_missions[1].core_id, unguarded_id)
+
+    def test_search_timeout_exits_but_keeps_unconfirmed_core(self):
+        core_id = UUID(int=400)
+        center = (100, 100)
+        memory = self.squad_memory()
+        memory.known_enemy_cores[core_id] = (center, 99)
+        memory.enemy_core_missing.add(core_id)
+        memory.squad_search_missions[1] = agent.SquadSearchMission(
+            kind="verify",
+            center=center,
+            started_tick=100,
+            core_id=core_id,
+        )
+
+        _, actions, memory = self.plan(
+            make_turn(self.roster(), tick=100 + agent.CORE_SEARCH_MAX_TICKS),
+            memory,
+        )
+
+        self.assertNotIn(1, memory.squad_search_missions)
+        self.assertIn(core_id, memory.known_enemy_cores)
+        self.assertIn(core_id, memory.enemy_core_missing)
+        self.assertTrue(any("search-inconclusive" in item for item in actions))
+
+    def test_search_with_no_remaining_goal_exits_without_sticking(self):
+        core_id = UUID(int=400)
+        center = (100, 100)
+        memory = self.squad_memory()
+        memory.known_enemy_cores[core_id] = (center, 99)
+        memory.enemy_core_missing.add(core_id)
+        memory.squad_search_missions[1] = agent.SquadSearchMission(
+            kind="verify",
+            center=center,
+            started_tick=100,
+            core_id=core_id,
+            failed_goals=agent.core_search_cells(center),
+        )
+
+        _, actions, memory = self.plan(make_turn(self.roster(), tick=101), memory)
+
+        self.assertNotIn(1, memory.squad_search_missions)
+        self.assertIn(core_id, memory.known_enemy_cores)
+        self.assertTrue(any("search-inconclusive" in item for item in actions))
+
+    def test_own_core_destruction_event_removes_record_immediately(self):
+        core_id = UUID(int=400)
+        memory = self.squad_memory()
+        memory.known_enemy_cores[core_id] = ((20, 0), 99)
+        event = ResolutionEvent(
+            event_id=UUID(int=900),
+            tick=100,
+            event_type="DESTRUCTION_PARTICIPATION",
+            reason_code="CORE",
+            target_id=core_id,
+            position=(20, 0),
+        )
+
+        self.plan(make_turn(self.roster(), tick=100, events=[event]), memory)
+
+        self.assertNotIn(core_id, memory.known_enemy_cores)
+
+    def test_visible_core_cancels_guess_and_restarts_assault(self):
+        memory = self.squad_memory()
+        memory.squad_search_missions[1] = agent.SquadSearchMission(
+            kind="guess",
+            center=(20, 0),
+            started_tick=99,
+            source_worker_id=UUID(int=401),
+        )
+
+        _, actions, memory = self.plan(
+            make_turn(self.roster(), enemies=[enemy_core(400, (20, 0))]),
+            memory,
+        )
+
+        self.assertFalse(memory.squad_search_missions)
+        self.assertEqual(memory.assault_target_id, UUID(int=400))
+        self.assertTrue(any("squad-assault" in item for item in actions))
+
+    def test_v8_state_migrates_enemy_core_into_v9(self):
+        core_id = UUID(int=400)
+        restored = agent.AgentMemory.restore(
+            {
+                "version": 8,
+                "core_position": [0, 0],
+                "known_enemy_cores": {
+                    str(core_id): {"position": [25, 0], "tick": 100},
+                },
+            }
+        )
+
+        self.assertEqual(restored.known_enemy_cores[core_id], ((25, 0), 100))
+        self.assertEqual(restored.persistent_state()["version"], 9)
+
+    def test_v9_search_mission_round_trips(self):
+        worker_id = UUID(int=401)
+        memory = self.squad_memory()
+        memory.squad_search_missions[1] = agent.SquadSearchMission(
+            kind="guess",
+            center=(20, 0),
+            started_tick=100,
+            source_worker_id=worker_id,
+            covered_cells={(4, 0), (5, 0)},
+            unit_goals={UUID(int=203): (12, 0)},
+        )
+
+        restored = agent.AgentMemory.restore(memory.persistent_state())
+
+        mission = restored.squad_search_missions[1]
+        self.assertEqual(mission.source_worker_id, worker_id)
+        self.assertEqual(mission.covered_cells, {(4, 0), (5, 0)})
+        self.assertEqual(mission.unit_goals[UUID(int=203)], (12, 0))
 
 
 class ResourceMemoryTests(AgentTestCase):
