@@ -927,6 +927,95 @@ class ResourceScoutTests(AgentTestCase):
 class OuterScoutTests(AgentTestCase):
     """高库存时四名 Worker 的 32-64 格方环扫描。"""
 
+    def test_incremental_worker_spawns_are_rebalanced_into_quarter_sectors(self):
+        memory = agent.AgentMemory()
+
+        for count in range(1, 5):
+            memory.sync_worker_sectors(workers(count))
+
+        worker_ids = [UUID(int=value) for value in range(100, 104)]
+        self.assertEqual(
+            memory.worker_sector,
+            dict(zip(worker_ids, (0, 2, 4, 6))),
+        )
+
+    def test_adjacent_persisted_sectors_are_migrated_and_reset(self):
+        worker_ids = [UUID(int=value) for value in range(100, 104)]
+        memory = agent.AgentMemory(
+            worker_sector=dict(zip(worker_ids, (0, 1, 2, 3))),
+            outer_scout_ring_index={worker_id: 2 for worker_id in worker_ids},
+            outer_scout_step={worker_id: 8 for worker_id in worker_ids},
+            outer_scout_goal={worker_id: (32, 32) for worker_id in worker_ids},
+            outer_scout_path_failures={worker_id: 1 for worker_id in worker_ids},
+        )
+
+        memory.sync_worker_sectors(workers(4))
+
+        self.assertEqual(
+            memory.worker_sector,
+            dict(zip(worker_ids, (0, 2, 4, 6))),
+        )
+        self.assertFalse(memory.outer_scout_ring_index)
+        self.assertFalse(memory.outer_scout_step)
+        self.assertFalse(memory.outer_scout_goal)
+        self.assertFalse(memory.outer_scout_path_failures)
+
+    def test_outer_mode_repairs_persisted_layout_before_assigning_goals(self):
+        worker_ids = [UUID(int=value) for value in range(100, 104)]
+        memory = agent.AgentMemory(
+            worker_sector=dict(zip(worker_ids, (0, 1, 2, 3))),
+        )
+
+        _, _, memory = self.plan(
+            make_turn(outer_scout_roster(), resources=80),
+            memory,
+        )
+
+        self.assertEqual(
+            memory.worker_sector,
+            dict(zip(worker_ids, (0, 2, 4, 6))),
+        )
+        goals = [memory.outer_scout_goal[worker_id] for worker_id in worker_ids]
+        self.assertEqual(len(set(goals)), len(goals))
+        self.assertTrue(
+            all(
+                agent.manhattan(first, second)
+                >= agent.OUTER_SCOUT_MIN_GOAL_DISTANCE
+                for index, first in enumerate(goals)
+                for second in goals[index + 1 :]
+            )
+        )
+
+    def test_outer_scout_skips_goal_inside_another_worker_vision(self):
+        first_id = UUID(int=100)
+        second_id = UUID(int=101)
+        route = agent.square_ring_waypoints((0, 0), 32)
+        memory = agent.AgentMemory(
+            worker_sector={first_id: 1, second_id: 2},
+            outer_scout_step={second_id: 35},
+        )
+
+        first_goal = memory.outer_scout_goal_for(
+            first_id,
+            (0, 0),
+            (0, 0),
+            set(),
+        )
+        second_goal = memory.outer_scout_goal_for(
+            second_id,
+            (0, 0),
+            (0, 0),
+            set(),
+            {first_goal},
+        )
+
+        self.assertEqual(first_goal, route[5])
+        self.assertNotEqual(second_goal, first_goal)
+        self.assertGreaterEqual(
+            agent.manhattan(second_goal, first_goal),
+            agent.OUTER_SCOUT_MIN_GOAL_DISTANCE,
+        )
+
     def test_outer_scout_requires_population_nineteen_and_eighty_resources(self):
         cases = (
             (outer_scout_roster(), 79, False),

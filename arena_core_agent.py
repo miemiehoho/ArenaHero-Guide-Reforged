@@ -85,6 +85,8 @@ OUTER_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
 )
 OUTER_SCOUT_WAYPOINT_STEP = 7
 OUTER_SCOUT_PATH_FAILURES = 3
+# Worker 视野半径为 3；外圈目标至少相隔 7 格，避免两个视野相交。
+OUTER_SCOUT_MIN_GOAL_DISTANCE = 7
 ROAM_CHASE_STEPS = 8
 ROAM_TARGET_LOST_TICKS = 3
 ROAM_HELPER_RADIUS = 5
@@ -1470,31 +1472,31 @@ class AgentMemory:
         return self.known_resources != before
 
     def sync_worker_sectors(self, workers) -> None:
-        """保持现存 Worker 扇区稳定，并优先填补覆盖最少的方向。"""
-        if not self.worker_sector:
-            worker_count = len(workers)
-            for worker_index, worker in enumerate(workers):
-                self.worker_sector[worker.id] = (
-                    worker_index * len(SCOUT_VECTORS)
-                ) // max(1, worker_count)
+        """按当前 Worker 数量均匀分配扇区，并迁移旧的相邻布局。"""
+        ordered_workers = tuple(sorted(workers, key=lambda worker: str(worker.id)))
+        worker_count = len(ordered_workers)
+        desired_sectors = {
+            worker.id: (worker_index * len(SCOUT_VECTORS))
+            // max(1, worker_count)
+            for worker_index, worker in enumerate(ordered_workers)
+        }
+        if self.worker_sector != desired_sectors:
+            # Worker 逐个生产时，旧的“游标补位”会得到 0、1、2、3，
+            # 而不是四等分的 0、2、4、6。布局改变后清掉所有侦察进度，
+            # 避免旧目标与新的扇区偏移叠加。
+            self.worker_sector = desired_sectors
+            self.scout_ring_index.clear()
+            self.scout_phase.clear()
+            self.scout_goal.clear()
+            self.scout_path_failures.clear()
+            self.outer_scout_ring_index.clear()
+            self.outer_scout_step.clear()
+            self.outer_scout_goal.clear()
+            self.outer_scout_path_failures.clear()
 
-        for worker in workers:
-            if worker.id not in self.worker_sector:
-                sector_counts = Counter(self.worker_sector.values())
-                sector = min(
-                    range(len(SCOUT_VECTORS)),
-                    key=lambda candidate: (
-                        sector_counts.get(candidate, 0),
-                        (candidate - self.productive_sector_cursor)
-                        % len(SCOUT_VECTORS),
-                    ),
-                )
-                self.productive_sector_cursor += 1
-                self.worker_sector[worker.id] = sector
-                self.scout_ring_index[worker.id] = 0
-                self.scout_phase[worker.id] = 0
-                self.scout_goal.pop(worker.id, None)
-
+        for worker in ordered_workers:
+            self.scout_ring_index.setdefault(worker.id, 0)
+            self.scout_phase.setdefault(worker.id, 0)
             self.worker_harvests.setdefault(worker.id, 0)
             if worker.cargo > 0:
                 self.worker_harvests[worker.id] = max(
@@ -1570,10 +1572,19 @@ class AgentMemory:
         core: Pos,
         position: Pos,
         obstacles: set[Pos],
+        separation_points: Iterable[Pos] = (),
     ) -> Pos:
         """选择外圈方环上的下一个顺时针目标，并按稳定扇区错开起点。"""
+        separation_points = tuple(separation_points)
+
+        def is_safe(candidate: Pos) -> bool:
+            return candidate not in obstacles and all(
+                manhattan(candidate, other) >= OUTER_SCOUT_MIN_GOAL_DISTANCE
+                for other in separation_points
+            )
+
         goal = self.outer_scout_goal.get(worker_id)
-        if goal is not None and goal not in obstacles and manhattan(position, goal) > 1:
+        if goal is not None and is_safe(goal) and manhattan(position, goal) > 1:
             return goal
         if goal is not None:
             self.advance_outer_scout(worker_id)
@@ -1592,7 +1603,7 @@ class AgentMemory:
             sector = self.worker_sector.get(worker_id, 0) % len(SCOUT_VECTORS)
             offset = (sector * len(route)) // len(SCOUT_VECTORS)
             candidate = route[(step + offset) % len(route)]
-            if candidate not in obstacles:
+            if is_safe(candidate):
                 self.outer_scout_goal[worker_id] = candidate
                 return candidate
             self.advance_outer_scout(worker_id)
@@ -2419,11 +2430,22 @@ def plan_workers(context: PlanningContext) -> None:
         # 状态 4：19 人口且 Core 资源达到 80 后，四名 Worker 在 32-64 格
         # 方环上错位顺时针扫描；资源下降后由模式切换恢复正常任务。
         if context.outer_scout_active:
+            separation_points = {
+                tuple(other.position)
+                for other in context.workers
+                if other.id != worker.id
+            }
+            separation_points.update(
+                goal
+                for other_id, goal in memory.outer_scout_goal.items()
+                if other_id != worker.id
+            )
             goal = memory.outer_scout_goal_for(
                 worker.id,
                 context.core_pos,
                 position,
                 context.navigation_obstacles,
+                separation_points,
             )
             destination = first_step_astar(
                 position,
