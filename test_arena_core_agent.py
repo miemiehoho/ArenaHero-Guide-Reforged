@@ -399,6 +399,67 @@ class ResourceTests(AgentTestCase):
 class ProductionTests(AgentTestCase):
     """基础生产顺序、满仓扩编和动态价格。"""
 
+    @staticmethod
+    def saturation_roster():
+        """87 人口、下一单位为 Ranger 的高人口控制阵容。"""
+        return [
+            *workers(4),
+            *(
+                controlled_unit(
+                    2000 + index,
+                    UnitType.VANGUARD,
+                    (10 + index % 20, 10 + index // 20),
+                )
+                for index in range(56)
+            ),
+            *(
+                controlled_unit(
+                    3000 + index,
+                    UnitType.RANGER,
+                    (30 + index % 20, 20 + index // 20),
+                )
+                for index in range(27)
+            ),
+        ]
+
+    def test_plan_records_tick_and_astar_metrics(self):
+        memory = agent.AgentMemory()
+
+        self.plan(make_turn(workers(4), resources=10), memory)
+
+        metrics = memory.last_plan_metrics
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.tick, 100)
+        self.assertGreater(metrics.astar_calls, 0)
+        self.assertGreater(metrics.astar_expansions, 0)
+        self.assertGreaterEqual(metrics.decision_ms, 0)
+
+    def test_population_87_marks_ranger_production_saturated_once(self):
+        memory = agent.AgentMemory()
+        roster = self.saturation_roster()
+
+        first_actions = self.plan(
+            make_turn(roster, resources=435, tick=100),
+            memory,
+        )[1]
+        second_actions = self.plan(
+            make_turn(roster, resources=435, tick=101),
+            memory,
+        )[1]
+
+        self.assertEqual(agent.unit_cost(UnitType.RANGER, 87), 472)
+        self.assertEqual(memory.production_status, "SATURATED")
+        self.assertEqual(
+            [action for action in first_actions if "production-status=SATURATED" in action],
+            [
+                "core production-status=SATURATED type=RANGER cost=472 "
+                "capacity=435 reason=price-exceeds-capacity"
+            ],
+        )
+        self.assertFalse(
+            any("production-status=SATURATED" in action for action in second_actions)
+        )
+
     def test_harvest_mode_still_stops_at_target(self):
         turn = make_turn([], resources=30)
         actions, reached = agent.plan_turn(

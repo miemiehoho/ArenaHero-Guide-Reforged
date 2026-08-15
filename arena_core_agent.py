@@ -36,6 +36,26 @@ from arena_hero.turn import Core, Ranger, Turn, Vanguard, Worker
 
 Pos = tuple[int, int]
 
+
+@dataclass
+class PlanningMetrics:
+    """当前 Tick 的轻量诊断；不写入持久化策略状态。"""
+
+    tick: int
+    started_at: float = field(default_factory=time.perf_counter, repr=False)
+    decision_ms: float = 0.0
+    astar_calls: int = 0
+    astar_expansions: int = 0
+    astar_budget_exhausted: int = 0
+    field_squad_count: int = 0
+    protected_squad_count: int = 0
+    active_wave_id: int | None = None
+    production_status: str = "IDLE"
+    production_wait_reason: str | None = None
+
+
+_ACTIVE_PLANNING_METRICS: PlanningMetrics | None = None
+
 DIRECTION_STEPS: tuple[tuple[Direction, Pos], ...] = (
     (Direction.UP, (0, -1)),
     (Direction.RIGHT, (1, 0)),
@@ -489,6 +509,8 @@ def first_step_astar(
     *,
     max_expansions: int = 5000,
 ) -> Pos | None:
+    if _ACTIVE_PLANNING_METRICS is not None:
+        _ACTIVE_PLANNING_METRICS.astar_calls += 1
     if start == goal:
         return start
 
@@ -502,6 +524,8 @@ def first_step_astar(
         if cost != best_cost.get(current):
             continue
         expansions += 1
+        if _ACTIVE_PLANNING_METRICS is not None:
+            _ACTIVE_PLANNING_METRICS.astar_expansions += 1
         if current == goal:
             break
 
@@ -520,6 +544,11 @@ def first_step_astar(
             )
 
     if goal not in came_from:
+        if (
+            _ACTIVE_PLANNING_METRICS is not None
+            and expansions >= max_expansions
+        ):
+            _ACTIVE_PLANNING_METRICS.astar_budget_exhausted += 1
         return None
 
     cursor = goal
@@ -742,6 +771,17 @@ class AgentMemory:
     roam_chase_cooldown_until: dict[UUID, int] = field(default_factory=dict)
 
     spawn_clear_until: int = 0
+
+    # 当前进程内的诊断和生产状态；不写入持久化策略状态。
+    last_plan_metrics: PlanningMetrics | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    production_status: str = "IDLE"
+    production_wait_reason: str | None = None
+    production_status_key: tuple[str, str | None, int, int, int] | None = None
+    last_announced_production_status: tuple[str, str | None, int, int, int] | None = None
 
     # 生命周期与持久化节流。
     last_core_position: Pos | None = None
@@ -5318,6 +5358,47 @@ def plan_rangers(context: PlanningContext) -> None:
         actions.append(f"{str(ranger.id)[:8]} ranger-guard-wait")
 
 
+def set_production_status(
+    context: PlanningContext,
+    status: str,
+    reason: str | None = None,
+    *,
+    unit_type: UnitType | None = None,
+    cost: int | None = None,
+) -> None:
+    """记录生产等待原因，并只对状态键首次出现时写一条日志。"""
+    memory = context.memory
+    metrics = memory.last_plan_metrics
+    turn = context.turn
+    type_name = unit_type.value if unit_type is not None else None
+    status_key = (
+        status,
+        type_name,
+        cost if cost is not None else -1,
+        turn.state.population,
+        turn.resource_capacity,
+    )
+    memory.production_status = status
+    memory.production_wait_reason = reason
+    memory.production_status_key = status_key
+    if metrics is not None:
+        metrics.production_status = status
+        metrics.production_wait_reason = reason
+    if status in {"SATURATED", "BLOCKED"}:
+        previous_key = memory.last_announced_production_status
+        if previous_key != status_key:
+            detail = f" reason={reason}" if reason else ""
+            unit_detail = f" type={type_name}" if type_name else ""
+            cost_detail = f" cost={cost}" if cost is not None else ""
+            context.actions.append(
+                f"core production-status={status}{unit_detail}"
+                f"{cost_detail} capacity={turn.resource_capacity}{detail}"
+            )
+            memory.last_announced_production_status = status_key
+    elif status == "READY":
+        memory.last_announced_production_status = None
+
+
 def plan_core_production(
     context: PlanningContext,
     mode: str,
@@ -5328,6 +5409,7 @@ def plan_core_production(
     memory = context.memory
     actions = context.actions
     if context.spawn_clearing:
+        set_production_status(context, "BLOCKED", "spawn-clearing")
         actions.append(f"core hold spawn-clear until={memory.spawn_clear_until}")
         return
     core_available = (
@@ -5335,11 +5417,13 @@ def plan_core_production(
         and context.core_pos not in context.occupied
     )
     if not core_available:
+        set_production_status(context, "BLOCKED", "core-unavailable")
         return
     if (
         turn.state.population >= BASE_AUTO_POPULATION
         and turn.resources < turn.resource_capacity
     ):
+        set_production_status(context, "RESOURCE_WAIT", "core-not-full")
         return
     available_resources = context.healing_resources
 
@@ -5348,6 +5432,8 @@ def plan_core_production(
         spawn_type: UnitType | None = None
         spawn_reason = ""
         worker_cost = unit_cost(UnitType.WORKER, turn.state.population)
+        next_type: UnitType | None = None
+        next_cost: int | None = None
         if (
             len(context.workers) < TARGET_WORKERS_CONTROL
             and available_resources >= worker_cost
@@ -5357,6 +5443,8 @@ def plan_core_production(
                 f"expand Workers {len(context.workers) + 1}/"
                 f"{TARGET_WORKERS_CONTROL}"
             )
+            next_type = UnitType.WORKER
+            next_cost = worker_cost
         else:
             home_squad = next(
                 (squad for squad in context.combat_squads if squad.squad_id == 0),
@@ -5384,6 +5472,8 @@ def plan_core_production(
                 missing_type = UnitType.RANGER
                 squad_id = incomplete.squad_id
             cost = unit_cost(missing_type, turn.state.population)
+            next_type = missing_type
+            next_cost = cost
             if available_resources >= cost:
                 spawn_type = missing_type
                 spawn_reason = (
@@ -5391,8 +5481,32 @@ def plan_core_production(
                     f"{len(incomplete.vanguard_ids) if incomplete else 0}V:"
                     f"{len(incomplete.ranger_ids) if incomplete else 0}R"
                 )
+        if next_type is not None and next_cost is not None:
+            if next_cost > turn.resource_capacity:
+                set_production_status(
+                    context,
+                    "SATURATED",
+                    "price-exceeds-capacity",
+                    unit_type=next_type,
+                    cost=next_cost,
+                )
+                return
+            if spawn_type is None:
+                set_production_status(
+                    context,
+                    "RESOURCE_WAIT",
+                    "insufficient-resources",
+                    unit_type=next_type,
+                    cost=next_cost,
+                )
         if spawn_type is not None:
             turn.core.spawn(spawn_type)
+            set_production_status(
+                context,
+                "READY",
+                unit_type=spawn_type,
+                cost=next_cost,
+            )
             actions.append(f"core spawn {spawn_type.value} ({spawn_reason})")
         return
 
@@ -5408,6 +5522,12 @@ def plan_core_production(
                     f"core spawn WORKER "
                     f"(reserve={available_resources - worker_threshold})"
                 )
+                set_production_status(
+                    context,
+                    "READY",
+                    unit_type=UnitType.WORKER,
+                    cost=worker_threshold,
+                )
         if not spawned_worker:
             needs_capacity = turn.resource_capacity < target
             defense_is_thin = bool(context.home_combat_targets) and (
@@ -5416,6 +5536,15 @@ def plan_core_production(
                 > len(context.rangers) + len(context.vanguards)
             )
             vanguard_cost = unit_cost(UnitType.VANGUARD, turn.state.population)
+            if vanguard_cost > turn.resource_capacity:
+                set_production_status(
+                    context,
+                    "SATURATED",
+                    "price-exceeds-capacity",
+                    unit_type=UnitType.VANGUARD,
+                    cost=vanguard_cost,
+                )
+                return
             if (
                 available_resources >= vanguard_cost
                 and (needs_capacity or defense_is_thin)
@@ -5427,6 +5556,27 @@ def plan_core_production(
                     else "defense reinforcement"
                 )
                 actions.append(f"core spawn VANGUARD ({reason})")
+                set_production_status(
+                    context,
+                    "READY",
+                    unit_type=UnitType.VANGUARD,
+                    cost=vanguard_cost,
+                )
+            elif available_resources < vanguard_cost:
+                set_production_status(
+                    context,
+                    "RESOURCE_WAIT",
+                    "insufficient-resources",
+                    unit_type=UnitType.VANGUARD,
+                    cost=vanguard_cost,
+                )
+
+
+def finish_planning_metrics(metrics: PlanningMetrics) -> None:
+    """结束当前 Tick 计时，并清理 A* 诊断上下文。"""
+    global _ACTIVE_PLANNING_METRICS
+    metrics.decision_ms = (time.perf_counter() - metrics.started_at) * 1000
+    _ACTIVE_PLANNING_METRICS = None
 
 
 def plan_turn(
@@ -5435,14 +5585,20 @@ def plan_turn(
     target: int = 30,
     mode: str = "harvest",
 ) -> tuple[list[str], bool]:
+    global _ACTIVE_PLANNING_METRICS
     actions: list[str] = []
+    metrics = PlanningMetrics(turn.tick)
+    memory.last_plan_metrics = metrics
+    _ACTIVE_PLANNING_METRICS = metrics
     memory.known_obstacles.update(tuple(p) for p in turn.obstacle_cells)
     memory.observe_dynamic_blocks(turn.events, turn.tick)
     memory.observe_spawn_blocks(turn.events, turn.tick)
 
     if mode == "harvest" and turn.resources >= target:
+        finish_planning_metrics(metrics)
         return actions, True
     if turn.state.status is not PlayerStatus.ACTIVE or turn.core is None:
+        finish_planning_metrics(metrics)
         return actions, False
 
     core_pos: Pos = tuple(turn.core.position)
@@ -5462,6 +5618,9 @@ def plan_turn(
         core_pos,
     )
     combat_squads = memory.combat_squads(vanguards, rangers)
+    metrics.field_squad_count = sum(
+        squad.squad_id != 0 for squad in combat_squads
+    )
     home_squad = next(
         (squad for squad in combat_squads if squad.squad_id == 0),
         None,
@@ -5720,6 +5879,7 @@ def plan_turn(
         save_state(memory.persistent_state())
         memory.last_state_save_tick = turn.tick
 
+    finish_planning_metrics(metrics)
     return actions, False
 
 
@@ -5818,6 +5978,18 @@ def main() -> int:
                         )
                         or "none"
                     )
+                    metrics = memory.last_plan_metrics
+                    metrics_summary = (
+                        "none"
+                        if metrics is None
+                        else (
+                            f"decision_ms={metrics.decision_ms:.2f} "
+                            f"astar_calls={metrics.astar_calls} "
+                            f"astar_expansions={metrics.astar_expansions} "
+                            f"astar_budget_exhausted={metrics.astar_budget_exhausted} "
+                            f"production={metrics.production_status}"
+                        )
+                    )
                     emit(
                         logger,
                         f"tick={turn.tick} status={turn.state.status.value} "
@@ -5840,6 +6012,7 @@ def main() -> int:
                         f"enemy_cores_missing={len(memory.enemy_core_missing)} "
                         f"squad_searches={len(memory.squad_search_missions)} "
                         f"enemy_worker_tracks={len(memory.enemy_worker_tracks)} "
+                        f"metrics=[{metrics_summary}] "
                         f"events=[{events}]",
                     )
 
