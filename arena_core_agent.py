@@ -183,6 +183,7 @@ SQUAD_PATROL_PATH_FAILURES = 3
 HIGH_POPULATION_PATROL_THRESHOLD = 40
 ASSAULT_WAVE_SIZE = 3
 TARGET_WORKERS_CONTROL = 4
+WORKER_REPLENISH_TARGET = 12
 SQUAD_VANGUARDS = 2
 SQUAD_RANGERS = 1
 SQUAD_FORMATION_RADIUS = 4
@@ -230,7 +231,7 @@ RESOURCE_DISTANCE_COST = 10
 RESOURCE_LOAD_COST = 3
 COMBAT_THREAT_MEMORY_TICKS = 6
 STATE_SAVE_INTERVAL_TICKS = 10
-STATE_VERSION = 9
+STATE_VERSION = 10
 
 
 def resource_scout_radii_for(worker_count: int) -> tuple[int, ...]:
@@ -981,6 +982,11 @@ class AgentMemory:
     resource_deferred_until: dict[Pos, int] = field(default_factory=dict)
     worker_intercept_goal: dict[UUID, tuple[Pos, int]] = field(default_factory=dict)
 
+    # 达到成熟人口后发生战损时，冻结恢复目标并优先补回经济单位。
+    population_peak: int = 0
+    replenishment_target_population: int = 0
+    replenishment_active: bool = False
+
     # Vanguard/Ranger：持久化 2V1R 小队、巡逻目标和统一集结状态。
     ranger_patrol_phase: dict[UUID, int] = field(default_factory=dict)
     vanguard_patrol_phase: dict[UUID, int] = field(default_factory=dict)
@@ -1041,6 +1047,14 @@ class AgentMemory:
         state_version = state.get("version")
         restore_enemy_state = isinstance(state_version, int) and state_version >= 8
         restore_search_state = isinstance(state_version, int) and state_version >= 9
+        if isinstance(state_version, int) and state_version >= 10:
+            raw_population_peak = state.get("population_peak")
+            if isinstance(raw_population_peak, int) and raw_population_peak >= 0:
+                memory.population_peak = raw_population_peak
+            raw_replenishment_target = state.get("replenishment_target_population")
+            if isinstance(raw_replenishment_target, int) and raw_replenishment_target >= 0:
+                memory.replenishment_target_population = raw_replenishment_target
+            memory.replenishment_active = state.get("replenishment_active") is True
         raw_core_position = state.get("core_position")
         if (
             restore_enemy_state
@@ -1153,8 +1167,8 @@ class AgentMemory:
                     worker_id = UUID(raw_id)
                 except (TypeError, ValueError):
                     continue
-                if isinstance(sector, int):
-                    memory.worker_sector[worker_id] = sector % len(SCOUT_VECTORS)
+                if isinstance(sector, int) and sector >= 0:
+                    memory.worker_sector[worker_id] = sector
         if restore_enemy_state:
             raw_enemy_cores = state.get("known_enemy_cores", {})
             if isinstance(raw_enemy_cores, dict):
@@ -1286,6 +1300,9 @@ class AgentMemory:
                     key=lambda item: str(item[0]),
                 )
             },
+            "population_peak": self.population_peak,
+            "replenishment_target_population": self.replenishment_target_population,
+            "replenishment_active": self.replenishment_active,
             "home_vanguard_id": (
                 str(self.home_vanguard_id) if self.home_vanguard_id else None
             ),
@@ -2141,6 +2158,50 @@ class AgentMemory:
                     1,
                     self.worker_harvests[worker.id],
                 )
+
+    def observe_population_for_replenishment(
+        self,
+        population: int,
+        worker_count: int,
+    ) -> bool:
+        """检测成熟人口下降，并冻结至少能恢复 12 Worker 的目标。"""
+        before = (
+            self.population_peak,
+            self.replenishment_target_population,
+            self.replenishment_active,
+        )
+        if not self.replenishment_active:
+            if population > self.population_peak:
+                self.population_peak = population
+            if (
+                self.population_peak >= BASE_AUTO_POPULATION
+                and population < self.population_peak
+            ):
+                self.replenishment_active = True
+                self.replenishment_target_population = self.population_peak
+
+        if self.replenishment_active:
+            required_for_workers = self.population_peak + max(
+                0,
+                WORKER_REPLENISH_TARGET - worker_count,
+            )
+            self.replenishment_target_population = max(
+                self.replenishment_target_population,
+                required_for_workers,
+            )
+            if (
+                worker_count >= WORKER_REPLENISH_TARGET
+                and population >= self.replenishment_target_population
+            ):
+                self.replenishment_active = False
+                self.population_peak = population
+                self.replenishment_target_population = 0
+
+        return before != (
+            self.population_peak,
+            self.replenishment_target_population,
+            self.replenishment_active,
+        )
 
     def observe_worker_harvests(self, events, workers) -> None:
         """只扩大长期零产出、而同伴已经成功采集的侦察方向。"""
@@ -5961,10 +6022,46 @@ def plan_core_production(
     if (
         turn.state.population >= BASE_AUTO_POPULATION
         and turn.resources < turn.resource_capacity
+        and not memory.replenishment_active
     ):
         set_production_status(context, "RESOURCE_WAIT", "core-not-full")
         return
     available_resources = context.healing_resources
+
+    if memory.replenishment_active and len(context.workers) < WORKER_REPLENISH_TARGET:
+        worker_cost = unit_cost(UnitType.WORKER, turn.state.population)
+        if worker_cost > turn.resource_capacity:
+            set_production_status(
+                context,
+                "SATURATED",
+                "price-exceeds-capacity",
+                unit_type=UnitType.WORKER,
+                cost=worker_cost,
+            )
+            return
+        if available_resources < worker_cost:
+            set_production_status(
+                context,
+                "RESOURCE_WAIT",
+                "worker-replenishment-insufficient-resources",
+                unit_type=UnitType.WORKER,
+                cost=worker_cost,
+            )
+            return
+        turn.core.spawn(UnitType.WORKER)
+        set_production_status(
+            context,
+            "READY",
+            reason="worker-replenishment",
+            unit_type=UnitType.WORKER,
+            cost=worker_cost,
+        )
+        actions.append(
+            f"core spawn WORKER (replenish Workers "
+            f"{len(context.workers) + 1}/{WORKER_REPLENISH_TARGET} "
+            f"target-population={memory.replenishment_target_population})"
+        )
+        return
 
     # 控制模式：固定四个 Worker，其余人口严格补成 2V1R 小队。
     if mode == "control":
@@ -6144,6 +6241,10 @@ def plan_turn(
     workers = sorted(turn.workers, key=lambda worker: str(worker.id))
     vanguards = sorted(turn.vanguards, key=lambda unit: str(unit.id))
     rangers = sorted(turn.rangers, key=lambda unit: str(unit.id))
+    replenishment_changed = memory.observe_population_for_replenishment(
+        turn.state.population,
+        len(workers),
+    )
     core_changed = memory.sync_core_position(core_pos)
     sectors_changed = memory.prune_unit_state(
         workers,
@@ -6438,6 +6539,7 @@ def plan_turn(
 
     if (
         core_changed
+        or replenishment_changed
         or resources_changed
         or squads_changed
         or sectors_changed
@@ -6525,6 +6627,9 @@ def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, objec
         "Worker数": len(turn.workers),
         "Vanguard数": len(turn.vanguards),
         "Ranger数": len(turn.rangers),
+        "补员激活": memory.replenishment_active,
+        "历史峰值人口": memory.population_peak,
+        "补员目标人口": memory.replenishment_target_population,
         "可见敌人数": len(turn.visible_enemies),
         "已知敌方Core数": len(memory.known_enemy_cores),
         "已知资源数": len(memory.known_resources),

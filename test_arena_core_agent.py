@@ -403,6 +403,29 @@ class ProductionTests(AgentTestCase):
     """基础生产顺序、满仓扩编和动态价格。"""
 
     @staticmethod
+    def mature_roster():
+        """四名 Worker、十一名 Vanguard、五名 Ranger 的 20 人阵容。"""
+        return [
+            *workers(4),
+            *(
+                controlled_unit(
+                    200 + index,
+                    UnitType.VANGUARD,
+                    (10 + index, 10),
+                )
+                for index in range(11)
+            ),
+            *(
+                controlled_unit(
+                    300 + index,
+                    UnitType.RANGER,
+                    (10 + index, 12),
+                )
+                for index in range(5)
+            ),
+        ]
+
+    @staticmethod
     def saturation_roster():
         """87 人口、下一单位为 Ranger 的高人口控制阵容。"""
         return [
@@ -560,6 +583,198 @@ class ProductionTests(AgentTestCase):
         plan, _, _ = self.plan(make_turn(units, resources=100))
         self.assertIsInstance(plan.core_action, SpawnAction)
         self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_mature_combat_loss_starts_worker_replenishment_before_core_is_full(self):
+        memory = agent.AgentMemory()
+        mature = self.mature_roster()
+        self.plan(make_turn(mature, resources=0, tick=100), memory)
+        damaged = [unit for unit in mature if unit.id != UUID(int=210)]
+
+        turn = make_turn(damaged, resources=5, tick=101)
+        plan, actions, memory = self.plan(turn, memory)
+
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.WORKER)
+        self.assertTrue(memory.replenishment_active)
+        self.assertEqual(memory.population_peak, 20)
+        self.assertEqual(memory.replenishment_target_population, 28)
+        self.assertTrue(any("replenish Workers 5/12" in item for item in actions))
+        statistics = agent.turn_statistics(turn, memory, False)
+        self.assertTrue(statistics["补员激活"])
+        self.assertEqual(statistics["历史峰值人口"], 20)
+        self.assertEqual(statistics["补员目标人口"], 28)
+
+    def test_replenishment_prioritizes_worker_until_twelve(self):
+        units = [
+            *population_workers(11),
+            *(
+                controlled_unit(2000 + index, UnitType.VANGUARD, (20 + index, 20))
+                for index in range(10)
+            ),
+            *(
+                controlled_unit(3000 + index, UnitType.RANGER, (20 + index, 22))
+                for index in range(5)
+            ),
+        ]
+        memory = agent.AgentMemory(
+            population_peak=20,
+            replenishment_target_population=28,
+            replenishment_active=True,
+        )
+        worker_cost = agent.unit_cost(UnitType.WORKER, len(units))
+
+        plan, _, _ = self.plan(make_turn(units, resources=worker_cost), memory)
+
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.WORKER)
+
+    def test_replenishment_restores_vanguard_after_workers_reach_twelve(self):
+        units = [
+            *population_workers(12),
+            *(
+                controlled_unit(2000 + index, UnitType.VANGUARD, (20 + index, 20))
+                for index in range(10)
+            ),
+            *(
+                controlled_unit(3000 + index, UnitType.RANGER, (20 + index, 22))
+                for index in range(5)
+            ),
+        ]
+        memory = agent.AgentMemory(
+            population_peak=20,
+            replenishment_target_population=28,
+            replenishment_active=True,
+        )
+        vanguard_cost = agent.unit_cost(UnitType.VANGUARD, len(units))
+
+        plan, _, _ = self.plan(make_turn(units, resources=vanguard_cost), memory)
+
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_replenishment_exits_then_ranger_loss_can_trigger_again(self):
+        units = [
+            *population_workers(12),
+            *(
+                controlled_unit(2000 + index, UnitType.VANGUARD, (20 + index, 20))
+                for index in range(11)
+            ),
+            *(
+                controlled_unit(3000 + index, UnitType.RANGER, (20 + index, 22))
+                for index in range(5)
+            ),
+        ]
+        memory = agent.AgentMemory(
+            population_peak=20,
+            replenishment_target_population=28,
+            replenishment_active=True,
+        )
+
+        plan, _, memory = self.plan(make_turn(units, resources=0, tick=100), memory)
+        self.assertIsNone(plan.core_action)
+        self.assertFalse(memory.replenishment_active)
+        self.assertEqual(memory.population_peak, 28)
+        self.assertEqual(memory.replenishment_target_population, 0)
+
+        damaged = [unit for unit in units if unit.id != UUID(int=3004)]
+        ranger_cost = agent.unit_cost(UnitType.RANGER, len(damaged))
+        plan, _, memory = self.plan(
+            make_turn(damaged, resources=ranger_cost, tick=101),
+            memory,
+        )
+        self.assertTrue(memory.replenishment_active)
+        self.assertEqual(memory.replenishment_target_population, 28)
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_replenishment_waits_for_worker_resources_and_moving_core(self):
+        units = [
+            *population_workers(11),
+            *(
+                controlled_unit(2000 + index, UnitType.VANGUARD, (20 + index, 20))
+                for index in range(15)
+            ),
+        ]
+        worker_cost = agent.unit_cost(UnitType.WORKER, len(units))
+        memory = agent.AgentMemory(
+            population_peak=28,
+            replenishment_target_population=29,
+            replenishment_active=True,
+        )
+
+        plan, _, memory = self.plan(
+            make_turn(units, resources=worker_cost - 1),
+            memory,
+        )
+        self.assertIsNone(plan.core_action)
+        self.assertEqual(memory.production_status, "RESOURCE_WAIT")
+        self.assertEqual(
+            memory.production_wait_reason,
+            "worker-replenishment-insufficient-resources",
+        )
+
+        moving_memory = agent.AgentMemory(
+            population_peak=28,
+            replenishment_target_population=29,
+            replenishment_active=True,
+        )
+        plan, _, moving_memory = self.plan(
+            make_turn(units, resources=worker_cost, core_state=CoreState.MOVING),
+            moving_memory,
+        )
+        self.assertIsNone(plan.core_action)
+        self.assertEqual(moving_memory.production_status, "BLOCKED")
+
+    def test_worker_replenishment_marks_dynamic_price_saturated(self):
+        units = [
+            *population_workers(11),
+            *(
+                controlled_unit(
+                    5000 + index,
+                    UnitType.VANGUARD,
+                    (20 + index % 20, 20 + index // 20),
+                )
+                for index in range(94)
+            ),
+        ]
+        memory = agent.AgentMemory(
+            population_peak=106,
+            replenishment_target_population=107,
+            replenishment_active=True,
+        )
+
+        plan, _, memory = self.plan(make_turn(units, resources=525), memory)
+
+        self.assertGreater(agent.unit_cost(UnitType.WORKER, 105), 525)
+        self.assertIsNone(plan.core_action)
+        self.assertEqual(memory.production_status, "SATURATED")
+        self.assertEqual(memory.production_wait_reason, "price-exceeds-capacity")
+
+    def test_replenishment_state_migrates_v9_and_round_trips_v10(self):
+        worker_id = UUID(int=401)
+        migrated = agent.AgentMemory.restore(
+            {
+                "version": 9,
+                "worker_sectors": {str(worker_id): 11},
+            }
+        )
+        self.assertEqual(migrated.persistent_state()["version"], 10)
+        self.assertEqual(migrated.worker_sector[worker_id], 11)
+        self.assertEqual(migrated.population_peak, 0)
+        self.assertEqual(migrated.replenishment_target_population, 0)
+        self.assertFalse(migrated.replenishment_active)
+
+        memory = agent.AgentMemory(
+            worker_sector={worker_id: 11},
+            population_peak=28,
+            replenishment_target_population=36,
+            replenishment_active=True,
+        )
+        restored = agent.AgentMemory.restore(memory.persistent_state())
+        self.assertEqual(restored.worker_sector[worker_id], 11)
+        self.assertEqual(restored.population_peak, 28)
+        self.assertEqual(restored.replenishment_target_population, 36)
+        self.assertTrue(restored.replenishment_active)
 
     def test_population_above_twenty_keeps_two_vanguards_one_ranger_ratio(self):
         units = [
@@ -1832,7 +2047,7 @@ class SquadStrategyTests(AgentTestCase):
         self.assertEqual(squads[0].unit_ids, {UUID(int=201), UUID(int=202), UUID(int=301)})
 
         restored = agent.AgentMemory.restore(memory.persistent_state())
-        self.assertEqual(restored.persistent_state()["version"], 9)
+        self.assertEqual(restored.persistent_state()["version"], 10)
         self.assertEqual(restored.squad_assignments, memory.squad_assignments)
         self.assertEqual(restored.squad_regroup_goal, memory.squad_regroup_goal)
         self.assertEqual(
@@ -2600,7 +2815,7 @@ class V2SearchTests(AgentTestCase):
         self.assertEqual(memory.assault_target_id, UUID(int=400))
         self.assertTrue(any("squad-assault" in item for item in actions))
 
-    def test_v8_state_migrates_enemy_core_into_v9(self):
+    def test_v8_state_migrates_enemy_core_into_v10(self):
         core_id = UUID(int=400)
         restored = agent.AgentMemory.restore(
             {
@@ -2613,7 +2828,7 @@ class V2SearchTests(AgentTestCase):
         )
 
         self.assertEqual(restored.known_enemy_cores[core_id], ((25, 0), 100))
-        self.assertEqual(restored.persistent_state()["version"], 9)
+        self.assertEqual(restored.persistent_state()["version"], 10)
 
     def test_v9_search_mission_round_trips(self):
         worker_id = UUID(int=401)
