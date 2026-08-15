@@ -123,6 +123,8 @@ SQUAD_PATROL_RING_SEQUENCE: tuple[int, ...] = (
 )
 SQUAD_PATROL_WAYPOINT_STEP = 7
 SQUAD_PATROL_PATH_FAILURES = 3
+HIGH_POPULATION_PATROL_THRESHOLD = 40
+ASSAULT_WAVE_SIZE = 3
 TARGET_WORKERS_CONTROL = 4
 SQUAD_VANGUARDS = 2
 SQUAD_RANGERS = 1
@@ -171,6 +173,24 @@ STATE_SAVE_INTERVAL_TICKS = 10
 STATE_VERSION = 9
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 4
+
+
+def squad_patrol_radii_for(
+    population: int,
+    squad_index: int,
+) -> tuple[int, ...]:
+    """返回当前人口和野战序号对应的巡逻方环半径。"""
+    if population < HIGH_POPULATION_PATROL_THRESHOLD:
+        return SQUAD_PATROL_RADII
+    if squad_index < 4:
+        return (12, 19, 26, 32)
+    if squad_index < 8:
+        return (32, 39, 49, 56)
+    return (56, 63, 73, 80)
+
+
+def squad_patrol_ring_sequence(radii: tuple[int, ...]) -> tuple[int, ...]:
+    return (*radii, *reversed(radii[1:-1]))
 
 STATE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -690,6 +710,44 @@ class CombatSquad:
         )
 
 
+def protected_squad_roles(
+    population: int,
+    squads: Iterable[CombatSquad],
+) -> dict[int, str]:
+    """按人口为完整或正在补位的小队派生近家保护职责。"""
+    ordered = tuple(sorted(squads, key=lambda squad: squad.squad_id))
+    field_ids = [squad.squad_id for squad in ordered if squad.squad_id != 0]
+    roles: dict[int, str] = {}
+    if any(squad.squad_id == 0 and squad.unit_ids for squad in ordered):
+        roles[0] = "HOME_GUARD"
+    if population >= HIGH_POPULATION_PATROL_THRESHOLD and field_ids:
+        roles[field_ids[0]] = "HOME_GUARD"
+    if population >= BASE_AUTO_POPULATION:
+        rapid_index = 1 if population >= HIGH_POPULATION_PATROL_THRESHOLD else 0
+        if len(field_ids) > rapid_index:
+            roles[field_ids[rapid_index]] = "RAPID_RESPONSE"
+    return roles
+
+
+def assault_wave_groups(
+    squads: Iterable[CombatSquad],
+    wave_size: int = ASSAULT_WAVE_SIZE,
+) -> tuple[tuple[CombatSquad, ...], ...]:
+    """将完整野战小队按稳定编号切成固定大小的攻击波。"""
+    ordered = tuple(
+        sorted(
+            (squad for squad in squads if squad.complete),
+            key=lambda squad: squad.squad_id,
+        )
+    )
+    if wave_size <= 0:
+        return (ordered,) if ordered else ()
+    return tuple(
+        ordered[index : index + wave_size]
+        for index in range(0, len(ordered), wave_size)
+    )
+
+
 @dataclass
 class SquadSearchMission:
     """一次性覆盖猜测点或失联 Core 周围区域。"""
@@ -766,6 +824,7 @@ class AgentMemory:
     assault_guarded: bool = False
     assault_gathering: bool = False
     assault_rally_position: Pos | None = None
+    assault_wave_index: int = 0
     enemy_worker_tracks: dict[UUID, EnemyWorkerTrack] = field(default_factory=dict)
     roam_chase_started: dict[UUID, int] = field(default_factory=dict)
     roam_chase_cooldown_until: dict[UUID, int] = field(default_factory=dict)
@@ -888,6 +947,9 @@ class AgentMemory:
                 memory.assault_target_last_seen_tick = last_seen_tick
             memory.assault_guarded = state.get("assault_guarded") is True
             memory.assault_gathering = state.get("assault_gathering") is True
+            raw_wave_index = state.get("assault_wave_index")
+            if isinstance(raw_wave_index, int) and raw_wave_index >= 0:
+                memory.assault_wave_index = raw_wave_index
             raw_rally = state.get("assault_rally_position")
             if (
                 isinstance(raw_rally, list)
@@ -1142,6 +1204,7 @@ class AgentMemory:
             "assault_target_last_seen_tick": self.assault_target_last_seen_tick,
             "assault_guarded": self.assault_guarded,
             "assault_gathering": self.assault_gathering,
+            "assault_wave_index": self.assault_wave_index,
             "assault_rally_position": (
                 list(self.assault_rally_position)
                 if self.assault_rally_position is not None
@@ -1432,6 +1495,7 @@ class AgentMemory:
         self.assault_guarded = False
         self.assault_gathering = False
         self.assault_rally_position = None
+        self.assault_wave_index = 0
 
     def sync_assault_target(
         self,
@@ -1448,6 +1512,7 @@ class AgentMemory:
             self.assault_guarded,
             self.assault_gathering,
             self.assault_rally_position,
+            self.assault_wave_index,
         )
         visible_cores = tuple(
             enemy
@@ -1484,6 +1549,7 @@ class AgentMemory:
                 self.assault_guarded = False
                 self.assault_gathering = False
                 self.assault_rally_position = None
+                self.assault_wave_index = 0
             self.assault_target_id = target.id
             self.assault_target_kind = target.kind
             self.assault_target_position = tuple(target.position)
@@ -1491,28 +1557,39 @@ class AgentMemory:
             has_guard = self.enemy_core_guarded.get(target.id, False)
             if has_guard:
                 if not self.assault_guarded:
+                    self.assault_wave_index = 0
                     self.assault_rally_position = None
+                    self.assault_gathering = True
                 self.assault_guarded = True
-                self.assault_gathering = True
+                if self.assault_rally_position is None:
+                    self.assault_gathering = True
             else:
                 self.assault_guarded = False
                 self.assault_gathering = False
                 self.assault_rally_position = None
+                self.assault_wave_index = 0
         elif target_id is not None and target_position is not None:
             if target_id != self.assault_target_id:
                 self.assault_guarded = False
                 self.assault_gathering = False
                 self.assault_rally_position = None
+                self.assault_wave_index = 0
             self.assault_target_id = target_id
             self.assault_target_kind = "CORE"
             self.assault_target_position = target_position
             if self.enemy_core_guarded.get(target_id, False):
+                if not self.assault_guarded:
+                    self.assault_wave_index = 0
+                    self.assault_rally_position = None
+                    self.assault_gathering = True
                 self.assault_guarded = True
-                self.assault_gathering = True
+                if self.assault_rally_position is None:
+                    self.assault_gathering = True
             else:
                 self.assault_guarded = False
                 self.assault_gathering = False
                 self.assault_rally_position = None
+                self.assault_wave_index = 0
         elif self.assault_target_id is not None:
             if self.assault_target_kind == "CORE":
                 sighting = self.known_enemy_cores.get(self.assault_target_id)
@@ -1543,6 +1620,7 @@ class AgentMemory:
             self.assault_guarded,
             self.assault_gathering,
             self.assault_rally_position,
+            self.assault_wave_index,
         )
         return before != after
 
@@ -2168,11 +2246,18 @@ class AgentMemory:
         self.scout_goal[worker_id] = core
         return core
 
-    def advance_squad_patrol(self, squad_id: int, core: Pos) -> None:
+    def advance_squad_patrol(
+        self,
+        squad_id: int,
+        core: Pos,
+        *,
+        population: int = 0,
+        squad_index: int = 0,
+    ) -> None:
+        radii = squad_patrol_radii_for(population, squad_index)
+        ring_sequence = squad_patrol_ring_sequence(radii)
         ring_index = self.squad_patrol_ring_index.get(squad_id, 0)
-        radius = SQUAD_PATROL_RING_SEQUENCE[
-            ring_index % len(SQUAD_PATROL_RING_SEQUENCE)
-        ]
+        radius = ring_sequence[ring_index % len(ring_sequence)]
         route = square_ring_waypoints(
             core,
             radius,
@@ -2181,7 +2266,7 @@ class AgentMemory:
         step = self.squad_patrol_step.get(squad_id, 0) + 1
         if step >= len(route):
             step = 0
-            ring_index = (ring_index + 1) % len(SQUAD_PATROL_RING_SEQUENCE)
+            ring_index = (ring_index + 1) % len(ring_sequence)
         self.squad_patrol_ring_index[squad_id] = ring_index
         self.squad_patrol_step[squad_id] = step
         self.squad_patrol_goal.pop(squad_id, None)
@@ -2194,20 +2279,21 @@ class AgentMemory:
         squad_count: int,
         core: Pos,
         obstacles: set[Pos],
+        population: int = 0,
     ) -> Pos:
-        """按 12～32 格往返方环为完整小队选择稳定、错开的巡逻点。"""
+        """按人口分层方环为完整小队选择稳定、错开的巡逻点。"""
+        radii = squad_patrol_radii_for(population, squad_index)
+        ring_sequence = squad_patrol_ring_sequence(radii)
         goal = self.squad_patrol_goal.get(squad_id)
         if goal is not None and goal not in obstacles:
             return goal
         max_candidates = sum(
             len(square_ring_waypoints(core, radius, SQUAD_PATROL_WAYPOINT_STEP))
-            for radius in SQUAD_PATROL_RADII
+            for radius in radii
         )
         for _ in range(max_candidates):
             ring_index = self.squad_patrol_ring_index.get(squad_id, 0)
-            radius = SQUAD_PATROL_RING_SEQUENCE[
-                ring_index % len(SQUAD_PATROL_RING_SEQUENCE)
-            ]
+            radius = ring_sequence[ring_index % len(ring_sequence)]
             route = square_ring_waypoints(
                 core,
                 radius,
@@ -2219,7 +2305,12 @@ class AgentMemory:
             if candidate not in obstacles:
                 self.squad_patrol_goal[squad_id] = candidate
                 return candidate
-            self.advance_squad_patrol(squad_id, core)
+            self.advance_squad_patrol(
+                squad_id,
+                core,
+                population=population,
+                squad_index=squad_index,
+            )
         self.squad_patrol_goal[squad_id] = core
         return core
 
@@ -3694,11 +3785,58 @@ def plan_field_squads(context: PlanningContext) -> None:
         enemy.id: enemy for enemy in context.turn.visible_enemies
     }
     field_squads = tuple(
-        squad for squad in context.combat_squads if squad.squad_id != 0
+        squad
+        for squad in context.combat_squads
+        if squad.squad_id != 0
+        and not squad.unit_ids.intersection(context.home_squad_ids)
     )
     complete_field_squads = tuple(squad for squad in field_squads if squad.complete)
     if not field_squads:
         return
+
+    wave_groups = assault_wave_groups(complete_field_squads)
+    if not wave_groups:
+        memory.assault_wave_index = 0
+        memory.assault_rally_position = None
+    else:
+        memory.assault_wave_index = min(
+            memory.assault_wave_index,
+            len(wave_groups) - 1,
+        )
+    active_wave = (
+        wave_groups[memory.assault_wave_index]
+        if wave_groups
+        else ()
+    )
+    active_wave_ids = {squad.squad_id for squad in active_wave}
+    metrics = memory.last_plan_metrics
+    if metrics is not None and memory.assault_guarded:
+        metrics.active_wave_id = memory.assault_wave_index
+
+    if (
+        memory.assault_guarded
+        and not memory.assault_gathering
+        and memory.assault_target_position is not None
+        and active_wave
+        and all(
+            unit_id in unit_by_id
+            and manhattan(
+                tuple(unit_by_id[unit_id].position),
+                memory.assault_target_position,
+            ) <= ASSAULT_GATHER_RADIUS
+            for squad in active_wave
+            for unit_id in squad.unit_ids
+        )
+        and memory.assault_wave_index + 1 < len(wave_groups)
+    ):
+        memory.assault_wave_index += 1
+        memory.assault_gathering = True
+        memory.assault_rally_position = None
+        actions.append(
+            f"squads assault-wave-next id={memory.assault_wave_index}"
+        )
+        active_wave = wave_groups[memory.assault_wave_index]
+        active_wave_ids = {squad.squad_id for squad in active_wave}
 
     if (
         memory.assault_guarded
@@ -3707,14 +3845,14 @@ def plan_field_squads(context: PlanningContext) -> None:
         and memory.assault_rally_position is None
     ):
         memory.assault_rally_position = choose_assault_rally(
-            complete_field_squads,
+            active_wave,
             unit_by_id,
             memory.assault_target_position,
         )
     if memory.assault_gathering and memory.assault_rally_position is not None:
         gathered_ids = set().union(
-            *(squad.unit_ids for squad in complete_field_squads),
-        ) if complete_field_squads else set()
+            *(squad.unit_ids for squad in active_wave),
+        ) if active_wave else set()
         if gathered_ids and all(
             unit_id in unit_by_id
             and manhattan(
@@ -3759,6 +3897,7 @@ def plan_field_squads(context: PlanningContext) -> None:
     joint_assault = (
         assault_core_near_home
         and memory.assault_guarded
+        and bool(active_wave_ids)
     )
     primary_assault_squad_id: int | None = None
     if (
@@ -3804,12 +3943,16 @@ def plan_field_squads(context: PlanningContext) -> None:
         members = [unit_by_id[unit_id] for unit_id in squad.unit_ids if unit_id in unit_by_id]
         if not members:
             continue
+        active_wave_squad = squad.squad_id in active_wave_ids
         leader = unit_by_id.get(squad.vanguard_ids[0]) if squad.vanguard_ids else None
         if leader is None:
             leader = min(members, key=lambda unit: str(unit.id))
         leader_position: Pos = tuple(leader.position)
         squad_target_object = target_object
         squad_target_position = target_position
+        if memory.assault_guarded and not active_wave_squad and not home_emergency:
+            squad_target_object = None
+            squad_target_position = None
         if (
             primary_assault_squad_id is not None
             and squad.squad_id != primary_assault_squad_id
@@ -3994,21 +4137,27 @@ def plan_field_squads(context: PlanningContext) -> None:
             mission_goal = search_mission.center
             mission_label = "squad-search"
         else:
+            patrol_squad_ids = tuple(
+                sorted(item.squad_id for item in complete_field_squads)
+            )
+            patrol_index = patrol_squad_ids.index(squad.squad_id)
             patrol_goal = memory.squad_patrol_goal.get(squad.squad_id)
             if patrol_goal is not None and leader_position == patrol_goal:
-                memory.advance_squad_patrol(squad.squad_id, context.core_pos)
+                memory.advance_squad_patrol(
+                    squad.squad_id,
+                    context.core_pos,
+                    population=context.turn.state.population,
+                    squad_index=patrol_index,
+                )
                 patrol_goal = None
             if patrol_goal is None:
-                patrol_squad_ids = tuple(
-                    sorted(item.squad_id for item in complete_field_squads)
-                )
-                patrol_index = patrol_squad_ids.index(squad.squad_id)
                 patrol_goal = memory.squad_patrol_goal_for(
                     squad.squad_id,
                     patrol_index,
                     len(patrol_squad_ids),
                     context.core_pos,
                     memory.known_obstacles | context.known_enemy_core_cells,
+                    context.turn.state.population,
                 )
             mission_goal = patrol_goal
             mission_label = "squad-patrol"
@@ -4340,7 +4489,16 @@ def plan_field_squads(context: PlanningContext) -> None:
                 failures = memory.squad_patrol_path_failures.get(squad.squad_id, 0) + 1
                 memory.squad_patrol_path_failures[squad.squad_id] = failures
                 if failures >= SQUAD_PATROL_PATH_FAILURES:
-                    memory.advance_squad_patrol(squad.squad_id, context.core_pos)
+                    patrol_squad_ids = tuple(
+                        sorted(item.squad_id for item in complete_field_squads)
+                    )
+                    patrol_index = patrol_squad_ids.index(squad.squad_id)
+                    memory.advance_squad_patrol(
+                        squad.squad_id,
+                        context.core_pos,
+                        population=context.turn.state.population,
+                        squad_index=patrol_index,
+                    )
                     actions.append(f"squad-patrol-repath team={squad.squad_id}")
             unit.wait()
             occupied.add(position)
@@ -5621,19 +5779,31 @@ def plan_turn(
     metrics.field_squad_count = sum(
         squad.squad_id != 0 for squad in combat_squads
     )
-    home_squad = next(
-        (squad for squad in combat_squads if squad.squad_id == 0),
-        None,
+    protected_roles = protected_squad_roles(
+        turn.state.population,
+        combat_squads,
     )
-    home_squad_ids = home_squad.unit_ids if home_squad else set()
+    protected_squad_ids = set(protected_roles)
+    home_squad_ids = set().union(
+        *(
+            squad.unit_ids
+            for squad in combat_squads
+            if squad.squad_id in protected_squad_ids
+        ),
+    ) if protected_squad_ids else set()
     field_combat_ids = set().union(
         *(
             squad.unit_ids
             for squad in combat_squads
-            if squad.squad_id != 0
+            if squad.squad_id not in protected_squad_ids
         ),
-    ) if any(squad.squad_id != 0 for squad in combat_squads) else set()
+    ) if any(
+        squad.squad_id not in protected_squad_ids for squad in combat_squads
+    ) else set()
     reserved_combat_ids = set(field_combat_ids)
+    metrics.protected_squad_count = len(protected_squad_ids)
+    for squad_id, role in sorted(protected_roles.items()):
+        actions.append(f"squad-role team={squad_id} role={role}")
     sectors_before = dict(memory.worker_sector)
     memory.sync_worker_sectors(workers)
     sectors_changed = sectors_changed or memory.worker_sector != sectors_before

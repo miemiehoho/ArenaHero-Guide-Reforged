@@ -1367,6 +1367,126 @@ class SquadStrategyTests(AgentTestCase):
             },
         )
 
+    @staticmethod
+    def high_population_roster(population: int):
+        """生成完整 2V1R 阵容，用于 40/60 人口职责边界测试。"""
+        worker_count = 4
+        combat_population = population - worker_count
+        squad_count = combat_population // 3
+        units = population_workers(worker_count)
+        for squad_index in range(squad_count):
+            base_x = 10 + squad_index * 4
+            units.extend(
+                (
+                    controlled_unit(
+                        200 + squad_index * 2,
+                        UnitType.VANGUARD,
+                        (base_x, 0),
+                    ),
+                    controlled_unit(
+                        201 + squad_index * 2,
+                        UnitType.VANGUARD,
+                        (base_x, 1),
+                    ),
+                    controlled_unit(
+                        500 + squad_index,
+                        UnitType.RANGER,
+                        (base_x + 1, 0),
+                    ),
+                )
+            )
+        for extra_index in range(combat_population - squad_count * 3):
+            units.append(
+                controlled_unit(
+                    800 + extra_index,
+                    UnitType.VANGUARD,
+                    (100 + extra_index, 0),
+                )
+            )
+        return units
+
+    @staticmethod
+    def complete_squad(squad_id: int) -> agent.CombatSquad:
+        return agent.CombatSquad(
+            squad_id=squad_id,
+            vanguard_ids=(UUID(int=1000 + squad_id * 2), UUID(int=1001 + squad_id * 2)),
+            ranger_ids=(UUID(int=2000 + squad_id),),
+        )
+
+    def test_high_population_patrol_bands_preserve_low_population_layout(self):
+        self.assertEqual(
+            agent.squad_patrol_radii_for(39, 0),
+            agent.SQUAD_PATROL_RADII,
+        )
+        self.assertEqual(agent.squad_patrol_radii_for(40, 0), (12, 19, 26, 32))
+        self.assertEqual(agent.squad_patrol_radii_for(40, 3), (12, 19, 26, 32))
+        self.assertEqual(agent.squad_patrol_radii_for(40, 4), (32, 39, 49, 56))
+        self.assertEqual(agent.squad_patrol_radii_for(60, 8), (56, 63, 73, 80))
+
+    def test_protected_squad_roles_follow_population_boundaries(self):
+        squads = tuple(self.complete_squad(squad_id) for squad_id in range(4))
+        self.assertEqual(
+            agent.protected_squad_roles(19, squads),
+            {0: "HOME_GUARD"},
+        )
+        self.assertEqual(
+            agent.protected_squad_roles(20, squads),
+            {0: "HOME_GUARD", 1: "RAPID_RESPONSE"},
+        )
+        self.assertEqual(
+            agent.protected_squad_roles(40, squads),
+            {0: "HOME_GUARD", 1: "HOME_GUARD", 2: "RAPID_RESPONSE"},
+        )
+        self.assertEqual(
+            agent.protected_squad_roles(60, squads),
+            {0: "HOME_GUARD", 1: "HOME_GUARD", 2: "RAPID_RESPONSE"},
+        )
+
+    def test_assault_waves_use_stable_sorted_batches(self):
+        squads = [
+            self.complete_squad(4),
+            agent.CombatSquad(3, (UUID(int=3000),), (UUID(int=4000),)),
+            self.complete_squad(1),
+            self.complete_squad(5),
+            self.complete_squad(2),
+        ]
+        waves = agent.assault_wave_groups(squads, wave_size=3)
+        self.assertEqual(
+            tuple(tuple(squad.squad_id for squad in wave) for wave in waves),
+            ((1, 2, 4), (5,)),
+        )
+
+    def test_high_population_plan_keeps_three_protected_squads_out_of_patrol(self):
+        for population in (40, 60):
+            with self.subTest(population=population):
+                _, actions, memory = self.plan(
+                    make_turn(self.high_population_roster(population))
+                )
+                self.assertEqual(memory.last_plan_metrics.protected_squad_count, 3)
+                self.assertTrue(any("squad-role team=0 role=HOME_GUARD" in item for item in actions))
+                self.assertTrue(any("squad-role team=1 role=HOME_GUARD" in item for item in actions))
+                self.assertTrue(any("squad-role team=2 role=RAPID_RESPONSE" in item for item in actions))
+                self.assertNotIn(0, memory.squad_patrol_goal)
+                self.assertNotIn(1, memory.squad_patrol_goal)
+                self.assertNotIn(2, memory.squad_patrol_goal)
+
+    def test_assault_rally_is_selected_per_wave(self):
+        squads = tuple(self.complete_squad(squad_id) for squad_id in (1, 2, 3, 4))
+        unit_by_id = {}
+        for squad_id in (1, 2, 3, 4):
+            squad = self.complete_squad(squad_id)
+            for index, unit_id in enumerate(squad.vanguard_ids + squad.ranger_ids):
+                unit_by_id[unit_id] = controlled_unit(
+                    unit_id.int,
+                    UnitType.VANGUARD if index < 2 else UnitType.RANGER,
+                    (10 + squad_id * 10, index),
+                )
+        first_rally = agent.choose_assault_rally(squads[:3], unit_by_id, (100, 0))
+        second_rally = agent.choose_assault_rally(squads[3:], unit_by_id, (100, 0))
+        self.assertIsNotNone(first_rally)
+        self.assertIsNotNone(second_rally)
+        self.assertNotEqual(first_rally, second_rally)
+
     def test_squads_are_stable_persisted_two_vanguards_one_ranger(self):
         memory = self.squad_memory()
         memory.squad_regroup_goal[1] = (12, 4)
