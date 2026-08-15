@@ -1059,7 +1059,8 @@ class OuterScoutTests(AgentTestCase):
             memory.worker_sector,
             dict(zip(worker_ids, (0, 2, 4, 6))),
         )
-        goals = [memory.outer_scout_goal[worker_id] for worker_id in worker_ids]
+        scout_ids = worker_ids[2:]
+        goals = [memory.outer_scout_goal[worker_id] for worker_id in scout_ids]
         self.assertEqual(len(set(goals)), len(goals))
         self.assertTrue(
             all(
@@ -1157,13 +1158,12 @@ class OuterScoutTests(AgentTestCase):
 
         self.assertTrue(memory.outer_scout_active)
         self.assertIsInstance(plan.unit_actions[UUID(int=100)], MoveAction)
-        self.assertTrue(
-            any(
-                action.startswith("00000000 outer-scout ")
-                for action in actions
-            )
+        self.assertTrue(any("carrier-" in action for action in actions))
+        self.assertEqual(
+            sum("worker-role" in action and "role=CARRIER" in action for action in actions),
+            2,
         )
-        self.assertFalse(any("capacity-" in action for action in actions))
+        self.assertTrue(any("capacity-" in action for action in actions))
 
     def test_immediate_threat_overrides_outer_scout(self):
         units = outer_scout_roster(worker_positions={100: (5, 0)})
@@ -1223,17 +1223,17 @@ class OuterScoutTests(AgentTestCase):
 
         _, _, memory = self.plan(make_turn(units, resources=95))
 
-        worker_ids = [UUID(int=value) for value in range(100, 104)]
+        worker_ids = [UUID(int=value) for value in range(102, 104)]
         route = agent.square_ring_waypoints((0, 0), 32)
         expected = {
             worker_id: route[(sector * len(route)) // len(agent.SCOUT_VECTORS)]
-            for worker_id, sector in zip(worker_ids, (0, 2, 4, 6))
+            for worker_id, sector in zip(worker_ids, (4, 6))
         }
         self.assertEqual(
             {worker_id: memory.outer_scout_goal[worker_id] for worker_id in worker_ids},
             expected,
         )
-        self.assertEqual(len(set(expected.values())), 4)
+        self.assertEqual(len(set(expected.values())), 2)
 
     def test_square_ring_route_is_clockwise_and_covers_outer_annulus(self):
         route = agent.square_ring_waypoints((0, 0), 32)
@@ -1279,7 +1279,7 @@ class OuterScoutTests(AgentTestCase):
         self.assertEqual(memory.outer_scout_step[worker_id], 1)
 
     def test_three_path_failures_advance_outer_goal(self):
-        units = outer_scout_roster(worker_positions={100: (5, 0)})
+        units = outer_scout_roster(worker_positions={102: (5, 0)})
         obstacles = ((4, 0), (6, 0), (5, -1), (5, 1))
         memory = agent.AgentMemory()
 
@@ -1300,7 +1300,7 @@ class OuterScoutTests(AgentTestCase):
                 )
             )
 
-        worker_id = UUID(int=100)
+        worker_id = UUID(int=102)
         self.assertEqual(memory.outer_scout_step[worker_id], 1)
         self.assertNotIn(worker_id, memory.outer_scout_goal)
         self.assertNotIn(worker_id, memory.outer_scout_path_failures)
@@ -1486,6 +1486,45 @@ class SquadStrategyTests(AgentTestCase):
         self.assertIsNotNone(first_rally)
         self.assertIsNotNone(second_rally)
         self.assertNotEqual(first_rally, second_rally)
+
+    def test_target_reservations_cap_repeat_attackers_by_target_type(self):
+        worker_target = enemy_unit(401, UnitType.WORKER, (20, 0))
+        combat_target = enemy_unit(402, UnitType.VANGUARD, (20, 1))
+        core_target = enemy_core(403, (20, 2))
+        reservations = agent.build_target_reservations(
+            (worker_target, combat_target, core_target),
+        )
+        self.assertEqual(reservations[worker_target.id].max_attackers, 1)
+        self.assertEqual(reservations[combat_target.id].max_attackers, 2)
+        self.assertEqual(reservations[core_target.id].max_attackers, 3)
+
+        context = type("ReservationContext", (), {
+            "target_reservations": reservations,
+        })()
+        self.assertTrue(agent.reserve_target_attacker(context, worker_target, UUID(int=1)))
+        self.assertFalse(agent.reserve_target_attacker(context, worker_target, UUID(int=2)))
+        self.assertTrue(agent.reserve_target_attacker(context, combat_target, UUID(int=1)))
+        self.assertTrue(agent.reserve_target_attacker(context, combat_target, UUID(int=2)))
+        self.assertFalse(agent.reserve_target_attacker(context, combat_target, UUID(int=3)))
+
+    def test_worker_roles_are_stable_and_carriers_are_first_two(self):
+        roster = workers(4)
+        active_roles = agent.worker_roles_for(roster, True)
+        inactive_roles = agent.worker_roles_for(roster, False)
+        self.assertEqual(
+            [active_roles[worker.id] for worker in roster],
+            ["CARRIER", "CARRIER", "SCOUT", "SCOUT"],
+        )
+        self.assertTrue(all(role == "STANDARD" for role in inactive_roles.values()))
+
+    def test_outer_scout_carrier_keeps_visible_resource_task_when_core_is_full(self):
+        units = outer_scout_roster(worker_positions={100: (5, 0)})
+        plan, actions, memory = self.plan(
+            make_turn(units, resources=95, resource_cells=[(5, 0)]),
+        )
+        self.assertTrue(memory.outer_scout_active)
+        self.assertIsInstance(plan.unit_actions[UUID(int=100)], HarvestAction)
+        self.assertTrue(any("worker-role" in action and "role=CARRIER" in action for action in actions))
 
     def test_squads_are_stable_persisted_two_vanguards_one_ranger(self):
         memory = self.squad_memory()

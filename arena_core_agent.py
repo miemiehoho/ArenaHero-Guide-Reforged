@@ -54,6 +54,16 @@ class PlanningMetrics:
     production_wait_reason: str | None = None
 
 
+@dataclass
+class TargetReservation:
+    """当前 Tick 对单个敌方目标的主动攻击名额。"""
+
+    target_id: UUID
+    max_attackers: int
+    reason: str
+    reserved_unit_ids: set[UUID] = field(default_factory=set)
+
+
 _ACTIVE_PLANNING_METRICS: PlanningMetrics | None = None
 
 DIRECTION_STEPS: tuple[tuple[Direction, Pos], ...] = (
@@ -191,6 +201,82 @@ def squad_patrol_radii_for(
 
 def squad_patrol_ring_sequence(radii: tuple[int, ...]) -> tuple[int, ...]:
     return (*radii, *reversed(radii[1:-1]))
+
+
+def worker_roles_for(
+    workers: Iterable[Worker],
+    outer_scout_active: bool,
+) -> dict[UUID, str]:
+    """按稳定 UUID 顺序派生外圈模式的 Worker 默认职责。"""
+    ordered = tuple(sorted(workers, key=lambda worker: str(worker.id)))
+    if not outer_scout_active:
+        return {worker.id: "STANDARD" for worker in ordered}
+    return {
+        worker.id: "CARRIER" if index < 2 else "SCOUT"
+        for index, worker in enumerate(ordered)
+    }
+
+
+def target_attack_limit(target, urgent: bool = False) -> tuple[int, str]:
+    """返回目标的主动攻击上限和原因；紧急目标允许三名攻击者。"""
+    if urgent or target.kind == "CORE":
+        return 3, "urgent" if urgent else "core-assault"
+    if target.unit_type is UnitType.WORKER:
+        return 1, "worker-pickoff"
+    return 2, "combat-focus"
+
+
+def build_target_reservations(
+    targets: Iterable[CoreView | UnitView],
+    *,
+    urgent_target_ids: Iterable[UUID] = (),
+) -> dict[UUID, TargetReservation]:
+    """为当前可见目标建立确定性的主动攻击名额。"""
+    urgent_ids = set(urgent_target_ids)
+    unique_targets = {target.id: target for target in targets}
+    ordered_targets = sorted(
+        unique_targets.values(),
+        key=lambda target: (
+            target.id not in urgent_ids,
+            target.kind != "CORE",
+            getattr(target, "unit_type", None) is UnitType.WORKER,
+            str(target.id),
+        ),
+    )
+    reservations: dict[UUID, TargetReservation] = {}
+    for target in ordered_targets:
+        max_attackers, reason = target_attack_limit(
+            target,
+            target.id in urgent_ids,
+        )
+        reservations[target.id] = TargetReservation(
+            target_id=target.id,
+            max_attackers=max_attackers,
+            reason=reason,
+        )
+    return reservations
+
+
+def reserve_target_attacker(
+    context: "PlanningContext",
+    target,
+    unit_id: UUID,
+    *,
+    urgent: bool = False,
+) -> bool:
+    """尝试占用一个主动攻击名额；紧急自卫始终放行。"""
+    reservation = context.target_reservations.get(target.id)
+    if reservation is None:
+        return urgent
+    if urgent:
+        reservation.reserved_unit_ids.add(unit_id)
+        return True
+    if unit_id in reservation.reserved_unit_ids:
+        return True
+    if len(reservation.reserved_unit_ids) >= reservation.max_attackers:
+        return False
+    reservation.reserved_unit_ids.add(unit_id)
+    return True
 
 STATE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -2381,6 +2467,8 @@ class PlanningContext:
     threat_positions: tuple[Pos, ...]
     occupied: FriendlyOccupancy
     resource_assignments: dict[UUID, Pos]
+    worker_roles: dict[UUID, str]
+    target_reservations: dict[UUID, TargetReservation]
     reserved_combat_ids: set[UUID]
     combat_squads: tuple[CombatSquad, ...]
     home_squad_ids: set[UUID]
@@ -3163,7 +3251,12 @@ def plan_workers(context: PlanningContext) -> None:
 
     for worker_index, worker in ordered:
         position: Pos = tuple(worker.position)
+        worker_role = context.worker_roles.get(worker.id, "STANDARD")
         occupied.discard(position)
+        if context.outer_scout_active:
+            actions.append(
+                f"worker-role unit={str(worker.id)[:8]} role={worker_role}"
+            )
         danger = position in context.danger_cells or (
             context.threat_positions
             and min(
@@ -3298,9 +3391,36 @@ def plan_workers(context: PlanningContext) -> None:
         ):
             continue
 
+        if (
+            worker.cargo > 0
+            and context.outer_scout_active
+            and worker_role == "CARRIER"
+        ):
+            destination, staging_goal = full_capacity_worker_destination(
+                context,
+                position,
+                worker_index,
+            )
+            if destination is not None and destination != position:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    worker.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(worker.id)[:8]} carrier-stage "
+                        f"{staging_goal} {direction.value}"
+                    )
+                    continue
+            worker.wait()
+            occupied.add(position)
+            actions.append(
+                f"{str(worker.id)[:8]} carrier-hold {staging_goal}"
+            )
+            continue
+
         # 状态 4：达到成熟人口且 Core 满仓后，四名 Worker 在 32-64 格
         # 方环上错位顺时针扫描；资源下降后由模式切换恢复正常任务。
-        if context.outer_scout_active:
+        if context.outer_scout_active and worker_role == "SCOUT":
             separation_points = {
                 tuple(other.position)
                 for other in context.workers
@@ -3346,7 +3466,14 @@ def plan_workers(context: PlanningContext) -> None:
             continue
 
         # 状态 5：非外圈模式下，Core 满仓后分散待命并优先腾空生产格。
-        if turn.resources >= turn.resource_capacity:
+        if (
+            turn.resources >= turn.resource_capacity
+            and not (
+                context.outer_scout_active
+                and worker_role == "CARRIER"
+                and assigned_resource is not None
+            )
+        ):
             destination, staging_goal = full_capacity_worker_destination(
                 context,
                 position,
@@ -4352,7 +4479,12 @@ def plan_field_squads(context: PlanningContext) -> None:
                 and manhattan(position, squad_target_position) == 1
             ):
                 direction = direction_between(position, squad_target_position)
-                if direction is not None:
+                if direction is not None and reserve_target_attacker(
+                    context,
+                    squad_target_object,
+                    unit.id,
+                    urgent=home_emergency,
+                ):
                     unit.sweep(direction)
                     occupied.add(position)
                     actions.append(
@@ -4369,10 +4501,16 @@ def plan_field_squads(context: PlanningContext) -> None:
                     memory.known_obstacles,
                 )
             ):
-                unit.shoot(squad_target_object)
-                occupied.add(position)
-                actions.append(f"{str(unit.id)[:8]} squad-assault-shoot")
-                continue
+                if reserve_target_attacker(
+                    context,
+                    squad_target_object,
+                    unit.id,
+                    urgent=home_emergency,
+                ):
+                    unit.shoot(squad_target_object)
+                    occupied.add(position)
+                    actions.append(f"{str(unit.id)[:8]} squad-assault-shoot")
+                    continue
 
             destination: Pos | None = None
             if regroup_paused:
@@ -5812,6 +5950,7 @@ def plan_turn(
         and turn.state.population >= OUTER_SCOUT_POPULATION_THRESHOLD
         and turn.resources >= turn.resource_capacity
     )
+    worker_roles = worker_roles_for(workers, outer_scout_active)
     if memory.sync_outer_scout_mode(outer_scout_active):
         actions.append(
             "workers outer-scout-active"
@@ -5944,23 +6083,30 @@ def plan_turn(
         for enemy in safe_enemy_units
         if manhattan(core_pos, tuple(enemy.position)) <= HOME_ENGAGE_RADIUS
     )
+    target_reservations = build_target_reservations(
+        (*safe_enemy_units, *visible_enemy_cores),
+        urgent_target_ids=(enemy.id for enemy in home_combat_targets),
+    )
 
     # 资源任务跨 Tick 保留；只有空载、无资源任务且不在撤退的 Worker 才空闲。
     occupied = FriendlyOccupancy(tuple(unit.position) for unit in turn.units)
-    resource_assignments = (
-        {}
-        if outer_scout_active
-        else memory.assign_resource_targets(
-            workers,
-            memory.known_resources,
-            visible_resources,
-            turn.tick,
-            navigation_obstacles,
-            memory.known_obstacles
-            | known_enemy_core_cells
-            | visible_enemy_unit_cells
-            | known_enemy_worker_cells,
-        )
+    resource_workers = tuple(
+        worker
+        for worker in workers
+        if not outer_scout_active
+        or worker_roles.get(worker.id) == "CARRIER"
+        or worker.cargo > 0
+    )
+    resource_assignments = memory.assign_resource_targets(
+        resource_workers,
+        memory.known_resources,
+        visible_resources,
+        turn.tick,
+        navigation_obstacles,
+        memory.known_obstacles
+        | known_enemy_core_cells
+        | visible_enemy_unit_cells
+        | known_enemy_worker_cells,
     )
     roaming_combat_units = tuple(
         unit
@@ -6005,6 +6151,8 @@ def plan_turn(
         threat_positions=threat_positions,
         occupied=occupied,
         resource_assignments=resource_assignments,
+        worker_roles=worker_roles,
+        target_reservations=target_reservations,
         reserved_combat_ids=reserved_combat_ids,
         combat_squads=combat_squads,
         home_squad_ids=home_squad_ids,
