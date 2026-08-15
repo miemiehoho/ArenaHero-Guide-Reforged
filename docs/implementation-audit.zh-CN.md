@@ -7,6 +7,8 @@
 > `arena-hero-python` `423d252adcca439669adb3e7b04252e53b4430bd`、
 > `arena-hero-skill` `88fe8632a1dceeba58f57db5a0facfb5d5ef5a74`
 
+> 实施状态：阶段 A1 已完成（`99b7769`）；A2～A4 待实施，A5 保持可选。
+
 ## 1. 审计结论
 
 当前 fork 已完成原有 40+ 人口优化的四个阶段：动态生产饱和、巡逻分层、攻击波与目标
