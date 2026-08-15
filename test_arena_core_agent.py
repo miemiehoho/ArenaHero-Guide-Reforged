@@ -23,6 +23,7 @@ from arena_hero.actions import (
     HarvestAction,
     HealAction,
     MoveAction,
+    RepairShieldAction,
     ShootAction,
     SpawnAction,
     SweepAction,
@@ -99,6 +100,8 @@ def make_turn(
     obstacle_cells=(),
     events=(),
     core_state: CoreState = CoreState.NORMAL,
+    core_hp: int = 5,
+    core_shield: int = 5,
 ):
     core_kwargs = {}
     if core_state is CoreState.MOVING:
@@ -114,8 +117,8 @@ def make_turn(
         controlled=True,
         owner_username="tester",
         position=core_position,
-        hp=100,
-        shield=10,
+        hp=core_hp,
+        shield=core_shield,
         state=core_state,
         **core_kwargs,
     )
@@ -1033,6 +1036,79 @@ class HealingTests(AgentTestCase):
 
         self.assertIsInstance(plan.unit_actions[vanguard.id], HealAction)
         self.assertIsNone(plan.core_action)
+
+
+class CoreSurvivalTests(AgentTestCase):
+    """Core 生存动作优先于生产，并遵守资源与 Beacon 上限。"""
+
+    def test_injured_core_heals_before_production(self):
+        plan, actions, _ = self.plan(
+            make_turn([], resources=10, core_hp=4, core_shield=5),
+        )
+
+        self.assertIsInstance(plan.core_action, HealAction)
+        self.assertTrue(any("core heal" in item for item in actions))
+
+    def test_core_repairs_shield_after_hp_is_full(self):
+        plan, actions, _ = self.plan(
+            make_turn([], resources=10, core_hp=5, core_shield=4),
+        )
+
+        self.assertIsInstance(plan.core_action, RepairShieldAction)
+        self.assertTrue(any("core repair-shield" in item for item in actions))
+
+    def test_unit_healing_reservation_leaves_no_core_recovery_budget(self):
+        worker = controlled_unit(100, UnitType.WORKER, (2, 0), hp=1)
+        plan, _, _ = self.plan(
+            make_turn([worker], resources=1, core_hp=4, core_shield=5),
+        )
+
+        self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
+        self.assertIsNone(plan.core_action)
+
+    def test_moving_core_does_not_heal_or_repair(self):
+        plan, _, _ = self.plan(
+            make_turn(
+                [],
+                resources=10,
+                core_hp=4,
+                core_shield=4,
+                core_state=CoreState.MOVING,
+            ),
+        )
+
+        self.assertIsNone(plan.core_action)
+
+    def test_friendly_beacon_raises_core_shield_cap_to_ten(self):
+        plan, actions, _ = self.plan(
+            make_turn(
+                [],
+                resources=10,
+                core_hp=5,
+                core_shield=5,
+                beacon_status=BeaconStatus.CARRIED,
+                beacon_carrier_id=CORE_ID,
+            ),
+        )
+
+        self.assertIsInstance(plan.core_action, RepairShieldAction)
+        self.assertTrue(any("shield=5/10" in item for item in actions))
+
+    def test_unknown_or_enemy_beacon_carrier_keeps_normal_shield_cap(self):
+        for carrier_id in (UUID(int=9999), None):
+            with self.subTest(carrier_id=carrier_id):
+                plan, _, _ = self.plan(
+                    make_turn(
+                        [],
+                        resources=10,
+                        core_hp=5,
+                        core_shield=5,
+                        beacon_status=BeaconStatus.CARRIED if carrier_id else None,
+                        beacon_carrier_id=carrier_id,
+                    ),
+                )
+
+                self.assertIsInstance(plan.core_action, SpawnAction)
 
 
 class ResourceScoutTests(AgentTestCase):

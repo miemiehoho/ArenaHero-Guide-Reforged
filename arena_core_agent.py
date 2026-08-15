@@ -17,6 +17,7 @@ from arena_hero import (
     APIError,
     ArenaHeroClient,
     AuthenticationError,
+    BeaconStatus,
     ConfigurationError,
     CoreState,
     CoreView,
@@ -209,6 +210,9 @@ UNIT_MAX_HP: dict[UnitType, int] = {
     UnitType.VANGUARD: 4,
     UnitType.RANGER: 2,
 }
+CORE_MAX_HP = 5
+CORE_SHIELD_MAX = 5
+CORE_BEACON_SHIELD_MAX = 10
 TEMPORARY_BLOCK_TICKS = 8
 RESOURCE_REASSIGN_MIN_GAIN = 4
 # 距离仍是资源匹配的主要成本，同时用历史负载打散连续任务。
@@ -5849,6 +5853,50 @@ def set_production_status(
         memory.last_announced_production_status = None
 
 
+def core_has_friendly_beacon(context: PlanningContext) -> bool:
+    """只在官方明确给出己方载体时启用 Beacon 护盾上限。"""
+    beacon = context.turn.beacon
+    if beacon.status is not BeaconStatus.CARRIED or beacon.carrier_id is None:
+        return False
+    return beacon.carrier_id in {
+        context.turn.core.id,
+        *(unit.id for unit in context.turn.units),
+    }
+
+
+def plan_core_survival(context: PlanningContext) -> bool:
+    """在普通生产前执行一次 Core HEAL 或 REPAIR_SHIELD。"""
+    turn = context.turn
+    if (
+        turn.core.view.state is not CoreState.NORMAL
+        or context.core_pos in context.occupied
+        or context.healing_resources <= 0
+    ):
+        return False
+
+    if turn.core.hp < CORE_MAX_HP:
+        turn.core.heal()
+        context.healing_resources -= 1
+        context.actions.append(
+            f"core heal hp={turn.core.hp}/{CORE_MAX_HP}"
+        )
+        return True
+
+    shield_max = (
+        CORE_BEACON_SHIELD_MAX
+        if core_has_friendly_beacon(context)
+        else CORE_SHIELD_MAX
+    )
+    if turn.core.shield < shield_max:
+        turn.core.repair_shield()
+        context.healing_resources -= 1
+        context.actions.append(
+            f"core repair-shield shield={turn.core.shield}/{shield_max}"
+        )
+        return True
+    return False
+
+
 def plan_core_production(
     context: PlanningContext,
     mode: str,
@@ -5858,6 +5906,8 @@ def plan_core_production(
     turn = context.turn
     memory = context.memory
     actions = context.actions
+    if plan_core_survival(context):
+        return
     if context.spawn_clearing:
         set_production_status(context, "BLOCKED", "spawn-clearing")
         actions.append(f"core hold spawn-clear until={memory.spawn_clear_until}")
