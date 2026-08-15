@@ -36,6 +36,8 @@ from arena_hero.turn import Core, Ranger, Turn, Vanguard, Worker
 
 Pos = tuple[int, int]
 
+PLANNING_BUDGET_SECONDS = 10.0
+
 
 @dataclass
 class PlanningMetrics:
@@ -43,7 +45,10 @@ class PlanningMetrics:
 
     tick: int
     started_at: float = field(default_factory=time.perf_counter, repr=False)
+    deadline_at: float | None = field(default=None, repr=False)
     decision_ms: float = 0.0
+    deadline_exceeded: bool = False
+    degraded_sections: list[str] = field(default_factory=list)
     astar_calls: int = 0
     astar_expansions: int = 0
     astar_budget_exhausted: int = 0
@@ -65,6 +70,10 @@ class PlanningMetrics:
         compare=False,
     )
 
+    def __post_init__(self) -> None:
+        if self.deadline_at is None:
+            self.deadline_at = self.started_at + PLANNING_BUDGET_SECONDS
+
 
 @dataclass
 class TargetReservation:
@@ -77,6 +86,21 @@ class TargetReservation:
 
 
 _ACTIVE_PLANNING_METRICS: PlanningMetrics | None = None
+
+
+def planning_deadline_exceeded(section: str) -> bool:
+    """记录一次规划降级；调用方应保留已经写入当前计划的动作。"""
+    metrics = _ACTIVE_PLANNING_METRICS
+    if (
+        metrics is None
+        or metrics.deadline_at is None
+        or time.perf_counter() < metrics.deadline_at
+    ):
+        return False
+    metrics.deadline_exceeded = True
+    if section not in metrics.degraded_sections:
+        metrics.degraded_sections.append(section)
+    return True
 
 DIRECTION_STEPS: tuple[tuple[Direction, Pos], ...] = (
     (Direction.UP, (0, -1)),
@@ -652,6 +676,12 @@ def first_step_astar(
     expansions = 0
 
     while frontier and expansions < max_expansions:
+        if planning_deadline_exceeded("astar"):
+            if metrics is not None:
+                metrics.astar_budget_exhausted += 1
+            if metrics is not None and cache_key is not None:
+                metrics.astar_cache[cache_key] = None
+            return None
         _, cost, current = heapq.heappop(frontier)
         if cost != best_cost.get(current):
             continue
@@ -2684,6 +2714,8 @@ def search_goal_for(
 
     choices: list[tuple[tuple[int, int, int, Pos], Pos, set[Pos]]] = []
     for candidate in area - obstacles - mission.failed_goals - reserved_goals:
+        if planning_deadline_exceeded("search"):
+            break
         coverage = search_coverage_from(
             candidate,
             UNIT_VISION_RADII[unit.unit_type],
@@ -3474,6 +3506,11 @@ def plan_workers(context: PlanningContext) -> None:
             actions.append(f"{str(worker.id)[:8]} wait-return")
             continue
 
+        if planning_deadline_exceeded("workers"):
+            # 未规划的 Unit 按官方计划语义等待；保留占位，避免 Core 生产误判空位。
+            occupied.add(position)
+            continue
+
         assigned_resource = context.resource_assignments.get(worker.id)
         active_intercept = (
             worker.id == context.blocker_worker_id
@@ -4176,6 +4213,8 @@ def plan_field_squads(context: PlanningContext) -> None:
             target_object = None
             target_position = None
     for squad in field_squads:
+        if planning_deadline_exceeded("field-squads"):
+            break
         members = [unit_by_id[unit_id] for unit_id in squad.unit_ids if unit_id in unit_by_id]
         if not members:
             continue
@@ -4419,6 +4458,8 @@ def plan_field_squads(context: PlanningContext) -> None:
         search_goal_attempts = 0
         search_goals_available = 0
         for unit in ordered_members:
+            if planning_deadline_exceeded("field-squad-units"):
+                break
             position: Pos = tuple(unit.position)
             unit_search_goal: Pos | None = None
             occupied.discard(position)
@@ -4775,6 +4816,8 @@ def plan_vanguards(context: PlanningContext) -> None:
     for vanguard_index, vanguard in enumerate(context.vanguards):
         if vanguard.id in context.reserved_combat_ids:
             continue
+        if planning_deadline_exceeded("vanguards"):
+            break
         position: Pos = tuple(vanguard.position)
         occupied.discard(position)
         is_home_guard = vanguard.id in context.home_squad_ids
@@ -5234,6 +5277,8 @@ def plan_rangers(context: PlanningContext) -> None:
     for ranger_index, ranger in enumerate(context.rangers):
         if ranger.id in context.reserved_combat_ids:
             continue
+        if planning_deadline_exceeded("rangers"):
+            break
         position: Pos = tuple(ranger.position)
         occupied.discard(position)
         visible_entity_cells = {
@@ -6439,6 +6484,9 @@ def main() -> int:
                             f"astar_cache_hits={metrics.astar_cache_hits} "
                             f"search_cache_hits={metrics.search_coverage_cache_hits} "
                             f"astar_budget_exhausted={metrics.astar_budget_exhausted} "
+                            f"deadline_exceeded={str(metrics.deadline_exceeded).lower()} "
+                            f"degraded_sections="
+                            f"{','.join(metrics.degraded_sections) or 'none'} "
                             f"production={metrics.production_status}"
                         )
                     )

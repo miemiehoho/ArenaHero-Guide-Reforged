@@ -434,6 +434,44 @@ class ProductionTests(AgentTestCase):
         self.assertGreater(metrics.astar_expansions, 0)
         self.assertGreaterEqual(metrics.decision_ms, 0)
 
+    def test_expired_deadline_keeps_finished_worker_action_and_core_decision(self):
+        depositor = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+        idle = controlled_unit(101, UnitType.WORKER, (5, 0))
+        with patch.object(agent, "PLANNING_BUDGET_SECONDS", -1.0):
+            deposit_plan, actions, memory = self.plan(
+                make_turn([depositor, idle], resources=9),
+            )
+            core_plan, _, core_memory = self.plan(
+                make_turn([idle], resources=10),
+            )
+
+        self.assertIsInstance(
+            deposit_plan.unit_actions[depositor.id],
+            DepositAction,
+        )
+        self.assertTrue(memory.last_plan_metrics.deadline_exceeded)
+        self.assertIn("workers", memory.last_plan_metrics.degraded_sections)
+        self.assertTrue(any("deposit 1" in item for item in actions))
+        self.assertIsInstance(core_plan.core_action, SpawnAction)
+        self.assertTrue(core_memory.last_plan_metrics.deadline_exceeded)
+
+    def test_astar_stops_without_throwing_after_expired_deadline(self):
+        metrics = agent.PlanningMetrics(tick=100, deadline_at=0.0)
+        agent._ACTIVE_PLANNING_METRICS = metrics
+        try:
+            destination = agent.first_step_astar(
+                (0, 0),
+                (20, 0),
+                set(),
+                set(),
+            )
+        finally:
+            agent._ACTIVE_PLANNING_METRICS = None
+
+        self.assertIsNone(destination)
+        self.assertTrue(metrics.deadline_exceeded)
+        self.assertIn("astar", metrics.degraded_sections)
+
     def test_population_87_marks_ranger_production_saturated_once(self):
         memory = agent.AgentMemory()
         roster = self.saturation_roster()
@@ -1587,6 +1625,11 @@ class SquadStrategyTests(AgentTestCase):
                 self.assertNotIn(0, memory.squad_patrol_goal)
                 self.assertNotIn(1, memory.squad_patrol_goal)
                 self.assertNotIn(2, memory.squad_patrol_goal)
+                self.assertFalse(memory.last_plan_metrics.deadline_exceeded)
+                self.assertLess(
+                    memory.last_plan_metrics.decision_ms,
+                    agent.PLANNING_BUDGET_SECONDS * 1000,
+                )
 
     def test_assault_rally_is_selected_per_wave(self):
         squads = tuple(self.complete_squad(squad_id) for squad_id in (1, 2, 3, 4))
