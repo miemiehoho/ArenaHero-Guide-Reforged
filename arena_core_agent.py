@@ -47,11 +47,23 @@ class PlanningMetrics:
     astar_calls: int = 0
     astar_expansions: int = 0
     astar_budget_exhausted: int = 0
+    astar_cache_hits: int = 0
+    search_coverage_cache_hits: int = 0
     field_squad_count: int = 0
     protected_squad_count: int = 0
     active_wave_id: int | None = None
     production_status: str = "IDLE"
     production_wait_reason: str | None = None
+    astar_cache: dict[tuple, Pos | None] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    search_coverage_cache: dict[tuple, frozenset[Pos]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass
@@ -615,10 +627,24 @@ def first_step_astar(
     *,
     max_expansions: int = 5000,
 ) -> Pos | None:
-    if _ACTIVE_PLANNING_METRICS is not None:
-        _ACTIVE_PLANNING_METRICS.astar_calls += 1
+    metrics = _ACTIVE_PLANNING_METRICS
+    if metrics is not None:
+        metrics.astar_calls += 1
     if start == goal:
         return start
+
+    cache_key = None
+    if metrics is not None:
+        cache_key = (
+            start,
+            goal,
+            frozenset(obstacles),
+            frozenset(blocked),
+            max_expansions,
+        )
+        if cache_key in metrics.astar_cache:
+            metrics.astar_cache_hits += 1
+            return metrics.astar_cache[cache_key]
 
     frontier: list[tuple[int, int, Pos]] = [(manhattan(start, goal), 0, start)]
     came_from: dict[Pos, Pos | None] = {start: None}
@@ -630,8 +656,8 @@ def first_step_astar(
         if cost != best_cost.get(current):
             continue
         expansions += 1
-        if _ACTIVE_PLANNING_METRICS is not None:
-            _ACTIVE_PLANNING_METRICS.astar_expansions += 1
+        if metrics is not None:
+            metrics.astar_expansions += 1
         if current == goal:
             break
 
@@ -651,18 +677,24 @@ def first_step_astar(
 
     if goal not in came_from:
         if (
-            _ACTIVE_PLANNING_METRICS is not None
+            metrics is not None
             and expansions >= max_expansions
         ):
-            _ACTIVE_PLANNING_METRICS.astar_budget_exhausted += 1
+            metrics.astar_budget_exhausted += 1
+        if metrics is not None and cache_key is not None:
+            metrics.astar_cache[cache_key] = None
         return None
 
     cursor = goal
     while came_from[cursor] != start:
         parent = came_from[cursor]
         if parent is None:
+            if metrics is not None and cache_key is not None:
+                metrics.astar_cache[cache_key] = None
             return None
         cursor = parent
+    if metrics is not None and cache_key is not None:
+        metrics.astar_cache[cache_key] = cursor
     return cursor
 
 
@@ -2501,16 +2533,32 @@ def search_coverage_from(
     area: set[Pos],
     obstacles: set[Pos],
 ) -> set[Pos]:
+    metrics = _ACTIVE_PLANNING_METRICS
+    cache_key = None
+    if metrics is not None:
+        cache_key = (
+            source,
+            radius,
+            frozenset(area),
+            frozenset(obstacles),
+        )
+        cached = metrics.search_coverage_cache.get(cache_key)
+        if cached is not None:
+            metrics.search_coverage_cache_hits += 1
+            return set(cached)
     candidates = {
         (source[0] + dx, source[1] + dy)
         for dx in range(-radius, radius + 1)
         for dy in range(-(radius - abs(dx)), radius - abs(dx) + 1)
     }
-    return {
+    coverage = {
         cell
         for cell in candidates & area
         if cell not in obstacles and visible_from(source, cell, radius, obstacles)
     }
+    if metrics is not None and cache_key is not None:
+        metrics.search_coverage_cache[cache_key] = frozenset(coverage)
+    return coverage
 
 
 def infer_enemy_core_guess(
@@ -6304,6 +6352,8 @@ def main() -> int:
                             f"decision_ms={metrics.decision_ms:.2f} "
                             f"astar_calls={metrics.astar_calls} "
                             f"astar_expansions={metrics.astar_expansions} "
+                            f"astar_cache_hits={metrics.astar_cache_hits} "
+                            f"search_cache_hits={metrics.search_coverage_cache_hits} "
                             f"astar_budget_exhausted={metrics.astar_budget_exhausted} "
                             f"production={metrics.production_status}"
                         )

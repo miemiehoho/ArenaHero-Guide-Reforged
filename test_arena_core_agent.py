@@ -2043,6 +2043,43 @@ class V2SearchTests(AgentTestCase):
     def squad_memory():
         return SquadStrategyTests.squad_memory()
 
+    def test_astar_reuses_same_tick_result_and_invalidates_dynamic_blockers(self):
+        metrics = agent.PlanningMetrics(100)
+        with patch.object(agent, "_ACTIVE_PLANNING_METRICS", metrics):
+            first = agent.first_step_astar((0, 0), (3, 0), set(), set())
+            second = agent.first_step_astar((0, 0), (3, 0), set(), set())
+            changed = agent.first_step_astar((0, 0), (3, 0), set(), {(1, 0)})
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, (1, 0))
+        self.assertIsNotNone(changed)
+        self.assertEqual(metrics.astar_calls, 3)
+        self.assertEqual(metrics.astar_cache_hits, 1)
+
+    def test_search_coverage_reuses_same_tick_result_and_keeps_empty_results(self):
+        metrics = agent.PlanningMetrics(100)
+        area = agent.core_search_cells((10, 10))
+        with patch.object(agent, "_ACTIVE_PLANNING_METRICS", metrics):
+            first = agent.search_coverage_from((10, 10), 3, area, set())
+            second = agent.search_coverage_from((10, 10), 3, area, set())
+            blocked = agent.search_coverage_from(
+                (10, 10),
+                3,
+                area,
+                area,
+            )
+            blocked_again = agent.search_coverage_from(
+                (10, 10),
+                3,
+                area,
+                area,
+            )
+
+        self.assertEqual(first, second)
+        self.assertFalse(blocked)
+        self.assertEqual(blocked, blocked_again)
+        self.assertEqual(metrics.search_coverage_cache_hits, 2)
+
     def test_squad_patrol_moves_from_radius_twelve_to_nineteen(self):
         memory = agent.AgentMemory()
         first = memory.squad_patrol_goal_for(1, 0, 1, (0, 0), set())
