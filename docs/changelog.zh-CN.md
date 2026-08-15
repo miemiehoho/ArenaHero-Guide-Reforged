@@ -11,6 +11,8 @@
   Python SDK `0.2.9` 和 Skill 文档核对当前 Agent。
 - 记录 Core 占位、移动失败上下文、Core 迁移交付、命令错误恢复、15 秒截止、Core 防御动作、
   Champion Beacon 和远处资源记忆等问题及 A1～A5 实施顺序。
+- 新增 [官方规则对齐优化详细设计](official-aligned-optimization-design.zh-CN.md)，定义 A1～A4
+  的实现契约、动作优先级、错误状态机、规划截止、测试和回滚边界；A5 保持可选。
 
 ### 高人口优化阶段 4（`3b55bc7`）
 
