@@ -4,7 +4,8 @@
 fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续维护。当前分支为
 “进攻才是最好的防守”，版本为 v2；防守基线 `ecf5b65` 已保存为 annotated Tag
 `固若金汤正式版v1`，可直接用于回滚。项目使用官方 Arena Hero Python SDK `0.2.9`。
-截至 2026-08-15，40+ 人口优化的四个实施阶段均已完成。
+截至 2026-08-15，40+ 人口优化四阶段和官方规则对齐 A1～A4 均已完成，离线测试共
+126 个。
 
 ## 友情链接
 
@@ -44,8 +45,8 @@ fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续�
   不会站在队伍最前方与近战单位硬换血。
 - Ranger 遵循规则 v0.8：支持横竖和精确 45 度斜线，射程为 1-3 格；Unit 和 Core 不阻挡
   射击，只有射线上的地形障碍物挡住射线。
-- A* 和搜索覆盖结果使用当前 Tick 的短生命周期缓存；日志记录决策耗时、调用数、扩展数、
-  缓存命中和预算耗尽次数。
+- A* 和搜索覆盖结果使用当前 Tick 的短生命周期缓存；每 Tick 使用 10 秒内部规划预算，预算
+  耗尽时停止低优先级搜索并保留已规划动作，日志记录截止状态和降级模块。
 
 资源记忆按官方视野规则更新：Core、Worker、Vanguard、Ranger 的视野半径分别为 5、3、4、5，
 并考虑障碍物的 supercover 遮挡。视野外的已探索资源会保留在本地资源池，重新进入真实视野且
@@ -78,6 +79,10 @@ Core 或入口相邻格的残血单位会优先离开入口，不会进入 Core 
 安排单位治疗。治疗预留后的剩余资源才可用于本 Tick 的自动生产。治疗完成后的满血空闲单位
 会在下一 Tick 强制选择合法相邻格离开 Core，再恢复原小队或侦察逻辑；同队伤员可在退场单位
 腾出位置后接替进入。载货 Worker 的返航和交付仍高于这条退场规则，不会因满血而跳过交付。
+
+Core 的恢复动作优先于自动生产：HP 低于 5 时消耗剩余资源执行 `HEAL`；HP 已满而护盾低于
+当前上限时执行 `REPAIR_SHIELD`。普通护盾上限为 5，只有官方状态明确显示 Champion Beacon
+由己方 Core 或 Unit 携带时才按 10 处理。Unit 治疗已预留的资源不会被 Core 重复使用。
 
 ## 单位状态
 
@@ -182,3 +187,16 @@ journalctl --user -u arena-core-agent.service -n 100 --no-pager
 以后每次更新只需在运行目录执行 `git pull --ff-only origin "进攻才是最好的防守"`，验收通过
 后重启服务。`.env`、`.arena_core_state.json` 和日志文件不会随 Git 更新覆盖；若 `git status`
 显示有手工修改，应先处理冲突再拉取。
+
+日常更新到最新版本可直接按以下顺序执行：
+
+```bash
+cd /path/to/the/WorkingDirectory
+systemctl --user stop arena-core-agent.service
+git pull --ff-only origin "进攻才是最好的防守"
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest -q
+.venv/bin/python -m compileall -q arena_core_agent.py test_arena_core_agent.py
+systemctl --user restart arena-core-agent.service
+journalctl --user -u arena-core-agent.service -n 100 --no-pager
+```
