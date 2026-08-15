@@ -2516,5 +2516,33 @@ class ResourceMemoryTests(AgentTestCase):
         self.assertNotIn(resource, memory.known_resources)
 
 
+class RunnerErrorTests(unittest.TestCase):
+    """官方命令错误矩阵的 Runner 分流。"""
+
+    def test_submission_errors_follow_official_dispositions(self):
+        cases = (
+            (409, "COMMAND_WINDOW_CLOSED", "SKIP_TICK"),
+            (409, "TICK_MISMATCH", "SKIP_TICK"),
+            (429, "COMMAND_RATE_LIMITED", "SKIP_TICK"),
+            (429, "COMMAND_CONCURRENCY_LIMIT", "SKIP_TICK"),
+            (503, "TICK_NOT_READY", "SKIP_TICK"),
+            (500, "INTERNAL_ERROR", "RESTART_SESSION"),
+            (409, "IDEMPOTENCY_CONFLICT", "FATAL"),
+            (422, "INVALID_COMMAND", "FATAL"),
+            (401, "UNAUTHORIZED", "FATAL"),
+        )
+
+        for status_code, error_code, expected in cases:
+            with self.subTest(error=error_code):
+                error = agent.APIError(
+                    status_code=status_code,
+                    error=error_code,
+                )
+                self.assertEqual(
+                    agent.submission_error_disposition(error),
+                    expected,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

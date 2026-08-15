@@ -16,7 +16,6 @@ from uuid import UUID
 from arena_hero import (
     APIError,
     ArenaHeroClient,
-    ArenaHeroError,
     AuthenticationError,
     ConfigurationError,
     CoreState,
@@ -26,6 +25,7 @@ from arena_hero import (
     MoveAction,
     PlayerStatus,
     PolicyViolationError,
+    ProtocolError,
     TransportError,
     UnitView,
     UnitType,
@@ -6330,6 +6330,21 @@ def event_summary(turn) -> str:
     return ",".join(rendered)
 
 
+def submission_error_disposition(error: APIError) -> str:
+    """按官方错误矩阵决定跳过当前 Tick、重启会话或停止。"""
+    if error.error in {
+        "COMMAND_WINDOW_CLOSED",
+        "TICK_MISMATCH",
+        "COMMAND_RATE_LIMITED",
+        "COMMAND_CONCURRENCY_LIMIT",
+        "TICK_NOT_READY",
+    }:
+        return "SKIP_TICK"
+    if error.status_code >= 500:
+        return "RESTART_SESSION"
+    return "FATAL"
+
+
 def configure_run_logger() -> logging.Logger:
     """创建按大小轮转的进程日志，且不记录 API Key。"""
     logger = logging.getLogger("arena_core_agent")
@@ -6383,11 +6398,16 @@ def main() -> int:
     )
 
     reconnect_delay = 1.0
+    skipped_tick: int | None = None
     while True:
         try:
             with ArenaHeroClient(api_key=api_key) as game:
                 for turn in game.turns():
                     reconnect_delay = 1.0
+                    if skipped_tick is not None:
+                        if turn.tick <= skipped_tick:
+                            continue
+                        skipped_tick = None
                     events = event_summary(turn)
                     actions, reached = plan_turn(
                         turn,
@@ -6458,7 +6478,20 @@ def main() -> int:
 
                     # 由 SDK 生成进程唯一键：同一请求重试复用该键，进程重启后
                     # 也不会与旧 Tick 的计划发生幂等键冲突。
-                    turn.submit()
+                    try:
+                        turn.submit()
+                    except APIError as exc:
+                        disposition = submission_error_disposition(exc)
+                        if disposition == "SKIP_TICK":
+                            skipped_tick = turn.tick
+                            emit(
+                                logger,
+                                f"TICK_SKIPPED tick={turn.tick} "
+                                f"error={exc.error} detail={exc}",
+                                error=True,
+                            )
+                            continue
+                        raise
                     emit(
                         logger,
                         "actions=" + ("; ".join(actions) if actions else "WAIT"),
@@ -6470,6 +6503,7 @@ def main() -> int:
             ConfigurationError,
             InvalidActionError,
             PolicyViolationError,
+            ProtocolError,
         ) as exc:
             emit(
                 logger,
@@ -6478,14 +6512,8 @@ def main() -> int:
             )
             return 5
         except APIError as exc:
-            idempotency_conflict = (
-                exc.status_code == 409 and exc.error == "IDEMPOTENCY_CONFLICT"
-            )
-            if (
-                not idempotency_conflict
-                and exc.status_code != 429
-                and exc.status_code < 500
-            ):
+            disposition = submission_error_disposition(exc)
+            if disposition != "RESTART_SESSION":
                 emit(
                     logger,
                     f"FATAL_API_ERROR status={exc.status_code} detail={exc}",
@@ -6498,7 +6526,7 @@ def main() -> int:
                 f"retry_in={reconnect_delay:g}s detail={exc}",
                 error=True,
             )
-        except (ArenaHeroError, OSError, TimeoutError) as exc:
+        except (TransportError, OSError, TimeoutError) as exc:
             emit(
                 logger,
                 f"SESSION_RESTART type={type(exc).__name__} "
