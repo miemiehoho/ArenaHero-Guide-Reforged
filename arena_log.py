@@ -238,6 +238,60 @@ def filter_events(
     return result
 
 
+def _numeric_summary(values: Iterable[int | float]) -> dict[str, int | float | None]:
+    values = list(values)
+    if not values:
+        return {
+            "样本数": 0,
+            "起点": None,
+            "终点": None,
+            "最小": None,
+            "最大": None,
+            "平均": None,
+        }
+    return {
+        "样本数": len(values),
+        "起点": values[0],
+        "终点": values[-1],
+        "最小": min(values),
+        "最大": max(values),
+        "平均": round(sum(values) / len(values), 3),
+    }
+
+
+def _numeric_values(stats: Iterable[Mapping[str, Any]], field: str) -> list[int | float]:
+    values: list[int | float] = []
+    for record in stats:
+        data = record.get("数据")
+        if not isinstance(data, Mapping):
+            continue
+        value = data.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(value)
+    return values
+
+
+def _latest_snapshot(stats: list[Mapping[str, Any]]) -> dict[str, Any]:
+    if not stats:
+        return {}
+    latest = stats[-1]
+    snapshot: dict[str, Any] = {"Tick": latest["Tick"]}
+    data = latest.get("数据")
+    if not isinstance(data, Mapping):
+        return snapshot
+    for field in (
+        "Worker数",
+        "Vanguard数",
+        "Ranger数",
+        "人口",
+        "资源",
+        "容量",
+    ):
+        if field in data:
+            snapshot[field] = data[field]
+    return snapshot
+
+
 def aggregate_stats(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -245,12 +299,15 @@ def aggregate_stats(
     to_tick: int | None = None,
 ) -> dict[str, Any]:
     records = list(records)
-    stats = [
-        record
-        for record in records
-        if record.get("类别") == "统计"
-        and _tick_in_range(record, from_tick, to_tick)
-    ]
+    stats = sorted(
+        [
+            record
+            for record in records
+            if record.get("类别") == "统计"
+            and _tick_in_range(record, from_tick, to_tick)
+        ],
+        key=lambda record: record["Tick"],
+    )
     events = filter_events(records, tick=None)
     events = [record for record in events if _tick_in_range(record, from_tick, to_tick)]
     decisions = [
@@ -267,9 +324,18 @@ def aggregate_stats(
     ]
     durations = []
     event_counts: Counter[str] = Counter()
+    event_category_counts: Counter[str] = Counter()
     action_counts: Counter[str] = Counter()
     production_counts: Counter[str] = Counter()
-    resources: list[int] = []
+    resources = _numeric_values(stats, "资源")
+    capacities = _numeric_values(stats, "容量")
+    populations = _numeric_values(stats, "人口")
+    unit_counts = {
+        "Worker": _numeric_values(stats, "Worker数"),
+        "Vanguard": _numeric_values(stats, "Vanguard数"),
+        "Ranger": _numeric_values(stats, "Ranger数"),
+    }
+    resource_ratios: list[float] = []
     for record in stats:
         data = record.get("数据")
         if not isinstance(data, Mapping):
@@ -278,8 +344,15 @@ def aggregate_stats(
         if isinstance(duration, (int, float)):
             durations.append(float(duration))
         resource = data.get("资源")
-        if type(resource) is int:
-            resources.append(resource)
+        capacity = data.get("容量")
+        if (
+            isinstance(resource, (int, float))
+            and not isinstance(resource, bool)
+            and isinstance(capacity, (int, float))
+            and not isinstance(capacity, bool)
+            and capacity > 0
+        ):
+            resource_ratios.append(round(resource / capacity, 3))
         value = data.get("动作数量")
         if isinstance(value, Mapping):
             for name, count in value.items():
@@ -291,17 +364,31 @@ def aggregate_stats(
     for record in events:
         data = record.get("数据")
         if isinstance(data, Mapping) and isinstance(data.get("事件类型"), str):
-            event_counts[data["事件类型"]] += 1
+            event_type = data["事件类型"]
+            event_counts[event_type] += 1
+            event_category_counts[event_category(event_type)] += 1
     return {
         "统计Tick数": len(stats),
         "决策记录数": len(decisions),
         "错误记录数": len(errors),
         "事件数量": dict(event_counts),
+        "事件类别数量": dict(event_category_counts),
         "动作数量": dict(action_counts),
         "生产状态数量": dict(production_counts),
         "资源起点": resources[0] if resources else None,
         "资源终点": resources[-1] if resources else None,
         "资源变化": resources[-1] - resources[0] if len(resources) >= 2 else 0,
+        "兵种数量": {
+            unit_type: _numeric_summary(values)
+            for unit_type, values in unit_counts.items()
+        },
+        "人口统计": _numeric_summary(populations),
+        "资源统计": {
+            "资源": _numeric_summary(resources),
+            "容量": _numeric_summary(capacities),
+            "资源占用率": _numeric_summary(resource_ratios),
+        },
+        "最新快照": _latest_snapshot(stats),
         "平均决策耗时毫秒": round(sum(durations) / len(durations), 3) if durations else 0,
         "最大决策耗时毫秒": round(max(durations), 3) if durations else 0,
         "预算耗尽Tick数": sum(

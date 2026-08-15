@@ -85,6 +85,11 @@ class ArenaLogTests(unittest.TestCase):
                 tick=10,
                 data={
                     "资源": 5,
+                    "容量": 10,
+                    "人口": 3,
+                    "Worker数": 1,
+                    "Vanguard数": 1,
+                    "Ranger数": 1,
                     "决策耗时毫秒": 2.5,
                     "动作数量": {"移动": 1},
                     "事件数量": {"UNIT_MOVE_FAILED": 2},
@@ -103,6 +108,11 @@ class ArenaLogTests(unittest.TestCase):
                 tick=11,
                 data={
                     "资源": 8,
+                    "容量": 20,
+                    "人口": 4,
+                    "Worker数": 1,
+                    "Vanguard数": 2,
+                    "Ranger数": 1,
                     "决策耗时毫秒": 4.5,
                     "动作数量": {"移动": 2},
                     "预算耗尽": True,
@@ -123,8 +133,76 @@ class ArenaLogTests(unittest.TestCase):
         self.assertEqual(stats["资源变化"], 3)
         self.assertEqual(stats["动作数量"]["移动"], 3)
         self.assertEqual(stats["事件数量"]["UNIT_MOVE_FAILED"], 2)
+        self.assertEqual(stats["事件类别数量"]["Unit 事件"], 2)
         self.assertEqual(stats["预算耗尽Tick数"], 1)
         self.assertEqual(stats["最大决策耗时毫秒"], 4.5)
+        self.assertEqual(
+            stats["兵种数量"]["Vanguard"],
+            {
+                "样本数": 2,
+                "起点": 1,
+                "终点": 2,
+                "最小": 1,
+                "最大": 2,
+                "平均": 1.5,
+            },
+        )
+        self.assertEqual(stats["人口统计"]["终点"], 4)
+        self.assertEqual(stats["资源统计"]["容量"]["最大"], 20)
+        self.assertEqual(stats["资源统计"]["资源占用率"]["平均"], 0.45)
+        self.assertEqual(
+            stats["最新快照"],
+            {
+                "Tick": 11,
+                "Worker数": 1,
+                "Vanguard数": 2,
+                "Ranger数": 1,
+                "人口": 4,
+                "资源": 8,
+                "容量": 20,
+            },
+        )
+
+    def test_aggregate_stats_skips_missing_and_invalid_numeric_samples(self):
+        records = [
+            self.record(
+                "统计",
+                "Tick 统计",
+                tick=20,
+                data={"资源": 5, "容量": 0, "人口": 4, "Worker数": 4},
+            ),
+            self.record(
+                "统计",
+                "Tick 统计",
+                tick=21,
+                data={
+                    "资源": 8,
+                    "容量": None,
+                    "人口": 4,
+                    "Worker数": 4,
+                    "Vanguard数": True,
+                },
+            ),
+            self.record(
+                "事件",
+                "未来事件",
+                tick=21,
+                data={"事件类型": "A_FUTURE_EVENT"},
+            ),
+        ]
+
+        stats = arena_log.aggregate_stats(records, from_tick=20, to_tick=21)
+
+        self.assertEqual(stats["兵种数量"]["Worker"]["样本数"], 2)
+        self.assertEqual(stats["兵种数量"]["Vanguard"]["样本数"], 0)
+        self.assertIsNone(stats["兵种数量"]["Ranger"]["平均"])
+        self.assertEqual(stats["资源统计"]["资源占用率"]["样本数"], 0)
+        self.assertEqual(stats["事件类别数量"], {"官方事件": 1})
+        self.assertEqual(stats["最新快照"]["Tick"], 21)
+
+        empty = arena_log.aggregate_stats([], from_tick=1, to_tick=2)
+        self.assertEqual(empty["最新快照"], {})
+        self.assertEqual(empty["兵种数量"]["Worker"]["样本数"], 0)
 
     def test_cli_events_and_stats_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -154,6 +232,7 @@ class ArenaLogTests(unittest.TestCase):
                     0,
                 )
             self.assertIn("统计Tick数", output.getvalue())
+            self.assertIn("兵种数量", output.getvalue())
 
     def test_runtime_logger_writes_jsonl_and_keeps_move_origin_separate(self):
         event = ResolutionEvent(
