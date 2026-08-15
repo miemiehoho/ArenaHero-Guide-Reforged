@@ -13,6 +13,10 @@ fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续�
 
 - [Arena Hero 项目讨论帖](https://linux.do/t/topic/2714382)
 
+## 设计文档
+
+- [40+ 人口优化建议](docs/high-population-optimization.zh-CN.md)
+
 ## 当前策略
 
 - 前 20 个 Unit 按基础价格自动扩张；官方 v0.14 已删除每 Tick 维护费和欠费伤害。
