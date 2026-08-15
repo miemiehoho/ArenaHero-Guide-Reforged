@@ -1126,8 +1126,8 @@ class ResourceScoutTests(AgentTestCase):
             agent.RESOURCE_SCOUT_WAYPOINT_STEP,
         )
         expected = {
-            worker_id: route[(sector * len(route)) // len(agent.SCOUT_VECTORS)]
-            for worker_id, sector in zip(worker_ids, (0, 2, 4, 6))
+            worker_id: route[(sector * len(route)) // len(worker_ids)]
+            for worker_id, sector in zip(worker_ids, range(len(worker_ids)))
         }
         self.assertFalse(memory.outer_scout_active)
         self.assertFalse(any("outer-scout " in action for action in actions))
@@ -1136,6 +1136,40 @@ class ResourceScoutTests(AgentTestCase):
             expected,
         )
         self.assertEqual(len(set(expected.values())), 4)
+
+    def test_twelve_workers_receive_unique_sectors_and_scout_goals(self):
+        roster = population_workers(12)
+        memory = agent.AgentMemory()
+        memory.sync_worker_sectors(roster)
+
+        goals = [
+            memory.goal_for(
+                worker.id,
+                index,
+                len(roster),
+                (0, 0),
+                tuple(worker.position),
+                set(),
+            )
+            for index, worker in enumerate(roster)
+        ]
+
+        self.assertEqual(
+            memory.worker_sector,
+            {worker.id: index for index, worker in enumerate(roster)},
+        )
+        self.assertEqual(len(set(goals)), len(roster))
+        self.assertTrue(all(agent.chebyshev((0, 0), goal) == 12 for goal in goals))
+
+    def test_worker_count_expands_resource_scout_and_memory_radii(self):
+        self.assertEqual(agent.resource_scout_radii_for(4)[-1], 32)
+        self.assertEqual(agent.resource_scout_radii_for(8)[-1], 40)
+        self.assertEqual(agent.resource_scout_radii_for(12)[-1], 48)
+        self.assertEqual(agent.resource_scout_radii_for(16)[-1], 56)
+        self.assertEqual(agent.resource_scout_radii_for(20)[-1], 64)
+        self.assertEqual(agent.resource_memory_radius_for(4), 36)
+        self.assertEqual(agent.resource_memory_radius_for(12), 48)
+        self.assertEqual(agent.resource_memory_radius_for(20), 64)
 
     def test_resource_ring_route_is_clockwise_and_uses_expected_radii(self):
         route = agent.square_ring_waypoints(
@@ -1252,13 +1286,33 @@ class OuterScoutTests(AgentTestCase):
         worker_ids = [UUID(int=value) for value in range(100, 104)]
         self.assertEqual(
             memory.worker_sector,
-            dict(zip(worker_ids, (0, 2, 4, 6))),
+            dict(zip(worker_ids, range(4))),
         )
+
+    def test_twelve_workers_use_unique_outer_ring_offsets(self):
+        roster = population_workers(12)
+        memory = agent.AgentMemory()
+        memory.sync_worker_sectors(roster)
+
+        goals = [
+            memory.outer_scout_goal_for(
+                worker.id,
+                (0, 0),
+                tuple(worker.position),
+                set(),
+                worker_index=index,
+                worker_count=len(roster),
+            )
+            for index, worker in enumerate(roster)
+        ]
+
+        self.assertEqual(len(set(goals)), len(roster))
+        self.assertTrue(all(agent.chebyshev((0, 0), goal) == 32 for goal in goals))
 
     def test_adjacent_persisted_sectors_are_migrated_and_reset(self):
         worker_ids = [UUID(int=value) for value in range(100, 104)]
         memory = agent.AgentMemory(
-            worker_sector=dict(zip(worker_ids, (0, 1, 2, 3))),
+            worker_sector=dict(zip(worker_ids, (0, 2, 4, 6))),
             outer_scout_ring_index={worker_id: 2 for worker_id in worker_ids},
             outer_scout_step={worker_id: 8 for worker_id in worker_ids},
             outer_scout_goal={worker_id: (32, 32) for worker_id in worker_ids},
@@ -1269,7 +1323,7 @@ class OuterScoutTests(AgentTestCase):
 
         self.assertEqual(
             memory.worker_sector,
-            dict(zip(worker_ids, (0, 2, 4, 6))),
+            dict(zip(worker_ids, range(4))),
         )
         self.assertFalse(memory.outer_scout_ring_index)
         self.assertFalse(memory.outer_scout_step)
@@ -1279,7 +1333,7 @@ class OuterScoutTests(AgentTestCase):
     def test_outer_mode_repairs_persisted_layout_before_assigning_goals(self):
         worker_ids = [UUID(int=value) for value in range(100, 104)]
         memory = agent.AgentMemory(
-            worker_sector=dict(zip(worker_ids, (0, 1, 2, 3))),
+            worker_sector=dict(zip(worker_ids, (0, 2, 4, 6))),
         )
 
         _, _, memory = self.plan(
@@ -1289,7 +1343,7 @@ class OuterScoutTests(AgentTestCase):
 
         self.assertEqual(
             memory.worker_sector,
-            dict(zip(worker_ids, (0, 2, 4, 6))),
+            dict(zip(worker_ids, range(4))),
         )
         scout_ids = worker_ids[2:]
         goals = [memory.outer_scout_goal[worker_id] for worker_id in scout_ids]
@@ -1458,8 +1512,8 @@ class OuterScoutTests(AgentTestCase):
         worker_ids = [UUID(int=value) for value in range(102, 104)]
         route = agent.square_ring_waypoints((0, 0), 32)
         expected = {
-            worker_id: route[(sector * len(route)) // len(agent.SCOUT_VECTORS)]
-            for worker_id, sector in zip(worker_ids, (4, 6))
+            worker_id: route[(sector * len(route)) // 4]
+            for worker_id, sector in zip(worker_ids, (2, 3))
         }
         self.assertEqual(
             {worker_id: memory.outer_scout_goal[worker_id] for worker_id in worker_ids},
@@ -2619,6 +2673,17 @@ class ResourceMemoryTests(AgentTestCase):
             set(memory.worker_resource_target.values()),
             set(resources),
         )
+
+    def test_twelve_workers_expand_resource_memory_to_radius_48(self):
+        inside = (48, 0)
+        outside = (49, 0)
+
+        _, _, memory = self.plan(
+            make_turn(population_workers(12), resource_cells=(inside, outside)),
+        )
+
+        self.assertIn(inside, memory.known_resources)
+        self.assertNotIn(outside, memory.known_resources)
 
     def test_core_relocation_prunes_resources_outside_new_roam_square(self):
         resource = (36, 0)

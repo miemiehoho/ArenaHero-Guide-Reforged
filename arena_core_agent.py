@@ -148,6 +148,7 @@ ROAM_HOME_RESPONSE_RADIUS = 18
 ROAM_RADIUS = 24
 RESOURCE_MEMORY_RADIUS = 36
 RESOURCE_SCOUT_RADII: tuple[int, ...] = (12, 19, 26, 32)
+RESOURCE_SCOUT_EXPANDED_RADII: tuple[int, ...] = (40, 48, 56, 64)
 RESOURCE_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
     *RESOURCE_SCOUT_RADII,
     *reversed(RESOURCE_SCOUT_RADII[1:-1]),
@@ -230,6 +231,28 @@ RESOURCE_LOAD_COST = 3
 COMBAT_THREAT_MEMORY_TICKS = 6
 STATE_SAVE_INTERVAL_TICKS = 10
 STATE_VERSION = 9
+
+
+def resource_scout_radii_for(worker_count: int) -> tuple[int, ...]:
+    """Worker 每增加四名扩一层搜索环，避免新增采集力挤在原 32 格范围。"""
+    expanded_count = min(
+        len(RESOURCE_SCOUT_EXPANDED_RADII),
+        max(0, worker_count - TARGET_WORKERS_CONTROL + 3) // 4,
+    )
+    return (
+        *RESOURCE_SCOUT_RADII,
+        *RESOURCE_SCOUT_EXPANDED_RADII[:expanded_count],
+    )
+
+
+def resource_scout_ring_sequence_for(worker_count: int) -> tuple[int, ...]:
+    radii = resource_scout_radii_for(worker_count)
+    return (*radii, *reversed(radii[1:-1]))
+
+
+def resource_memory_radius_for(worker_count: int) -> int:
+    """资源记忆至少保留旧 36 格基线，并覆盖当前最远普通搜索环。"""
+    return max(RESOURCE_MEMORY_RADIUS, resource_scout_radii_for(worker_count)[-1])
 
 
 def squad_patrol_radii_for(
@@ -2092,16 +2115,13 @@ class AgentMemory:
     def sync_worker_sectors(self, workers) -> None:
         """按当前 Worker 数量均匀分配扇区，并迁移旧的相邻布局。"""
         ordered_workers = tuple(sorted(workers, key=lambda worker: str(worker.id)))
-        worker_count = len(ordered_workers)
         desired_sectors = {
-            worker.id: (worker_index * len(SCOUT_VECTORS))
-            // max(1, worker_count)
+            worker.id: worker_index
             for worker_index, worker in enumerate(ordered_workers)
         }
         if self.worker_sector != desired_sectors:
-            # Worker 逐个生产时，旧的“游标补位”会得到 0、1、2、3，
-            # 而不是四等分的 0、2、4、6。布局改变后清掉所有侦察进度，
-            # 避免旧目标与新的扇区偏移叠加。
+            # 扇区保存稳定 UUID 序号，目标函数再按实际 Worker 数量换算方环偏移。
+            # 这样超过八名后也不会复用旧的八方向编号。
             self.worker_sector = desired_sectors
             self.scout_ring_index.clear()
             self.scout_phase.clear()
@@ -2191,6 +2211,9 @@ class AgentMemory:
         position: Pos,
         obstacles: set[Pos],
         separation_points: Iterable[Pos] = (),
+        *,
+        worker_index: int = 0,
+        worker_count: int | None = None,
     ) -> Pos:
         """选择外圈方环上的下一个顺时针目标，并按稳定扇区错开起点。"""
         separation_points = tuple(separation_points)
@@ -2218,8 +2241,13 @@ class AgentMemory:
             ]
             route = square_ring_waypoints(core, radius)
             step = self.outer_scout_step.get(worker_id, 0)
-            sector = self.worker_sector.get(worker_id, 0) % len(SCOUT_VECTORS)
-            offset = (sector * len(route)) // len(SCOUT_VECTORS)
+            sector_count = (
+                len(SCOUT_VECTORS)
+                if worker_count is None
+                else max(1, worker_count)
+            )
+            sector = self.worker_sector.get(worker_id, worker_index) % sector_count
+            offset = (sector * len(route)) // sector_count
             candidate = route[(step + offset) % len(route)]
             if is_safe(candidate):
                 self.outer_scout_goal[worker_id] = candidate
@@ -2368,12 +2396,15 @@ class AgentMemory:
             self.worker_resource_target.pop(worker_id, None)
         self.resource_deferred_until[resource] = tick + 4
 
-    def advance_scout(self, worker_id: UUID) -> None:
+    def advance_scout(
+        self,
+        worker_id: UUID,
+        worker_count: int = TARGET_WORKERS_CONTROL,
+    ) -> None:
         """沿普通资源方环顺时针前进；绕环一周后切换扫描半径。"""
+        ring_sequence = resource_scout_ring_sequence_for(worker_count)
         ring_index = self.scout_ring_index.get(worker_id, 0)
-        radius = RESOURCE_SCOUT_RING_SEQUENCE[
-            ring_index % len(RESOURCE_SCOUT_RING_SEQUENCE)
-        ]
+        radius = ring_sequence[ring_index % len(ring_sequence)]
         route_length = len(
             square_ring_waypoints(
                 (0, 0),
@@ -2384,7 +2415,7 @@ class AgentMemory:
         step = self.scout_phase.get(worker_id, 0) + 1
         if step >= route_length:
             step = 0
-            ring_index = (ring_index + 1) % len(RESOURCE_SCOUT_RING_SEQUENCE)
+            ring_index = (ring_index + 1) % len(ring_sequence)
         self.scout_ring_index[worker_id] = ring_index
         self.scout_phase[worker_id] = step
         self.scout_goal.pop(worker_id, None)
@@ -2404,8 +2435,9 @@ class AgentMemory:
             return goal
 
         if goal is not None:
-            self.advance_scout(worker_id)
+            self.advance_scout(worker_id, worker_count)
 
+        ring_sequence = resource_scout_ring_sequence_for(worker_count)
         max_candidates = sum(
             len(
                 square_ring_waypoints(
@@ -2414,13 +2446,11 @@ class AgentMemory:
                     RESOURCE_SCOUT_WAYPOINT_STEP,
                 )
             )
-            for radius in RESOURCE_SCOUT_RING_SEQUENCE
+            for radius in ring_sequence
         )
         for _ in range(max_candidates):
             ring_index = self.scout_ring_index.get(worker_id, 0)
-            radius = RESOURCE_SCOUT_RING_SEQUENCE[
-                ring_index % len(RESOURCE_SCOUT_RING_SEQUENCE)
-            ]
+            radius = ring_sequence[ring_index % len(ring_sequence)]
             route = square_ring_waypoints(
                 core,
                 radius,
@@ -2429,14 +2459,14 @@ class AgentMemory:
             step = self.scout_phase.get(worker_id, 0)
             sector = self.worker_sector.get(
                 worker_id,
-                (worker_index * len(SCOUT_VECTORS)) // max(1, worker_count),
-            ) % len(SCOUT_VECTORS)
-            offset = (sector * len(route)) // len(SCOUT_VECTORS)
+                worker_index,
+            ) % max(1, worker_count)
+            offset = (sector * len(route)) // max(1, worker_count)
             candidate = route[(step + offset) % len(route)]
             if candidate not in obstacles:
                 self.scout_goal[worker_id] = candidate
                 return candidate
-            self.advance_scout(worker_id)
+            self.advance_scout(worker_id, worker_count)
 
         # 若所有普通方环候选点都被已知障碍覆盖，则回退到 Core。
         self.scout_goal[worker_id] = core
@@ -3594,6 +3624,8 @@ def plan_workers(context: PlanningContext) -> None:
                 position,
                 context.navigation_obstacles,
                 separation_points,
+                worker_index=worker_index,
+                worker_count=len(context.workers),
             )
             destination = first_step_astar(
                 position,
@@ -3758,7 +3790,7 @@ def plan_workers(context: PlanningContext) -> None:
         failures = memory.scout_path_failures.get(worker.id, 0) + 1
         memory.scout_path_failures[worker.id] = failures
         if failures >= RESOURCE_SCOUT_PATH_FAILURES:
-            memory.advance_scout(worker.id)
+            memory.advance_scout(worker.id, len(context.workers))
 
         worker.wait()
         occupied.add(position)
@@ -6172,14 +6204,20 @@ def plan_turn(
     memory.sync_ranger_coverage(bool(turn.rangers), workers)
     friendly_positions = tuple(tuple(unit.position) for unit in turn.units)
     vision_sources = friendly_vision_sources(turn.core, turn.units)
+    resource_memory_radius = resource_memory_radius_for(len(workers))
+    if outer_scout_active:
+        resource_memory_radius = max(
+            resource_memory_radius,
+            OUTER_SCOUT_RADII[-1],
+        )
     visible_resources: set[Pos] = {
         tuple(position)
         for position in turn.resource_cells
-        if chebyshev(core_pos, tuple(position)) <= RESOURCE_MEMORY_RADIUS
+        if chebyshev(core_pos, tuple(position)) <= resource_memory_radius
     }
     resources_changed = memory.prune_resources_outside(
         core_pos,
-        RESOURCE_MEMORY_RADIUS,
+        resource_memory_radius,
     )
     obstacle_resource_conflicts = memory.known_resources & memory.known_obstacles
     resources_changed = bool(obstacle_resource_conflicts) or resources_changed
@@ -6490,6 +6528,10 @@ def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, objec
         "可见敌人数": len(turn.visible_enemies),
         "已知敌方Core数": len(memory.known_enemy_cores),
         "已知资源数": len(memory.known_resources),
+        "资源记忆半径": max(
+            resource_memory_radius_for(len(turn.workers)),
+            OUTER_SCOUT_RADII[-1] if memory.outer_scout_active else 0,
+        ),
         "资源任务数": len(memory.worker_resource_target),
         "临时阻塞数": len(memory.temporary_blocked_cells),
         "彻查任务数": len(memory.squad_search_missions),
