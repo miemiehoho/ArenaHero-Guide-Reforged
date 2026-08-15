@@ -23,6 +23,7 @@ fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续�
 - [40+ 人口优化详细设计](docs/high-population-optimization-design.zh-CN.md)
 - [更新日志](docs/changelog.zh-CN.md)
 - [中文日志体系详细设计](docs/logging-system-design.zh-CN.md)
+- [中文日志统计增强详细设计](docs/logging-statistics-design.zh-CN.md)
 
 ## 当前策略
 
