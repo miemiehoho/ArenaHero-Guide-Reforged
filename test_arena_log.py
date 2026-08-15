@@ -87,6 +87,7 @@ class ArenaLogTests(unittest.TestCase):
                     "资源": 5,
                     "决策耗时毫秒": 2.5,
                     "动作数量": {"移动": 1},
+                    "事件数量": {"UNIT_MOVE_FAILED": 2},
                     "预算耗尽": False,
                 },
             ),

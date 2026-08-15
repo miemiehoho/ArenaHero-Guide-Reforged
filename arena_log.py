@@ -280,12 +280,11 @@ def aggregate_stats(
         resource = data.get("资源")
         if type(resource) is int:
             resources.append(resource)
-        for key, counter in (("动作数量", action_counts), ("事件数量", event_counts)):
-            value = data.get(key)
-            if isinstance(value, Mapping):
-                for name, count in value.items():
-                    if type(count) is int:
-                        counter[str(name)] += count
+        value = data.get("动作数量")
+        if isinstance(value, Mapping):
+            for name, count in value.items():
+                if type(count) is int:
+                    action_counts[str(name)] += count
         production = data.get("生产状态")
         if isinstance(production, str):
             production_counts[production] += 1
@@ -351,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     records = list(iter_log_records(args.log_dir))
     if args.command == "tail":
-        selected = records[-max(args.limit, 0):]
+        selected = [] if args.limit <= 0 else records[-args.limit:]
     elif args.command == "events":
         selected = filter_events(
             records,
@@ -359,13 +358,15 @@ def main(argv: list[str] | None = None) -> int:
             event_types=set(args.event_types or ()),
             reason=args.reason,
             actor=args.actor,
-        )[-max(args.limit, 0):]
+        )
+        selected = [] if args.limit <= 0 else selected[-args.limit:]
     elif args.command == "errors":
         selected = [
             record
             for record in records
             if record.get("级别") == "错误" or record.get("类别") == "错误"
-        ][-max(args.limit, 0):]
+        ]
+        selected = [] if args.limit <= 0 else selected[-args.limit:]
     else:
         summary = aggregate_stats(
             records,
