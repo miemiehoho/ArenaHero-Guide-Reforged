@@ -24,6 +24,7 @@ from arena_hero.actions import (
     HealAction,
     MoveAction,
     RepairShieldAction,
+    SelfDestructAction,
     ShootAction,
     SpawnAction,
     SweepAction,
@@ -170,6 +171,33 @@ def population_workers(count: int, *, start_id: int = 1000):
             (index % 8, 10 + index // 8),
         )
         for index in range(count)
+    ]
+
+
+def burst_roster(
+    worker_count: int,
+    vanguard_count: int,
+    ranger_count: int,
+):
+    """创建远离 Core 的高人口阵容，避免本地防守数量干扰危险分级。"""
+    return [
+        *population_workers(worker_count),
+        *(
+            controlled_unit(
+                2000 + index,
+                UnitType.VANGUARD,
+                (30 + index % 10, 30 + index // 10),
+            )
+            for index in range(vanguard_count)
+        ),
+        *(
+            controlled_unit(
+                3000 + index,
+                UnitType.RANGER,
+                (30 + index % 10, 40 + index // 10),
+            )
+            for index in range(ranger_count)
+        ),
     ]
 
 
@@ -985,6 +1013,180 @@ class BurstPlannerTests(unittest.TestCase):
         self.assertEqual(
             plan.spawn_types,
             (UnitType.VANGUARD, UnitType.VANGUARD, UnitType.RANGER),
+        )
+
+
+class DefenseBurstIntegrationTests(AgentTestCase):
+    """CRITICAL 危险下 Worker 自毁与 Core 生产的动作集成。"""
+
+    @staticmethod
+    def critical_enemies():
+        return [
+            enemy_unit(401, UnitType.VANGUARD, (8, 0)),
+            enemy_unit(402, UnitType.VANGUARD, (8, 1)),
+            enemy_unit(403, UnitType.RANGER, (8, 2)),
+        ]
+
+    def test_critical_n60_sacrifices_three_workers_and_spawns(self):
+        turn = make_turn(
+            burst_roster(15, 30, 15),
+            enemies=self.critical_enemies(),
+            resources=300,
+        )
+        plan, actions, memory = self.plan(turn)
+
+        sacrificed = {
+            unit_id
+            for unit_id, action in plan.unit_actions.items()
+            if isinstance(action, SelfDestructAction)
+        }
+        self.assertEqual(len(sacrificed), 3)
+        self.assertEqual(len(turn.workers) - len(sacrificed), 12)
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertTrue(any("defense-burst direct=2 selected=3" in item for item in actions))
+
+        statistics = agent.turn_statistics(turn, memory, False)
+        self.assertEqual(statistics["直接爆兵预计数量"], 2)
+        self.assertEqual(statistics["选中爆兵预计数量"], 3)
+        self.assertEqual(statistics["爆兵自毁Worker数"], 3)
+        self.assertEqual(statistics["动作数量"]["自毁"], 3)
+        self.assertEqual(statistics["动作数量"]["Core-生产"], 1)
+
+    def test_pressured_core_still_waits_until_full(self):
+        units = burst_roster(16, 16, 8)
+        units[16] = controlled_unit(2000, UnitType.VANGUARD, (2, 0))
+        turn = make_turn(
+            units,
+            enemies=[enemy_unit(401, UnitType.RANGER, (8, 0))],
+            resources=100,
+        )
+        plan, _, memory = self.plan(turn)
+
+        self.assertIsNone(plan.core_action)
+        self.assertFalse(
+            any(isinstance(action, SelfDestructAction) for action in plan.unit_actions.values())
+        )
+        self.assertEqual(memory.last_plan_metrics.defense_level, "PRESSURED")
+        self.assertEqual(memory.last_plan_metrics.production_wait_reason, "core-not-full")
+
+    def test_beacon_carrier_is_not_sacrificed(self):
+        carrier_id = UUID(int=1007)
+        turn = make_turn(
+            burst_roster(15, 30, 15),
+            enemies=self.critical_enemies(),
+            resources=300,
+            beacon_status=BeaconStatus.CARRIED,
+            beacon_carrier_id=carrier_id,
+            core_shield=10,
+        )
+        plan, _, _ = self.plan(turn)
+
+        self.assertNotIsInstance(plan.unit_actions[carrier_id], SelfDestructAction)
+        self.assertEqual(
+            sum(
+                isinstance(action, SelfDestructAction)
+                for action in plan.unit_actions.values()
+            ),
+            3,
+        )
+
+    def test_critical_replenishment_spawns_combat_without_sacrifice(self):
+        turn = make_turn(
+            burst_roster(11, 6, 3),
+            enemies=self.critical_enemies(),
+            resources=100,
+        )
+        memory = agent.AgentMemory(
+            population_peak=30,
+            replenishment_target_population=30,
+            replenishment_active=True,
+        )
+        plan, _, memory = self.plan(turn, memory)
+
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+        self.assertFalse(
+            any(isinstance(action, SelfDestructAction) for action in plan.unit_actions.values())
+        )
+        self.assertTrue(memory.replenishment_active)
+
+    def test_unaffordable_burst_does_not_sacrifice_or_spawn(self):
+        turn = make_turn(
+            burst_roster(15, 30, 15),
+            enemies=self.critical_enemies(),
+            resources=1,
+        )
+        plan, _, memory = self.plan(turn)
+
+        self.assertIsNone(plan.core_action)
+        self.assertFalse(
+            any(isinstance(action, SelfDestructAction) for action in plan.unit_actions.values())
+        )
+        self.assertEqual(
+            memory.last_plan_metrics.production_wait_reason,
+            "defense-burst-insufficient-resources",
+        )
+
+    def test_price_above_capacity_does_not_sacrifice_or_spawn(self):
+        turn = make_turn(
+            burst_roster(20, 53, 27),
+            enemies=self.critical_enemies(),
+            resources=500,
+        )
+        plan, _, memory = self.plan(turn)
+
+        self.assertIsNone(plan.core_action)
+        self.assertFalse(
+            any(isinstance(action, SelfDestructAction) for action in plan.unit_actions.values())
+        )
+        self.assertEqual(memory.last_plan_metrics.production_status, "SATURATED")
+
+    def test_core_migration_and_spawn_clearing_block_burst(self):
+        moving_turn = make_turn(
+            burst_roster(15, 30, 15),
+            enemies=self.critical_enemies(),
+            resources=300,
+            core_state=CoreState.MOVING,
+        )
+        moving_plan, _, _ = self.plan(moving_turn)
+        self.assertIsNone(moving_plan.core_action)
+        self.assertFalse(
+            any(
+                isinstance(action, SelfDestructAction)
+                for action in moving_plan.unit_actions.values()
+            )
+        )
+
+        clearing_turn = make_turn(
+            burst_roster(15, 30, 15),
+            enemies=self.critical_enemies(),
+            resources=300,
+        )
+        clearing_plan, _, _ = self.plan(
+            clearing_turn,
+            agent.AgentMemory(spawn_clear_until=101),
+        )
+        self.assertIsNone(clearing_plan.core_action)
+        self.assertFalse(
+            any(
+                isinstance(action, SelfDestructAction)
+                for action in clearing_plan.unit_actions.values()
+            )
+        )
+
+    def test_core_survival_action_precedes_burst(self):
+        turn = make_turn(
+            burst_roster(15, 30, 15),
+            enemies=self.critical_enemies(),
+            resources=300,
+            core_hp=4,
+        )
+        plan, _, _ = self.plan(turn)
+
+        self.assertIsInstance(plan.core_action, HealAction)
+        self.assertFalse(
+            any(isinstance(action, SelfDestructAction) for action in plan.unit_actions.values())
         )
 
 

@@ -68,6 +68,10 @@ class PlanningMetrics:
     field_squad_count: int = 0
     protected_squad_count: int = 0
     active_wave_id: int | None = None
+    burst_direct_spawn_count: int = 0
+    burst_selected_spawn_count: int = 0
+    burst_sacrifice_count: int = 0
+    burst_remaining_resources: int = 0
     production_status: str = "IDLE"
     production_wait_reason: str | None = None
     defense_level: str = "NONE"
@@ -6171,6 +6175,123 @@ def plan_core_survival(context: PlanningContext) -> bool:
     return False
 
 
+def projected_unit_position(unit: Worker, action) -> Pos:
+    """返回覆盖 Unit 动作前，规划占位器认为的最终位置。"""
+    if isinstance(action, MoveAction):
+        delta = dict(DIRECTION_STEPS)[action.direction]
+        return add(tuple(unit.position), delta)
+    return tuple(unit.position)
+
+
+def defense_burst_workers(
+    context: PlanningContext,
+    maximum: int,
+) -> list[Worker]:
+    """按空载、低 Cargo、远离 Core 和 UUID 顺序选择可自毁 Worker。"""
+    carrier_id = (
+        context.turn.beacon.carrier_id
+        if context.turn.beacon.status is BeaconStatus.CARRIED
+        else None
+    )
+    eligible = [
+        worker
+        for worker in context.workers
+        if worker.id != carrier_id
+    ]
+    eligible.sort(
+        key=lambda worker: (
+            worker.cargo > 0,
+            worker.cargo,
+            -manhattan(tuple(worker.position), context.core_pos),
+            str(worker.id),
+        )
+    )
+    return eligible[:maximum]
+
+
+def plan_defense_burst(
+    context: PlanningContext,
+    available_resources: int,
+) -> bool:
+    """在 CRITICAL 状态下比较直接生产与 Worker 自毁方案并规划首个生产。"""
+    metrics = context.memory.last_plan_metrics
+    direct = simulate_burst_plan(
+        context.turn.state.population,
+        available_resources,
+        len(context.vanguards),
+        len(context.rangers),
+    )
+    workers = defense_burst_workers(
+        context,
+        max(0, len(context.workers) - WORKER_REPLENISH_TARGET),
+    )
+    selected = choose_defense_burst_plan(
+        context.turn.state.population,
+        available_resources,
+        len(context.workers),
+        len(context.vanguards),
+        len(context.rangers),
+        eligible_sacrifices=len(workers),
+    )
+    if metrics is not None:
+        metrics.burst_direct_spawn_count = direct.spawn_count
+        metrics.burst_selected_spawn_count = selected.spawn_count
+        metrics.burst_sacrifice_count = selected.sacrifice_count
+        metrics.burst_remaining_resources = selected.remaining_resources
+
+    if selected.spawn_count == 0:
+        next_type = next_combat_unit_type(
+            len(context.vanguards),
+            len(context.rangers),
+        )
+        cost = unit_cost(next_type, selected.start_population)
+        if cost > core_resource_capacity(selected.start_population):
+            set_production_status(
+                context,
+                "SATURATED",
+                "defense-burst-price-exceeds-capacity",
+                unit_type=next_type,
+                cost=cost,
+            )
+        else:
+            set_production_status(
+                context,
+                "RESOURCE_WAIT",
+                "defense-burst-insufficient-resources",
+                unit_type=next_type,
+                cost=cost,
+            )
+        return True
+
+    victims = workers[:selected.sacrifice_count]
+    for worker in victims:
+        action = context.turn.plan.unit_actions.get(worker.id)
+        context.occupied.discard(projected_unit_position(worker, action))
+        worker.self_destruct()
+        context.actions.append(
+            f"{str(worker.id)[:8]} worker self-destruct defense-burst "
+            f"cargo={worker.cargo}"
+        )
+
+    unit_type = selected.spawn_types[0]
+    cost = unit_cost(unit_type, selected.start_population)
+    context.turn.core.spawn(unit_type)
+    set_production_status(
+        context,
+        "READY",
+        reason="defense-burst",
+        unit_type=unit_type,
+        cost=cost,
+    )
+    context.actions.append(
+        f"core spawn {unit_type.value} (defense-burst "
+        f"direct={direct.spawn_count} selected={selected.spawn_count} "
+        f"sacrifice={selected.sacrifice_count} "
+        f"remaining={selected.remaining_resources})"
+    )
+    return True
+
+
 def plan_core_production(
     context: PlanningContext,
     mode: str,
@@ -6197,10 +6318,18 @@ def plan_core_production(
         turn.state.population >= BASE_AUTO_POPULATION
         and turn.resources < turn.resource_capacity
         and not memory.replenishment_active
+        and not (
+            mode == "control"
+            and context.defense_pressure.burst_required
+        )
     ):
         set_production_status(context, "RESOURCE_WAIT", "core-not-full")
         return
     available_resources = context.healing_resources
+
+    if mode == "control" and context.defense_pressure.burst_required:
+        plan_defense_burst(context, available_resources)
+        return
 
     if memory.replenishment_active and len(context.workers) < WORKER_REPLENISH_TARGET:
         worker_cost = unit_cost(UnitType.WORKER, turn.state.population)
@@ -6790,6 +6919,10 @@ def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, objec
         "近家敌方战斗单位数": 0,
         "近家防守单位数": 0,
         "Core受损": False,
+        "直接爆兵预计数量": 0,
+        "选中爆兵预计数量": 0,
+        "爆兵自毁Worker数": 0,
+        "爆兵预计剩余资源": 0,
     }
     if metrics is not None:
         metric_data.update(
@@ -6807,6 +6940,10 @@ def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, objec
                 "近家敌方战斗单位数": metrics.defense_enemy_count,
                 "近家防守单位数": metrics.defense_defender_count,
                 "Core受损": metrics.defense_core_damaged,
+                "直接爆兵预计数量": metrics.burst_direct_spawn_count,
+                "选中爆兵预计数量": metrics.burst_selected_spawn_count,
+                "爆兵自毁Worker数": metrics.burst_sacrifice_count,
+                "爆兵预计剩余资源": metrics.burst_remaining_resources,
             }
         )
     return {
