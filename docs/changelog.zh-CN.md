@@ -5,6 +5,13 @@
 
 ## 2026-08-15
 
+### 实现审计
+
+- 新增 [实现审计报告](implementation-audit.zh-CN.md)，依据官方规则 `v0.14`、API `v0.1`、
+  Python SDK `0.2.9` 和 Skill 文档核对当前 Agent。
+- 记录 Core 占位、移动失败上下文、Core 迁移交付、命令错误恢复、15 秒截止、Core 防御动作、
+  Champion Beacon 和远处资源记忆等问题及 A1～A5 实施顺序。
+
 ### 高人口优化阶段 4（`3b55bc7`）
 
 - 为 `first_step_astar()` 增加当前 Tick 的短生命周期缓存。
