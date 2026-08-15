@@ -20,6 +20,7 @@ from arena_hero import (
 )
 from arena_hero.actions import (
     DepositAction,
+    HarvestAction,
     HealAction,
     MoveAction,
     ShootAction,
@@ -128,8 +129,6 @@ def make_turn(
         status=PlayerStatus.ACTIVE,
         resources=resources,
         population=len(units),
-        population_tier=0,
-        upkeep_next_tick=0,
         champion_beacon=ChampionBeacon(
             position=beacon_position,
             status=beacon_status,
@@ -160,7 +159,7 @@ def workers(count: int, *, start_id: int = 100):
 
 
 def population_workers(count: int, *, start_id: int = 1000):
-    """为人口上限测试创建互不重叠的 Worker。"""
+    """为人口与动态价格测试创建互不重叠的 Worker。"""
     return [
         controlled_unit(
             start_id + index,
@@ -398,7 +397,7 @@ class ResourceTests(AgentTestCase):
 
 
 class ProductionTests(AgentTestCase):
-    """基础生产顺序和自动人口上限。"""
+    """基础生产顺序、满仓扩编和动态价格。"""
 
     def test_harvest_mode_still_stops_at_target(self):
         turn = make_turn([], resources=30)
@@ -436,21 +435,7 @@ class ProductionTests(AgentTestCase):
         self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
         self.assertTrue(any("fill squad=0" in action for action in actions))
 
-    def test_automatic_population_stops_at_nineteen(self):
-        units = population_workers(19)
-        for mode in ("control", "harvest"):
-            turn = make_turn(units, resources=100, tick=200, core_position=(0, 0))
-            actions, reached = agent.plan_turn(
-                turn,
-                agent.AgentMemory(),
-                target=200,
-                mode=mode,
-            )
-            self.assertFalse(reached)
-            self.assertIsNone(turn.plan.core_action)
-            self.assertFalse(any("core spawn" in action for action in actions))
-
-    def test_automatic_population_can_reach_but_not_exceed_nineteen(self):
+    def test_twentieth_unit_can_spawn_before_core_is_full(self):
         units = [
             *workers(4),
             *(controlled_unit(200 + index, UnitType.VANGUARD, (index, 5)) for index in range(10)),
@@ -460,6 +445,38 @@ class ProductionTests(AgentTestCase):
         plan, _, _ = self.plan(turn)
         self.assertIsInstance(plan.core_action, SpawnAction)
         self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_population_above_twenty_waits_until_core_is_full(self):
+        units = [
+            *outer_scout_roster(),
+            controlled_unit(999, UnitType.VANGUARD, (30, 0)),
+        ]
+
+        plan, _, _ = self.plan(make_turn(units, resources=99))
+        self.assertIsNone(plan.core_action)
+
+        plan, _, _ = self.plan(make_turn(units, resources=100))
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def test_population_above_twenty_keeps_two_vanguards_one_ranger_ratio(self):
+        units = [
+            *outer_scout_roster(),
+            controlled_unit(999, UnitType.VANGUARD, (30, 0)),
+            controlled_unit(1000, UnitType.VANGUARD, (31, 0)),
+        ]
+
+        plan, _, _ = self.plan(make_turn(units, resources=105))
+        self.assertIsInstance(plan.core_action, SpawnAction)
+        self.assertIs(plan.core_action.unit_type, UnitType.RANGER)
+
+    def test_full_core_does_not_spawn_when_dynamic_price_is_unaffordable(self):
+        units = population_workers(100)
+
+        plan, _, _ = self.plan(make_turn(units, resources=500))
+
+        self.assertEqual(agent.unit_cost(UnitType.VANGUARD, 100), 865)
+        self.assertIsNone(plan.core_action)
 
 
 class WorkerTests(AgentTestCase):
@@ -912,10 +929,10 @@ class ResourceScoutTests(AgentTestCase):
     def test_leaving_outer_mode_resumes_resource_ring(self):
         units = outer_scout_roster()
         memory = agent.AgentMemory()
-        self.plan(make_turn(units, resources=80, tick=100), memory)
+        self.plan(make_turn(units, resources=95, tick=100), memory)
 
         _, actions, memory = self.plan(
-            make_turn(units, resources=79, tick=101),
+            make_turn(units, resources=94, tick=101),
             memory,
         )
 
@@ -973,7 +990,7 @@ class OuterScoutTests(AgentTestCase):
         )
 
         _, _, memory = self.plan(
-            make_turn(outer_scout_roster(), resources=80),
+            make_turn(outer_scout_roster(), resources=95),
             memory,
         )
 
@@ -1022,11 +1039,11 @@ class OuterScoutTests(AgentTestCase):
             agent.OUTER_SCOUT_MIN_GOAL_DISTANCE,
         )
 
-    def test_outer_scout_requires_population_nineteen_and_eighty_resources(self):
+    def test_outer_scout_requires_population_nineteen_and_full_core(self):
         cases = (
-            (outer_scout_roster(), 79, False),
-            (outer_scout_roster()[:-1], 80, False),
-            (outer_scout_roster(), 80, True),
+            (outer_scout_roster(), 94, False),
+            (outer_scout_roster()[:-1], 90, False),
+            (outer_scout_roster(), 95, True),
         )
 
         for units, resources, expected_active in cases:
@@ -1040,21 +1057,34 @@ class OuterScoutTests(AgentTestCase):
                     expected_active,
                 )
 
-    def test_loaded_worker_deposits_before_outer_scout_when_core_has_capacity(self):
+    def test_loaded_worker_deposits_above_old_threshold_when_core_has_capacity(self):
         units = outer_scout_roster(
             worker_positions={100: (0, 0)},
             worker_cargo={100: 1},
         )
 
-        plan, actions, memory = self.plan(make_turn(units, resources=80))
+        plan, actions, memory = self.plan(make_turn(units, resources=94))
 
-        self.assertTrue(memory.outer_scout_active)
+        self.assertFalse(memory.outer_scout_active)
         self.assertIsInstance(plan.unit_actions[UUID(int=100)], DepositAction)
         self.assertTrue(any("deposit 1" in action for action in actions))
-        self.assertEqual(
-            sum("outer-scout " in action for action in actions),
-            3,
+
+    def test_workers_keep_harvesting_above_one_hundred_with_free_capacity(self):
+        units = [
+            *outer_scout_roster(worker_positions={100: (5, 0)}),
+            controlled_unit(999, UnitType.VANGUARD, (30, 0)),
+            controlled_unit(1000, UnitType.VANGUARD, (31, 0)),
+            controlled_unit(1001, UnitType.RANGER, (32, 0)),
+        ]
+
+        plan, actions, memory = self.plan(
+            make_turn(units, resources=101, resource_cells=[(5, 0)]),
         )
+
+        self.assertEqual(len(units), 22)
+        self.assertFalse(memory.outer_scout_active)
+        self.assertIsInstance(plan.unit_actions[UUID(int=100)], HarvestAction)
+        self.assertTrue(any("00000000 harvest" in action for action in actions))
 
     def test_loaded_worker_scans_when_core_is_full(self):
         units = outer_scout_roster(
@@ -1079,7 +1109,7 @@ class OuterScoutTests(AgentTestCase):
         threat = enemy_unit(400, UnitType.VANGUARD, (6, 0))
 
         plan, actions, memory = self.plan(
-            make_turn(units, enemies=[threat], resources=80),
+            make_turn(units, enemies=[threat], resources=95),
         )
 
         self.assertTrue(memory.outer_scout_active)
@@ -1095,7 +1125,7 @@ class OuterScoutTests(AgentTestCase):
         )
 
         _, actions, memory = self.plan(
-            make_turn(units, resources=80, tick=100),
+            make_turn(units, resources=95, tick=100),
             memory,
         )
 
@@ -1106,13 +1136,13 @@ class OuterScoutTests(AgentTestCase):
     def test_leaving_outer_scout_clears_progress_and_restores_resources(self):
         units = outer_scout_roster()
         memory = agent.AgentMemory()
-        self.plan(make_turn(units, resources=80, tick=100), memory)
+        self.plan(make_turn(units, resources=95, tick=100), memory)
         self.assertTrue(memory.outer_scout_goal)
 
         _, actions, memory = self.plan(
             make_turn(
                 units,
-                resources=79,
+                resources=94,
                 tick=101,
                 resource_cells=[(6, 0)],
             ),
@@ -1130,7 +1160,7 @@ class OuterScoutTests(AgentTestCase):
     def test_four_workers_start_at_unique_quarter_ring_offsets(self):
         units = outer_scout_roster()
 
-        _, _, memory = self.plan(make_turn(units, resources=80))
+        _, _, memory = self.plan(make_turn(units, resources=95))
 
         worker_ids = [UUID(int=value) for value in range(100, 104)]
         route = agent.square_ring_waypoints((0, 0), 32)
@@ -1196,7 +1226,7 @@ class OuterScoutTests(AgentTestCase):
             _, actions, memory = self.plan(
                 make_turn(
                     units,
-                    resources=80,
+                    resources=95,
                     tick=tick,
                     obstacle_cells=obstacles,
                 ),

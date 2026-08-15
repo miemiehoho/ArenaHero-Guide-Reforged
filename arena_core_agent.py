@@ -29,6 +29,7 @@ from arena_hero import (
     TransportError,
     UnitView,
     UnitType,
+    unit_cost,
 )
 from arena_hero.turn import Core, Ranger, Turn, Vanguard, Worker
 
@@ -77,7 +78,6 @@ RESOURCE_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
 )
 RESOURCE_SCOUT_WAYPOINT_STEP = 7
 RESOURCE_SCOUT_PATH_FAILURES = 3
-OUTER_SCOUT_RESOURCE_THRESHOLD = 80
 OUTER_SCOUT_RADII: tuple[int, ...] = (32, 39, 46, 53, 60, 64)
 OUTER_SCOUT_RING_SEQUENCE: tuple[int, ...] = (
     *OUTER_SCOUT_RADII,
@@ -126,9 +126,9 @@ CORE_SEARCH_COOLDOWN_TICKS = 64
 CORE_SEARCH_MAX_TICKS = 256
 CORE_SEARCH_PATH_FAILURES = 3
 SPAWN_CLEAR_TICKS = 3
-# 19 是无需维护费的最后一个人口档；自动生产不得进入收费区间。
-# 用户仍可通过手动计划显式增加人口。
-MAX_AUTO_POPULATION = 19
+# 前 20 个 Unit 按基础编制持续生产；从第 21 个起只在 Core 满仓时扩编。
+BASE_AUTO_POPULATION = 20
+OUTER_SCOUT_POPULATION_THRESHOLD = 19
 # 官方视野半径按对象类型分别计算；资源与敌方 Core 的过期清理共用这套规则。
 CORE_VISION_RADIUS = 5
 UNIT_VISION_RADII: dict[UnitType, int] = {
@@ -3167,7 +3167,7 @@ def plan_workers(context: PlanningContext) -> None:
         ):
             continue
 
-        # 状态 4：19 人口且 Core 资源达到 80 后，四名 Worker 在 32-64 格
+        # 状态 4：达到成熟人口且 Core 满仓后，四名 Worker 在 32-64 格
         # 方环上错位顺时针扫描；资源下降后由模式切换恢复正常任务。
         if context.outer_scout_active:
             separation_points = {
@@ -5323,7 +5323,7 @@ def plan_core_production(
     mode: str,
     target: int,
 ) -> None:
-    """按运行模式规划 Core 生产，并严格遵守 19 人自动上限。"""
+    """按运行模式规划 Core 生产，并使用官方动态价格。"""
     turn = context.turn
     memory = context.memory
     actions = context.actions
@@ -5334,7 +5334,12 @@ def plan_core_production(
         turn.core.view.state is CoreState.NORMAL
         and context.core_pos not in context.occupied
     )
-    if not core_available or turn.state.population >= MAX_AUTO_POPULATION:
+    if not core_available:
+        return
+    if (
+        turn.state.population >= BASE_AUTO_POPULATION
+        and turn.resources < turn.resource_capacity
+    ):
         return
     available_resources = context.healing_resources
 
@@ -5342,7 +5347,11 @@ def plan_core_production(
     if mode == "control":
         spawn_type: UnitType | None = None
         spawn_reason = ""
-        if len(context.workers) < TARGET_WORKERS_CONTROL and available_resources >= 5:
+        worker_cost = unit_cost(UnitType.WORKER, turn.state.population)
+        if (
+            len(context.workers) < TARGET_WORKERS_CONTROL
+            and available_resources >= worker_cost
+        ):
             spawn_type = UnitType.WORKER
             spawn_reason = (
                 f"expand Workers {len(context.workers) + 1}/"
@@ -5374,7 +5383,7 @@ def plan_core_production(
             else:
                 missing_type = UnitType.RANGER
                 squad_id = incomplete.squad_id
-            cost = 10 if missing_type is UnitType.VANGUARD else 12
+            cost = unit_cost(missing_type, turn.state.population)
             if available_resources >= cost:
                 spawn_type = missing_type
                 spawn_reason = (
@@ -5391,12 +5400,13 @@ def plan_core_production(
     if mode == "harvest":
         spawned_worker = False
         if len(context.workers) < TARGET_WORKERS_CONTROL:
-            worker_threshold = 5
+            worker_threshold = unit_cost(UnitType.WORKER, turn.state.population)
             if available_resources >= worker_threshold:
                 turn.core.spawn(UnitType.WORKER)
                 spawned_worker = True
                 actions.append(
-                    f"core spawn WORKER (reserve={available_resources - 5})"
+                    f"core spawn WORKER "
+                    f"(reserve={available_resources - worker_threshold})"
                 )
         if not spawned_worker:
             needs_capacity = turn.resource_capacity < target
@@ -5405,7 +5415,11 @@ def plan_core_production(
                 or len(context.home_combat_targets)
                 > len(context.rangers) + len(context.vanguards)
             )
-            if available_resources >= 10 and (needs_capacity or defense_is_thin):
+            vanguard_cost = unit_cost(UnitType.VANGUARD, turn.state.population)
+            if (
+                available_resources >= vanguard_cost
+                and (needs_capacity or defense_is_thin)
+            ):
                 turn.core.spawn(UnitType.VANGUARD)
                 reason = (
                     "capacity replacement"
@@ -5466,8 +5480,8 @@ def plan_turn(
     sectors_changed = sectors_changed or memory.worker_sector != sectors_before
     outer_scout_active = (
         mode == "control"
-        and turn.state.population >= MAX_AUTO_POPULATION
-        and turn.resources >= OUTER_SCOUT_RESOURCE_THRESHOLD
+        and turn.state.population >= OUTER_SCOUT_POPULATION_THRESHOLD
+        and turn.resources >= turn.resource_capacity
     )
     if memory.sync_outer_scout_mode(outer_scout_active):
         actions.append(
