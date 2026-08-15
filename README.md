@@ -5,7 +5,7 @@ fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续�
 “进攻才是最好的防守”，版本为 v2；防守基线 `ecf5b65` 已保存为 annotated Tag
 `固若金汤正式版v1`，可直接用于回滚。项目使用官方 Arena Hero Python SDK `0.2.9`。
 截至 2026-08-16，40+ 人口优化四阶段、官方规则对齐 A1～A4 和中文日志体系均已完成，
-离线测试共 132 个。
+离线测试共 133 个。
 
 ## 友情链接
 
@@ -24,6 +24,7 @@ fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续�
 - [更新日志](docs/changelog.zh-CN.md)
 - [中文日志体系详细设计](docs/logging-system-design.zh-CN.md)
 - [中文日志统计增强详细设计](docs/logging-statistics-design.zh-CN.md)
+- [中文日志使用说明](docs/logging-usage.zh-CN.md)
 
 ## 当前策略
 
@@ -145,7 +146,7 @@ Core，才删除记录；彻查不完整则保留记录并在冷却后重试。�
 
 ```bash
 .venv/bin/python -m unittest -q
-.venv/bin/python -m compileall -q arena_core_agent.py test_arena_core_agent.py
+.venv/bin/python -m compileall -q arena_core_agent.py arena_log.py test_arena_core_agent.py test_arena_log.py
 systemctl --user status arena-core-agent.service
 ```
 
@@ -157,13 +158,14 @@ Agent 默认将 UTF-8 中文结构化日志写入 `arena_core_agent.jsonl`，并
 ```bash
 python arena_log.py tail --limit 50
 python arena_log.py events --type UNIT_MOVE_FAILED --reason CELL_UNIT_LIMIT
-python arena_log.py stats --from-tick 10000 --to-tick 10583
+python arena_log.py stats --from-tick 10000 --to-tick 10583 --json
 python arena_log.py errors --limit 100
 ```
 
 需要查询已部署目录时，在该目录执行命令，或使用 `--log-dir /path/to/the/WorkingDirectory`。
-`events` 保留官方 `event_type`、`reason_code` 和事件值；`stats` 汇总资源、动作、事件、耗时、
-生产状态和规划预算。
+`events` 保留官方 `event_type`、`reason_code` 和事件值；`stats` 汇总兵种、人口、资源/容量、
+资源占用率、最新快照、事件类别、动作、耗时、生产状态和规划预算。详细字段和 PowerShell/
+`jq` 示例见 [中文日志使用说明](docs/logging-usage.zh-CN.md)。
 
 ### 更新已部署实例
 
@@ -195,7 +197,7 @@ git pull --ff-only origin "进攻才是最好的防守"
 ```bash
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m unittest -q
-.venv/bin/python -m compileall -q arena_core_agent.py test_arena_core_agent.py
+.venv/bin/python -m compileall -q arena_core_agent.py arena_log.py test_arena_core_agent.py test_arena_log.py
 systemctl --user daemon-reload
 systemctl --user restart arena-core-agent.service
 systemctl --user status arena-core-agent.service
@@ -214,7 +216,7 @@ systemctl --user stop arena-core-agent.service
 git pull --ff-only origin "进攻才是最好的防守"
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m unittest -q
-.venv/bin/python -m compileall -q arena_core_agent.py test_arena_core_agent.py
+.venv/bin/python -m compileall -q arena_core_agent.py arena_log.py test_arena_core_agent.py test_arena_log.py
 systemctl --user restart arena-core-agent.service
 journalctl --user -u arena-core-agent.service -n 100 --no-pager
 ```

@@ -16,6 +16,12 @@
   `arena_log.py` 提供 `tail`、`events`、`stats`、`errors` 查询；离线测试总数增至 132 个。
 - 修复日志统计重复计数和 `--limit 0` 边界行为（`cf5df9a`）：事件计数只采用逐事件记录，
   不再与 Tick 统计中的事件摘要重复累加；显式限制为 0 时返回空结果。
+- 新增 [中文日志统计增强详细设计](logging-statistics-design.zh-CN.md)（`cdb400b`），明确兵种、
+  人口、资源/容量、占用率、最新快照和事件类别的区间统计契约。
+- 完成日志统计增强实现（`fb7c749`）：`stats` 输出 Worker/Vanguard/Ranger 数量摘要、人口和
+  资源统计、事件类别计数及最新 Tick 快照；缺失字段不伪造为 0，离线测试总数增至 133 个。
+- 新增 [中文日志使用说明](logging-usage.zh-CN.md)，补充部署目录、JSON/PowerShell/`jq` 查询
+  示例及区间统计语义。
 
 ## 2026-08-15
 
@@ -115,5 +121,5 @@
 
 ## 验证记录
 
-截至本日志最后一条记录，fork 离线测试共 132 个，全部通过；`compileall`、`git diff --check`
-和日志查询 CLI 检查也已通过。日志体系最终代码提交为 `cf5df9a`。
+截至本日志最后一条记录，fork 离线测试共 133 个，全部通过；`compileall`、`git diff --check`
+和日志查询 CLI 检查也已通过。日志体系最终代码提交为 `fb7c749`。

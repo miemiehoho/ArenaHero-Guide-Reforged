@@ -4,7 +4,7 @@
 > 适用分支：`进攻才是最好的防守`  
 > 官方基线：Arena Hero 规则 `v0.14`、API `v0.1`、Python SDK `0.2.9`
 > 实施状态：L1 设计（`e219acb`）、L2/L3 日志生产与查询（`a077192`）、统计修复
-> （`cf5df9a`）和 L4 文档验收均已完成。
+> （`cf5df9a`）、统计增强实现（`fb7c749`）和文档验收均已完成。
 
 ## 1. 目标与范围
 
@@ -127,6 +127,7 @@ Turn.events + 当前完整状态 + plan/actions + 异常
 
 - 状态：`玩家状态`、资源/容量、人口、Core 位置/HP/护盾/状态；
 - 编制：Worker、Vanguard、Ranger、可见敌人、已知敌方 Core；
+- 统计：兵种数量、人口、资源/容量区间摘要、资源占用率和最新 Tick 快照；
 - 规划：`决策耗时毫秒`、A* 调用/扩展/缓存命中、预算耗尽、降级模块、生产状态；
 - 记忆：已知资源、资源任务、临时阻塞、彻查任务、敌方 Worker 轨迹；
 - 结果：本 Tick 动作数量、Core 动作类型、是否达到 harvest 目标。
@@ -171,8 +172,8 @@ python arena_log.py events --tick 10583
 # 只看移动失败和命令窗口错误
 python arena_log.py events --type UNIT_MOVE_FAILED --type COMMAND_WINDOW_CLOSED
 
-# 汇总 Tick 区间的资源、生产、事件和规划指标
-python arena_log.py stats --from-tick 10000 --to-tick 10583
+# 汇总 Tick 区间的兵种、资源、生产、事件和规划指标
+python arena_log.py stats --from-tick 10000 --to-tick 10583 --json
 
 # 查看最近错误和会话重启
 python arena_log.py errors --limit 100
@@ -182,8 +183,8 @@ python arena_log.py errors --limit 100
 
 - `tail` 按文件时间和行顺序合并轮转日志，坏行跳过并在 stderr 给出中文警告；
 - `events` 支持 `--tick`、`--type`、`--reason`、`--actor`、`--limit`；
-- `stats` 只聚合 `类别=统计` 的记录，计算 Tick 数、资源增量、事件计数、动作计数、平均/最大
-  决策耗时、预算耗尽 Tick 和生产状态分布；
+- `stats` 聚合 `类别=统计` 的记录，计算兵种/人口摘要、资源/容量/占用率、最新快照、Tick 数、
+  资源增量、事件计数、事件类别、动作计数、平均/最大决策耗时、预算耗尽 Tick 和生产状态分布；
 - `errors` 等价于 `类别=错误` 或 `级别=错误`，按时间倒序输出；
 - 无匹配结果返回空集合和成功退出码，参数错误返回非零退出码。
 
@@ -204,7 +205,7 @@ python arena_log.py errors --limit 100
 2. 所有官方事件字段完整保留，未知 `event_type`/`reason_code` 原样查询；
 3. `UNIT_MOVE_FAILED` 的原始位置与 Agent 目的格字段不混淆；
 4. 轮转文件合并、坏行跳过、Tick/类型/原因/Actor 过滤；
-5. 统计聚合的资源、事件、动作、耗时和错误计数；
+5. 统计聚合的兵种、人口、资源/容量、占用率、事件、动作、耗时和错误计数；
 6. CLI 的 `tail`、`events`、`stats`、`errors` 正常输出和空结果行为；
 7. 现有 Agent 全量测试、`compileall` 和 `git diff --check` 保持通过。
 
@@ -234,5 +235,11 @@ git diff --check
 ### 阶段 L4：部署文档和最终验收（已完成）
 
 补充 README、更新日志、`.gitignore`，运行全量测试后独立提交并 push。日志功能失败时可回滚
-L2/L3 提交，Agent 策略和状态文件不受影响。最终全量测试为 132 个，并确认本地 `HEAD` 与
+L2/L3 提交，Agent 策略和状态文件不受影响。最终全量测试为 133 个，并确认本地 `HEAD` 与
 远端分支一致。
+
+### 阶段 L5：统计增强（已完成，`fb7c749`）
+
+在不改变日志生产和 Agent 行为的前提下，`stats` 增加 Worker/Vanguard/Ranger、人口、资源、
+容量和资源占用率摘要，输出区间最新快照及事件类别计数；新增缺失字段、空结果和 CLI JSON
+回归测试。
