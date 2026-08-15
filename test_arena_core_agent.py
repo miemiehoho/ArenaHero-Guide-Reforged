@@ -105,7 +105,7 @@ def make_turn(
         core_kwargs = {
             "move_direction": Direction.RIGHT,
             "move_progress": 1,
-            "move_required_ticks": 3,
+            "move_required_ticks": 4,
             "destination": (core_position[0] + 1, core_position[1]),
         }
     core = CoreView(
@@ -717,6 +717,124 @@ class WorkerTests(AgentTestCase):
         )
 
         self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
+
+    def test_worker_deposit_keeps_core_cell_full_and_blocks_spawn(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+
+        plan, _, _ = self.plan(make_turn([worker], resources=9))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], DepositAction)
+        self.assertIsNone(plan.core_action)
+
+    def test_worker_leaving_core_allows_same_tick_spawn(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+
+        plan, _, _ = self.plan(make_turn([worker], resources=10))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
+        self.assertIsInstance(plan.core_action, SpawnAction)
+
+    def test_second_injured_worker_does_not_enter_occupied_core(self):
+        depositor = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+        injured = controlled_unit(101, UnitType.WORKER, (1, 0), hp=1)
+
+        plan, _, _ = self.plan(make_turn([depositor, injured], resources=1))
+
+        self.assertIsInstance(plan.unit_actions[depositor.id], DepositAction)
+        injured_action = plan.unit_actions[injured.id]
+        self.assertFalse(
+            isinstance(injured_action, MoveAction)
+            and injured_action.direction is Direction.LEFT
+        )
+
+    def test_moving_core_stages_loaded_workers_without_deposit(self):
+        for position in ((0, 0), (5, 0)):
+            with self.subTest(position=position):
+                worker = controlled_unit(
+                    100,
+                    UnitType.WORKER,
+                    position,
+                    cargo=1,
+                )
+
+                plan, actions, _ = self.plan(
+                    make_turn(
+                        [worker],
+                        resources=0,
+                        core_state=CoreState.MOVING,
+                    )
+                )
+
+                self.assertNotIsInstance(
+                    plan.unit_actions[worker.id],
+                    DepositAction,
+                )
+                self.assertTrue(
+                    any("moving-core-" in action for action in actions)
+                )
+
+    def test_move_failure_uses_recorded_destination_not_event_position(self):
+        worker_id = UUID(int=100)
+        memory = agent.AgentMemory(
+            pending_move_tick=100,
+            pending_move_destinations={worker_id: (1, 0)},
+        )
+        event = ResolutionEvent(
+            event_id=UUID(int=900),
+            tick=100,
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="MOVE_DESTINATION_OCCUPIED",
+            actor_id=worker_id,
+            position=(0, 0),
+        )
+
+        memory.observe_dynamic_blocks([event], 101)
+
+        self.assertIn((1, 0), memory.temporary_blocked_cells)
+        self.assertNotIn((0, 0), memory.temporary_blocked_cells)
+        self.assertEqual(memory.pending_move_tick, 0)
+        self.assertFalse(memory.pending_move_destinations)
+
+    def test_move_failure_without_matching_plan_does_not_guess_destination(self):
+        worker_id = UUID(int=100)
+        memory = agent.AgentMemory(
+            pending_move_tick=99,
+            pending_move_destinations={worker_id: (1, 0)},
+        )
+        event = ResolutionEvent(
+            event_id=UUID(int=901),
+            tick=100,
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="MOVE_DESTINATION_OCCUPIED",
+            actor_id=worker_id,
+            position=(0, 0),
+        )
+
+        memory.observe_dynamic_blocks([event], 101)
+
+        self.assertFalse(memory.temporary_blocked_cells)
+
+    def test_plan_records_move_destination_for_next_tick(self):
+        worker = controlled_unit(100, UnitType.WORKER, (0, 0), cargo=1)
+        memory = agent.AgentMemory()
+
+        plan, _, memory = self.plan(
+            make_turn([worker], resources=10, tick=100),
+            memory,
+        )
+
+        action = plan.unit_actions[worker.id]
+        self.assertIsInstance(action, MoveAction)
+        delta = next(
+            step
+            for direction, step in agent.DIRECTION_STEPS
+            if direction is action.direction
+        )
+        self.assertEqual(memory.pending_move_tick, 100)
+        self.assertEqual(
+            memory.pending_move_destinations[worker.id],
+            agent.add((0, 0), delta),
+        )
 
 
 class HealingTests(AgentTestCase):

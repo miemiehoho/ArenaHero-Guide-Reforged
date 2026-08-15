@@ -719,7 +719,7 @@ def choose_flee_step(
 
 
 class FriendlyOccupancy:
-    """按每格最多两个友军单位跟踪本 Tick 的预计占位。"""
+    """按每格最多两个可占位实体跟踪本 Tick 的预计占位。"""
 
     def __init__(self, positions: Iterable[Pos] = ()) -> None:
         self._counts: Counter[Pos] = Counter(positions)
@@ -890,6 +890,10 @@ class AgentMemory:
     enemy_core_missing: set[UUID] = field(default_factory=set)
     known_resources: set[Pos] = field(default_factory=set)
     temporary_blocked_cells: dict[Pos, int] = field(default_factory=dict)
+    # 当前进程中上一 Tick 已提交的移动目的格；官方失败事件只返回原始位置，
+    # 只有保留这份上下文才能安全推导动态冲突格。进程重启后允许丢失一次关联。
+    pending_move_tick: int = 0
+    pending_move_destinations: dict[UUID, Pos] = field(default_factory=dict)
     known_combat_threats: dict[UUID, tuple[Pos, int]] = field(default_factory=dict)
 
     # Worker：撤退、侦察、资源搬运和临时拦截状态。
@@ -1922,21 +1926,54 @@ class AgentMemory:
         }
 
     def observe_dynamic_blocks(self, events, tick: int) -> None:
-        """短暂记住移动占位失败的格子，让单位临时绕行。"""
+        """根据上一 Tick 计划上下文记住动态移动冲突格。"""
         self.temporary_blocked_cells = {
             position: expiry
             for position, expiry in self.temporary_blocked_cells.items()
             if expiry > tick
         }
+        pending_destinations = self.pending_move_destinations
         for event in events:
             if (
                 event.event_type == "UNIT_MOVE_FAILED"
-                and event.reason_code == "MOVE_DESTINATION_OCCUPIED"
-                and event.position is not None
+                and event.tick == self.pending_move_tick
+                and event.actor_id in pending_destinations
+                and event.reason_code
+                in {
+                    "MOVE_CONTESTED",
+                    "MOVE_SWAP_BLOCKED",
+                    "MOVE_DESTINATION_OCCUPIED",
+                    "MOVE_DEPENDENCY_FAILED",
+                    "CELL_UNIT_LIMIT",
+                }
             ):
-                self.temporary_blocked_cells[tuple(event.position)] = (
-                    tick + TEMPORARY_BLOCK_TICKS
-                )
+                destination = pending_destinations[event.actor_id]
+                self.temporary_blocked_cells[destination] = tick + TEMPORARY_BLOCK_TICKS
+        self.pending_move_tick = 0
+        self.pending_move_destinations = {}
+
+    def record_planned_moves(self, turn) -> None:
+        """保存当前 Turn 的移动目的格，供下一份状态解释失败事件。"""
+        positions = {unit.id: tuple(unit.position) for unit in turn.units}
+        destinations: dict[UUID, Pos] = {}
+        for unit_id, action in turn.plan.unit_actions.items():
+            if not isinstance(action, MoveAction):
+                continue
+            start = positions.get(unit_id)
+            if start is None:
+                continue
+            delta = next(
+                (
+                    step
+                    for direction, step in DIRECTION_STEPS
+                    if direction is action.direction
+                ),
+                None,
+            )
+            if delta is not None:
+                destinations[unit_id] = add(start, delta)
+        self.pending_move_tick = turn.tick
+        self.pending_move_destinations = destinations
 
     def observe_spawn_blocks(self, events, tick: int) -> None:
         """出生格达到单位上限后短暂停产，并让家门口单位向外疏散。"""
@@ -3383,8 +3420,32 @@ def plan_workers(context: PlanningContext) -> None:
                         )
                         continue
 
-        # 状态 3：进入外圈扫描前先交付现有货物；Core 满仓时无法交付，
-        # 载货 Worker 也直接参加扫描。
+        # 迁移中的 Core 不能接收交付。载货 Worker 保留货物并在近家位置等待，
+        # 避免每 Tick 重复提交必然失败的 DEPOSIT 或堵住 Core 迁移路径。
+        if worker.cargo > 0 and turn.core.view.state is not CoreState.NORMAL:
+            destination, staging_goal = full_capacity_worker_destination(
+                context,
+                position,
+                worker_index,
+            )
+            if destination is not None and destination != position:
+                direction = direction_between(position, destination)
+                if direction is not None:
+                    worker.move(direction)
+                    occupied.add(destination)
+                    actions.append(
+                        f"{str(worker.id)[:8]} moving-core-stage "
+                        f"{staging_goal} {direction.value}"
+                    )
+                    continue
+            worker.wait()
+            occupied.add(position)
+            actions.append(
+                f"{str(worker.id)[:8]} moving-core-hold {staging_goal}"
+            )
+            continue
+
+        # 状态 3：进入外圈扫描前先交付现有货物；Core 满仓时无法交付。
         if worker.cargo > 0 and turn.resources < turn.resource_capacity:
             if position == context.core_pos:
                 worker.deposit()
@@ -6084,7 +6145,8 @@ def plan_turn(
     visible_enemy_unit_cells = {
         tuple(enemy.position) for enemy in turn.visible_enemies if enemy.kind == "UNIT"
     }
-    friendly_counts = Counter(friendly_positions)
+    # Core 也是可占位实体；这里的计数用于判断临时冲突格是否仍然满载。
+    friendly_counts = Counter((*friendly_positions, core_pos))
     for blocked_cell in list(memory.temporary_blocked_cells):
         if (
             friendly_counts.get(blocked_cell, 0) < 2
@@ -6137,7 +6199,8 @@ def plan_turn(
     )
 
     # 资源任务跨 Tick 保留；只有空载、无资源任务且不在撤退的 Worker 才空闲。
-    occupied = FriendlyOccupancy(tuple(unit.position) for unit in turn.units)
+    # 官方每格最多两个可占位实体，Core 自己已经占一个位置。
+    occupied = FriendlyOccupancy((core_pos, *friendly_positions))
     resource_workers = tuple(
         worker
         for worker in workers
@@ -6231,6 +6294,7 @@ def plan_turn(
     plan_vanguards(context)
     plan_rangers(context)
     plan_core_production(context, mode, target)
+    memory.record_planned_moves(turn)
 
     if (
         core_changed
