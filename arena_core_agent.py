@@ -30,6 +30,7 @@ from arena_hero import (
     TransportError,
     UnitView,
     UnitType,
+    core_resource_capacity,
     unit_cost,
 )
 from arena_hero.turn import Core, Ranger, Turn, Vanguard, Worker
@@ -111,6 +112,21 @@ class DefensePressure:
     @property
     def burst_required(self) -> bool:
         return self.level == "CRITICAL"
+
+
+@dataclass(frozen=True)
+class BurstPlan:
+    """给定 Worker 自毁数时，当前库存最多能支付的战斗生产序列。"""
+
+    sacrifice_count: int
+    start_population: int
+    retained_resources: int
+    spawn_types: tuple[UnitType, ...]
+    remaining_resources: int
+
+    @property
+    def spawn_count(self) -> int:
+        return len(self.spawn_types)
 
 
 _ACTIVE_PLANNING_METRICS: PlanningMetrics | None = None
@@ -325,6 +341,92 @@ def resource_scout_ring_sequence_for(worker_count: int) -> tuple[int, ...]:
 def resource_memory_radius_for(worker_count: int) -> int:
     """资源记忆至少保留旧 36 格基线，并覆盖当前最远普通搜索环。"""
     return max(RESOURCE_MEMORY_RADIUS, resource_scout_radii_for(worker_count)[-1])
+
+
+def next_combat_unit_type(
+    vanguard_count: int,
+    ranger_count: int,
+) -> UnitType:
+    """按现有 2V1R 编制返回下一名应补的战斗单位。"""
+    complete_squads = min(vanguard_count // SQUAD_VANGUARDS, ranger_count)
+    if vanguard_count < (complete_squads + 1) * SQUAD_VANGUARDS:
+        return UnitType.VANGUARD
+    if ranger_count < complete_squads + SQUAD_RANGERS:
+        return UnitType.RANGER
+    return UnitType.VANGUARD
+
+
+def simulate_burst_plan(
+    population: int,
+    resources: int,
+    vanguard_count: int,
+    ranger_count: int,
+    sacrifice_count: int = 0,
+) -> BurstPlan:
+    """模拟固定 Worker 自毁数下，当前库存可支付的战斗单位数量。"""
+    start_population = population - sacrifice_count
+    retained_resources = min(
+        resources,
+        core_resource_capacity(start_population),
+    )
+    remaining_resources = retained_resources
+    spawn_types: list[UnitType] = []
+    while True:
+        current_population = start_population + len(spawn_types)
+        unit_type = next_combat_unit_type(vanguard_count, ranger_count)
+        cost = unit_cost(unit_type, current_population)
+        if (
+            cost > remaining_resources
+            or cost > core_resource_capacity(current_population)
+        ):
+            break
+        remaining_resources -= cost
+        spawn_types.append(unit_type)
+        if unit_type is UnitType.VANGUARD:
+            vanguard_count += 1
+        else:
+            ranger_count += 1
+    return BurstPlan(
+        sacrifice_count=sacrifice_count,
+        start_population=start_population,
+        retained_resources=retained_resources,
+        spawn_types=tuple(spawn_types),
+        remaining_resources=remaining_resources,
+    )
+
+
+def choose_defense_burst_plan(
+    population: int,
+    resources: int,
+    worker_count: int,
+    vanguard_count: int,
+    ranger_count: int,
+    *,
+    minimum_workers: int = WORKER_REPLENISH_TARGET,
+    eligible_sacrifices: int | None = None,
+) -> BurstPlan:
+    """选择产量最多且只牺牲必要 Worker 的爆兵方案。"""
+    maximum_sacrifice = max(0, worker_count - minimum_workers)
+    if eligible_sacrifices is not None:
+        maximum_sacrifice = min(maximum_sacrifice, eligible_sacrifices)
+    candidates = (
+        simulate_burst_plan(
+            population,
+            resources,
+            vanguard_count,
+            ranger_count,
+            sacrifice_count,
+        )
+        for sacrifice_count in range(maximum_sacrifice + 1)
+    )
+    return max(
+        candidates,
+        key=lambda plan: (
+            plan.spawn_count,
+            -plan.sacrifice_count,
+            plan.remaining_resources,
+        ),
+    )
 
 
 def squad_patrol_radii_for(

@@ -906,6 +906,88 @@ class DefensePressureTests(AgentTestCase):
         self.assertEqual(statistics["近家防守单位数"], 1)
 
 
+class BurstPlannerTests(unittest.TestCase):
+    """动态价格、容量损失和 Worker 自毁候选的纯计算。"""
+
+    def test_n40_same_yield_keeps_all_workers(self):
+        plan = agent.choose_defense_burst_plan(
+            population=40,
+            resources=200,
+            worker_count=16,
+            vanguard_count=16,
+            ranger_count=8,
+        )
+        self.assertEqual(plan.sacrifice_count, 0)
+        self.assertEqual(plan.spawn_count, 5)
+
+    def test_n60_price_tier_makes_three_worker_sacrifices_profitable(self):
+        plan = agent.choose_defense_burst_plan(
+            population=60,
+            resources=300,
+            worker_count=15,
+            vanguard_count=30,
+            ranger_count=15,
+        )
+        self.assertEqual(plan.sacrifice_count, 3)
+        self.assertEqual(plan.spawn_count, 3)
+        self.assertEqual(plan.start_population, 57)
+
+    def test_n80_chooses_fewer_of_two_equal_yield_sacrifices(self):
+        plan = agent.choose_defense_burst_plan(
+            population=80,
+            resources=400,
+            worker_count=20,
+            vanguard_count=40,
+            ranger_count=20,
+        )
+        self.assertEqual(plan.spawn_count, 2)
+        self.assertEqual(plan.sacrifice_count, 7)
+
+    def test_capacity_overflow_is_removed_before_production(self):
+        plan = agent.simulate_burst_plan(
+            population=40,
+            resources=200,
+            vanguard_count=16,
+            ranger_count=8,
+            sacrifice_count=4,
+        )
+        self.assertEqual(plan.retained_resources, 180)
+        self.assertEqual(plan.spawn_count, 5)
+
+    def test_twelve_workers_or_fewer_never_enter_sacrifice_candidates(self):
+        plan = agent.choose_defense_burst_plan(
+            population=60,
+            resources=300,
+            worker_count=12,
+            vanguard_count=32,
+            ranger_count=16,
+        )
+        self.assertEqual(plan.sacrifice_count, 0)
+
+    def test_dynamic_price_and_capacity_can_stop_all_candidates(self):
+        plan = agent.choose_defense_burst_plan(
+            population=100,
+            resources=500,
+            worker_count=20,
+            vanguard_count=53,
+            ranger_count=27,
+        )
+        self.assertEqual(plan.spawn_count, 0)
+        self.assertEqual(plan.sacrifice_count, 0)
+
+    def test_sequence_follows_two_vanguard_one_ranger(self):
+        plan = agent.simulate_burst_plan(
+            population=20,
+            resources=42,
+            vanguard_count=0,
+            ranger_count=0,
+        )
+        self.assertEqual(
+            plan.spawn_types,
+            (UnitType.VANGUARD, UnitType.VANGUARD, UnitType.RANGER),
+        )
+
+
 class WorkerTests(AgentTestCase):
     """Worker 状态、Core 迁移和资源任务生命周期。"""
 
