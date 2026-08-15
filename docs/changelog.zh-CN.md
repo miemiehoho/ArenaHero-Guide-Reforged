@@ -22,6 +22,13 @@
 - Core 迁移期间让载货 Worker 近家待命，不再提交必然失败的 `DEPOSIT`。
 - 新增容量、迁移和移动失败上下文回归测试；离线测试总数增至 117 个。
 
+### 官方规则对齐优化阶段 A2（`e868de5`）
+
+- 按官方 `APIError.error` 矩阵区分当前 Tick 跳过、会话重启和致命停止。
+- `COMMAND_WINDOW_CLOSED`、`TICK_MISMATCH`、限流和 `TICK_NOT_READY` 不再为同一 Tick 重复提交。
+- `ProtocolError`、认证失败和 WebSocket `1008` 进入停止分支；新增错误矩阵回归测试，离线
+  测试总数增至 118 个。
+
 ### 高人口优化阶段 4（`3b55bc7`）
 
 - 为 `first_step_astar()` 增加当前 Tick 的短生命周期缓存。

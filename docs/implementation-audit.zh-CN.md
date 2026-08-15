@@ -7,7 +7,7 @@
 > `arena-hero-python` `423d252adcca439669adb3e7b04252e53b4430bd`、
 > `arena-hero-skill` `88fe8632a1dceeba58f57db5a0facfb5d5ef5a74`
 
-> 实施状态：阶段 A1 已完成（`99b7769`）；A2～A4 待实施，A5 保持可选。
+> 实施状态：阶段 A1（`99b7769`）和 A2（`e868de5`）已完成；A3～A4 待实施，A5 保持可选。
 
 ## 1. 审计结论
 
