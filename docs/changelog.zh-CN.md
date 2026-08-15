@@ -5,6 +5,20 @@
 
 ## 2026-08-16
 
+### 受击危险评估与爆兵优化
+
+- 新增 [受击危险评估与爆兵优化详细设计](defense-pressure-and-burst-production-design.zh-CN.md)
+  （`e2fe7de`），明确近家危险模型、官方自毁与生产结算顺序、动态价格目标函数、容量溢出和
+  分阶段边界。
+- 完成 B1 危险评估（`0a858fd`）：按 Core 12 格内敌我战斗单位、Core 损伤和 6 Tick 敌情记忆
+  输出 `NONE`、`PRESSURED`、`CRITICAL`，并写入中文 Tick 统计。
+- 完成 B2 爆兵经济优化器（`987494b`）：逐单位调用官方 `unit_cost()` 和
+  `core_resource_capacity()`，枚举 Worker 自毁数并比较产量、牺牲数、容量溢出和剩余资源。
+- 完成 B3 动作集成（`0e65608`）：`CRITICAL` 时绕过未满仓门槛；只有自毁能严格增加可生产
+  战斗单位数时，才在同 Tick 提交 Worker `SELF_DESTRUCT` 和 Core `SPAWN`。至少保留 12 名
+  Worker，不选择 Champion Beacon 携带者，Core 恢复、迁移和生产清理优先。
+- 新增 21 个危险评估、纯优化器和动作集成回归测试，fork 离线测试总数增至 165 个，全部通过。
+
 ### Worker 分区探索与战损补员
 
 - 新增 [Worker 分区探索与战损补员详细设计](worker-exploration-and-replenishment-design.zh-CN.md)
@@ -132,5 +146,5 @@
 
 ## 验证记录
 
-截至本日志最后一条记录，fork 离线测试共 144 个，全部通过；`compileall`、`git diff --check`
-和日志查询 CLI 检查也已通过。Worker 补员阶段代码提交为 `b18337b`。
+截至本日志最后一条记录，fork 离线测试共 165 个，全部通过；`compileall`、`git diff --check`
+和日志查询 CLI 检查也已通过。防守爆兵阶段代码提交为 `0e65608`。

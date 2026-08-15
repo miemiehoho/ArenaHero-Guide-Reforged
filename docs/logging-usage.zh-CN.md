@@ -44,6 +44,21 @@ python arena_log.py --log-dir /path/to/WorkingDirectory stats --json
 | `最新快照` | 区间最大 Tick 的兵种、人口、资源和容量快照 |
 | `事件类别数量` | 按官方事件前缀分类的事件数量，未知事件归入 `官方事件` |
 
+只查看最新 Tick 的各种兵种数量，可使用：
+
+```bash
+python arena_log.py stats --json \
+  | jq '.最新快照 | {Worker数, Vanguard数, Ranger数, 人口}'
+```
+
+其中 `Worker数`、`Vanguard数`、`Ranger数` 是当前存活数量，三者之和应等于该快照的 `人口`。
+查看一段 Tick 内的起点、终点、最小、最大和平均数量，则使用：
+
+```bash
+python arena_log.py stats --from-tick 10000 --to-tick 10583 --json \
+  | jq '.兵种数量'
+```
+
 例如使用 `jq` 只查看当前区间的兵种和资源：
 
 ```bash
@@ -55,9 +70,17 @@ PowerShell 可以直接读取 JSON：
 
 ```powershell
 $summary = python arena_log.py stats --json | ConvertFrom-Json
-$summary.最新快照
+$summary.最新快照 | Select-Object Worker数, Vanguard数, Ranger数, 人口
 $summary.兵种数量
 $summary.资源统计
+```
+
+只读取三个当前数量也可以直接执行：
+
+```powershell
+$summary.最新快照.Worker数
+$summary.最新快照.Vanguard数
+$summary.最新快照.Ranger数
 ```
 
 如果终端中文显示异常，可先设置当前 PowerShell 会话的输出编码：
