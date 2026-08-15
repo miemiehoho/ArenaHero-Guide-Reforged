@@ -796,6 +796,116 @@ class ProductionTests(AgentTestCase):
         self.assertIsNone(plan.core_action)
 
 
+class DefensePressureTests(AgentTestCase):
+    """Core 近家危险分级和短期敌情记忆。"""
+
+    @staticmethod
+    def pressure(
+        *,
+        enemies=(),
+        defenders=(),
+        known_threats=None,
+        tick=100,
+        core_hp=5,
+        core_shield=5,
+    ):
+        turn = make_turn(
+            [*defenders],
+            enemies=enemies,
+            tick=tick,
+            core_hp=core_hp,
+            core_shield=core_shield,
+        )
+        return agent.defense_pressure_for(
+            turn.core,
+            turn.visible_enemies,
+            [
+                unit
+                for unit in turn.vanguards + turn.rangers
+            ],
+            known_threats or {},
+            tick,
+        )
+
+    def test_no_nearby_enemy_is_none(self):
+        pressure = self.pressure(
+            enemies=[enemy_unit(401, UnitType.VANGUARD, (20, 0))],
+            defenders=[controlled_unit(501, UnitType.VANGUARD, (2, 0))],
+        )
+        self.assertEqual(pressure.level, "NONE")
+        self.assertEqual(pressure.enemy_count, 0)
+
+    def test_one_enemy_without_local_advantage_is_pressured_not_burst(self):
+        pressure = self.pressure(
+            enemies=[enemy_unit(401, UnitType.RANGER, (8, 0))],
+            defenders=[controlled_unit(501, UnitType.VANGUARD, (2, 0))],
+        )
+        self.assertEqual(pressure.level, "PRESSURED")
+        self.assertFalse(pressure.burst_required)
+
+    def test_many_enemies_against_thin_defense_is_critical(self):
+        pressure = self.pressure(
+            enemies=[
+                enemy_unit(401, UnitType.VANGUARD, (8, 0)),
+                enemy_unit(402, UnitType.VANGUARD, (8, 1)),
+                enemy_unit(403, UnitType.RANGER, (8, 2)),
+            ],
+            defenders=[controlled_unit(501, UnitType.VANGUARD, (2, 0))],
+        )
+        self.assertEqual(pressure.level, "CRITICAL")
+        self.assertEqual(pressure.enemy_count, 3)
+        self.assertEqual(pressure.defender_count, 1)
+
+    def test_damaged_core_with_two_enemies_is_critical(self):
+        pressure = self.pressure(
+            enemies=[
+                enemy_unit(401, UnitType.VANGUARD, (8, 0)),
+                enemy_unit(402, UnitType.RANGER, (8, 1)),
+            ],
+            defenders=[
+                controlled_unit(501, UnitType.VANGUARD, (2, 0)),
+                controlled_unit(502, UnitType.RANGER, (2, 1)),
+            ],
+            core_hp=4,
+        )
+        self.assertEqual(pressure.level, "CRITICAL")
+        self.assertTrue(pressure.core_damaged)
+
+    def test_visible_and_remembered_threats_deduplicate_and_expire(self):
+        visible = enemy_unit(401, UnitType.VANGUARD, (8, 0))
+        pressure = self.pressure(
+            enemies=[visible],
+            known_threats={
+                visible.id: ((8, 0), 100),
+                UUID(int=402): ((7, 1), 100),
+            },
+        )
+        self.assertEqual(pressure.enemy_count, 2)
+
+        expired = self.pressure(
+            known_threats={UUID(int=402): ((7, 1), 100)},
+            tick=107,
+        )
+        self.assertEqual(expired.level, "NONE")
+        self.assertEqual(expired.enemy_count, 0)
+
+    def test_plan_statistics_include_defense_pressure(self):
+        turn = make_turn(
+            [controlled_unit(501, UnitType.VANGUARD, (2, 0))],
+            enemies=[
+                enemy_unit(401, UnitType.VANGUARD, (8, 0)),
+                enemy_unit(402, UnitType.VANGUARD, (8, 1)),
+                enemy_unit(403, UnitType.RANGER, (8, 2)),
+            ],
+        )
+        memory = agent.AgentMemory()
+        self.plan(turn, memory)
+        statistics = agent.turn_statistics(turn, memory, False)
+        self.assertEqual(statistics["防御危险等级"], "CRITICAL")
+        self.assertEqual(statistics["近家敌方战斗单位数"], 3)
+        self.assertEqual(statistics["近家防守单位数"], 1)
+
+
 class WorkerTests(AgentTestCase):
     """Worker 状态、Core 迁移和资源任务生命周期。"""
 

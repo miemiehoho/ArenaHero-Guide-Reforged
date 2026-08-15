@@ -69,6 +69,10 @@ class PlanningMetrics:
     active_wave_id: int | None = None
     production_status: str = "IDLE"
     production_wait_reason: str | None = None
+    defense_level: str = "NONE"
+    defense_enemy_count: int = 0
+    defense_defender_count: int = 0
+    defense_core_damaged: bool = False
     astar_cache: dict[tuple, Pos | None] = field(
         default_factory=dict,
         repr=False,
@@ -95,6 +99,20 @@ class TargetReservation:
     reserved_unit_ids: set[UUID] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class DefensePressure:
+    """Core 近家战斗压力；只由当前状态和短期敌情记忆派生。"""
+
+    level: str
+    enemy_count: int
+    defender_count: int
+    core_damaged: bool
+
+    @property
+    def burst_required(self) -> bool:
+        return self.level == "CRITICAL"
+
+
 _ACTIVE_PLANNING_METRICS: PlanningMetrics | None = None
 
 
@@ -111,6 +129,59 @@ def planning_deadline_exceeded(section: str) -> bool:
     if section not in metrics.degraded_sections:
         metrics.degraded_sections.append(section)
     return True
+
+
+def defense_pressure_for(
+    core: Core,
+    visible_enemies: Iterable[UnitView | CoreView],
+    defenders: Iterable[Vanguard | Ranger],
+    known_combat_threats: Mapping[UUID, tuple[Pos, int]],
+    tick: int,
+) -> DefensePressure:
+    """按 Core 12 格近家敌我数量和 Core 损伤分级，不猜测隐藏兵力。"""
+    core_position = tuple(core.position)
+    visible_combat = {
+        enemy.id: enemy
+        for enemy in visible_enemies
+        if (
+            enemy.kind == "UNIT"
+            and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
+            and manhattan(core_position, tuple(enemy.position)) <= HOME_ENGAGE_RADIUS
+        )
+    }
+    enemy_ids = set(visible_combat)
+    enemy_count = len(visible_combat)
+    for enemy_id, (position, seen_tick) in known_combat_threats.items():
+        if enemy_id in enemy_ids or seen_tick < tick - COMBAT_THREAT_MEMORY_TICKS:
+            continue
+        if manhattan(core_position, position) <= HOME_ENGAGE_RADIUS:
+            enemy_count += 1
+
+    defender_count = sum(
+        1
+        for unit in defenders
+        if manhattan(core_position, tuple(unit.position)) <= HOME_ENGAGE_RADIUS
+    )
+    core_damaged = core.hp < CORE_MAX_HP or core.shield < CORE_SHIELD_MAX
+    pressured = enemy_count > 0 and (
+        enemy_count >= max(1, defender_count) or core_damaged
+    )
+    critical = (
+        enemy_count >= 3 and enemy_count > defender_count
+    ) or (
+        enemy_count >= 2 and defender_count == 0
+    ) or (
+        core_damaged
+        and enemy_count >= 2
+        and enemy_count >= defender_count
+    )
+    level = "CRITICAL" if critical else "PRESSURED" if pressured else "NONE"
+    return DefensePressure(
+        level=level,
+        enemy_count=enemy_count,
+        defender_count=defender_count,
+        core_damaged=core_damaged,
+    )
 
 DIRECTION_STEPS: tuple[tuple[Direction, Pos], ...] = (
     (Direction.UP, (0, -1)),
@@ -2685,6 +2756,7 @@ class PlanningContext:
     spawn_clearing: bool
     outer_scout_active: bool
     healing_resources: int
+    defense_pressure: DefensePressure
     actions: list[str]
 
 
@@ -6434,6 +6506,17 @@ def plan_turn(
         for enemy in safe_enemy_units
         if manhattan(core_pos, tuple(enemy.position)) <= HOME_ENGAGE_RADIUS
     )
+    defense_pressure = defense_pressure_for(
+        turn.core,
+        turn.visible_enemies,
+        (*vanguards, *rangers),
+        memory.known_combat_threats,
+        turn.tick,
+    )
+    metrics.defense_level = defense_pressure.level
+    metrics.defense_enemy_count = defense_pressure.enemy_count
+    metrics.defense_defender_count = defense_pressure.defender_count
+    metrics.defense_core_damaged = defense_pressure.core_damaged
     target_reservations = build_target_reservations(
         (*safe_enemy_units, *visible_enemy_cores),
         urgent_target_ids=(enemy.id for enemy in home_combat_targets),
@@ -6527,6 +6610,7 @@ def plan_turn(
         spawn_clearing=turn.tick < memory.spawn_clear_until,
         outer_scout_active=outer_scout_active,
         healing_resources=turn.resources,
+        defense_pressure=defense_pressure,
         actions=actions,
     )
     search_changed = update_and_assign_search_missions(context)
@@ -6600,6 +6684,10 @@ def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, objec
         "预算耗尽": False,
         "降级模块": [],
         "生产状态": memory.production_status,
+        "防御危险等级": "NONE",
+        "近家敌方战斗单位数": 0,
+        "近家防守单位数": 0,
+        "Core受损": False,
     }
     if metrics is not None:
         metric_data.update(
@@ -6613,6 +6701,10 @@ def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, objec
                 "预算耗尽": metrics.deadline_exceeded,
                 "降级模块": list(metrics.degraded_sections),
                 "生产状态": metrics.production_status,
+                "防御危险等级": metrics.defense_level,
+                "近家敌方战斗单位数": metrics.defense_enemy_count,
+                "近家防守单位数": metrics.defense_defender_count,
+                "Core受损": metrics.defense_core_damaged,
             }
         )
     return {
