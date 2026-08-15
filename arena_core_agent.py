@@ -5,12 +5,12 @@ from collections import Counter
 import heapq
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Mapping
 from uuid import UUID
 
 from arena_hero import (
@@ -33,6 +33,15 @@ from arena_hero import (
     unit_cost,
 )
 from arena_hero.turn import Core, Ranger, Turn, Vanguard, Worker
+
+from arena_log import (
+    LOG_FILE_NAME,
+    configure_logger,
+    event_message,
+    event_record_data,
+    new_run_id,
+    write_record,
+)
 
 
 Pos = tuple[int, int]
@@ -221,8 +230,6 @@ RESOURCE_LOAD_COST = 3
 COMBAT_THREAT_MEMORY_TICKS = 6
 STATE_SAVE_INTERVAL_TICKS = 10
 STATE_VERSION = 9
-LOG_MAX_BYTES = 2 * 1024 * 1024
-LOG_BACKUP_COUNT = 4
 
 
 def squad_patrol_radii_for(
@@ -325,7 +332,7 @@ STATE_PATH = os.path.join(
 STATE_TEMP_PATH = f"{STATE_PATH}.tmp"
 LOG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "arena_core_agent.rotating.log",
+    LOG_FILE_NAME,
 )
 
 
@@ -6408,21 +6415,107 @@ def plan_turn(
     return actions, False
 
 
-def event_summary(turn) -> str:
-    if not turn.events:
-        return ""
-    rendered = []
-    for event in turn.events:
-        amount = event.resource_amount
-        suffix = f":{amount}" if amount is not None else ""
-        reason = f"/{event.reason_code}" if event.reason_code else ""
-        position = (
-            f"@{tuple(event.position)}"
-            if event.event_type == "UNIT_MOVE_FAILED" and event.position is not None
-            else ""
+ACTION_NAMES_ZH = {
+    "MoveAction": "移动",
+    "HarvestAction": "采集",
+    "DepositAction": "交付",
+    "SweepAction": "横扫",
+    "ShootAction": "射击",
+    "HealAction": "治疗",
+    "SpawnAction": "生产",
+    "RepairShieldAction": "修盾",
+    "WaitAction": "等待",
+    "StartMoveAction": "开始迁移",
+    "CancelMoveAction": "取消迁移",
+    "PickupBeaconAction": "拾取信标",
+    "DropBeaconAction": "放下信标",
+    "SelfDestructAction": "自毁",
+}
+
+
+def action_counts(turn) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for action in turn.plan.unit_actions.values():
+        name = ACTION_NAMES_ZH.get(type(action).__name__, type(action).__name__)
+        counts[name] += 1
+    if turn.plan.core_action is not None:
+        name = ACTION_NAMES_ZH.get(
+            type(turn.plan.core_action).__name__,
+            type(turn.plan.core_action).__name__,
         )
-        rendered.append(f"{event.event_type}{reason}{position}{suffix}")
-    return ",".join(rendered)
+        counts[f"Core-{name}"] += 1
+    return dict(sorted(counts.items()))
+
+
+def turn_statistics(turn, memory: AgentMemory, reached: bool) -> dict[str, object]:
+    metrics = memory.last_plan_metrics
+    core = turn.core
+    metric_data: dict[str, object] = {
+        "决策耗时毫秒": 0,
+        "A星调用次数": 0,
+        "A星扩展次数": 0,
+        "A星缓存命中": 0,
+        "搜索缓存命中": 0,
+        "A星预算耗尽": 0,
+        "预算耗尽": False,
+        "降级模块": [],
+        "生产状态": memory.production_status,
+    }
+    if metrics is not None:
+        metric_data.update(
+            {
+                "决策耗时毫秒": round(metrics.decision_ms, 3),
+                "A星调用次数": metrics.astar_calls,
+                "A星扩展次数": metrics.astar_expansions,
+                "A星缓存命中": metrics.astar_cache_hits,
+                "搜索缓存命中": metrics.search_coverage_cache_hits,
+                "A星预算耗尽": metrics.astar_budget_exhausted,
+                "预算耗尽": metrics.deadline_exceeded,
+                "降级模块": list(metrics.degraded_sections),
+                "生产状态": metrics.production_status,
+            }
+        )
+    return {
+        "玩家状态": turn.state.status.value,
+        "资源": turn.resources,
+        "容量": turn.resource_capacity,
+        "人口": turn.state.population,
+        "Core位置": None if core is None else tuple(core.position),
+        "CoreHP": None if core is None else core.hp,
+        "Core护盾": None if core is None else core.shield,
+        "Core状态": None if core is None else core.view.state.value,
+        "Worker数": len(turn.workers),
+        "Vanguard数": len(turn.vanguards),
+        "Ranger数": len(turn.rangers),
+        "可见敌人数": len(turn.visible_enemies),
+        "已知敌方Core数": len(memory.known_enemy_cores),
+        "已知资源数": len(memory.known_resources),
+        "资源任务数": len(memory.worker_resource_target),
+        "临时阻塞数": len(memory.temporary_blocked_cells),
+        "彻查任务数": len(memory.squad_search_missions),
+        "事件数量": dict(Counter(event.event_type for event in turn.events)),
+        "动作数量": action_counts(turn),
+        "达到目标": reached,
+        **metric_data,
+    }
+
+
+def log_turn_events(logger: logging.Logger, turn, memory: AgentMemory) -> None:
+    for event in turn.events:
+        destination = None
+        if (
+            event.event_type == "UNIT_MOVE_FAILED"
+            and event.actor_id is not None
+            and event.tick == memory.pending_move_tick
+        ):
+            destination = memory.pending_move_destinations.get(event.actor_id)
+        write_record(
+            logger,
+            "事件",
+            event_message(event.event_type, event.reason_code),
+            tick=event.tick,
+            data=event_record_data(event, agent_destination=destination),
+        )
 
 
 def submission_error_disposition(error: APIError) -> str:
@@ -6440,56 +6533,66 @@ def submission_error_disposition(error: APIError) -> str:
     return "FATAL"
 
 
-def configure_run_logger() -> logging.Logger:
-    """创建按大小轮转的进程日志，且不记录 API Key。"""
-    logger = logging.getLogger("arena_core_agent")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    logger.handlers.clear()
-    handler = RotatingFileHandler(
-        LOG_PATH,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
-    return logger
+def configure_run_logger(run_id: str, mode: str) -> logging.Logger:
+    """创建中文 JSONL 日志；日志不可用时不阻塞 Agent 主循环。"""
+    try:
+        return configure_logger(Path(LOG_PATH), run_id=run_id, mode=mode)
+    except OSError as exc:
+        logger = logging.getLogger(f"arena_core_agent.fallback.{run_id}")
+        logger.handlers.clear()
+        logger.addHandler(logging.NullHandler())
+        logger.run_id = run_id  # type: ignore[attr-defined]
+        logger.mode = mode  # type: ignore[attr-defined]
+        print(f"警告：无法创建日志文件，将只输出控制台：{exc}", file=sys.stderr, flush=True)
+        return logger
 
 
-def emit(logger: logging.Logger, message: str, *, error: bool = False) -> None:
+def emit(
+    logger: logging.Logger,
+    message: str,
+    *,
+    error: bool = False,
+    category: str = "生命周期",
+    tick: int | None = None,
+    data: Mapping[str, object] | None = None,
+) -> None:
     print(message, file=sys.stderr if error else sys.stdout, flush=True)
-    (logger.error if error else logger.info)(message)
+    write_record(logger, category, message, tick=tick, data=data, error=error)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the Arena Hero harvesting or long-term control Agent."
+        description="运行 Arena Hero 采集或长期控制 Agent。"
     )
     parser.add_argument(
         "--mode",
         choices=("control", "harvest"),
         default="control",
-        help="control runs indefinitely; harvest exits at --target",
+        help="control 持续运行；harvest 达到 --target 后退出",
     )
     parser.add_argument("--target", type=int, default=30)
     args = parser.parse_args()
 
-    logger = configure_run_logger()
+    run_id = new_run_id()
+    logger = configure_run_logger(run_id, args.mode)
     load_local_env()
     api_key = os.environ.get("ARENA_HERO_API_KEY", "").strip()
     if not api_key:
-        emit(logger, "ARENA_HERO_API_KEY is not set", error=True)
+        emit(logger, "未配置 ARENA_HERO_API_KEY", error=True, category="错误")
         return 2
     if args.mode == "harvest" and args.target < 1:
-        emit(logger, "target must be positive", error=True)
+        emit(logger, "采集目标必须为正数", error=True, category="错误")
         return 2
     memory = AgentMemory.restore(load_persistent_state())
     emit(
         logger,
-        f"agent start mode={args.mode} target={args.target} "
-        f"auto_reconnect=true time_limit=none "
-        f"known_resources={len(memory.known_resources)}",
+        f"Agent 已启动：模式={args.mode}，目标={args.target}",
+        data={
+            "运行ID": run_id,
+            "自动重连": True,
+            "已知资源数": len(memory.known_resources),
+            "日志文件": LOG_PATH,
+        },
     )
 
     reconnect_delay = 1.0
@@ -6503,74 +6606,43 @@ def main() -> int:
                         if turn.tick <= skipped_tick:
                             continue
                         skipped_tick = None
-                    events = event_summary(turn)
+                    log_turn_events(logger, turn, memory)
                     actions, reached = plan_turn(
                         turn,
                         memory,
                         target=args.target,
                         mode=args.mode,
                     )
-                    core_label = (
-                        "none" if turn.core is None else str(tuple(turn.core.position))
-                    )
-                    target_summary = (
-                        ",".join(
-                            f"{str(worker_id)[:8]}:{position}"
-                            for worker_id, position in sorted(
-                                memory.worker_resource_target.items(),
-                                key=lambda item: str(item[0]),
-                            )
-                        )
-                        or "none"
-                    )
-                    metrics = memory.last_plan_metrics
-                    metrics_summary = (
-                        "none"
-                        if metrics is None
-                        else (
-                            f"decision_ms={metrics.decision_ms:.2f} "
-                            f"astar_calls={metrics.astar_calls} "
-                            f"astar_expansions={metrics.astar_expansions} "
-                            f"astar_cache_hits={metrics.astar_cache_hits} "
-                            f"search_cache_hits={metrics.search_coverage_cache_hits} "
-                            f"astar_budget_exhausted={metrics.astar_budget_exhausted} "
-                            f"deadline_exceeded={str(metrics.deadline_exceeded).lower()} "
-                            f"degraded_sections="
-                            f"{','.join(metrics.degraded_sections) or 'none'} "
-                            f"production={metrics.production_status}"
-                        )
+                    statistics = turn_statistics(turn, memory, reached)
+                    emit(
+                        logger,
+                        f"Tick {turn.tick} 统计已记录：资源={turn.resources}/{turn.resource_capacity}，"
+                        f"人口={turn.state.population}，动作={sum(statistics['动作数量'].values())}",
+                        category="统计",
+                        tick=turn.tick,
+                        data=statistics,
                     )
                     emit(
                         logger,
-                        f"tick={turn.tick} status={turn.state.status.value} "
-                        f"core={core_label} resources={turn.resources}/{turn.resource_capacity} "
-                        f"population={turn.state.population} workers={len(turn.workers)} "
-                        f"vanguards={len(turn.vanguards)} rangers={len(turn.rangers)} "
-                        f"visible_resources={len(turn.resource_cells)} "
-                        f"known_resources={len(memory.known_resources)} "
-                        f"resource_targets={len(memory.worker_resource_target)} "
-                        f"target_map=[{target_summary}] "
-                        f"resource_deferred={len(memory.resource_deferred_until)} "
-                        f"temporary_blocks={len(memory.temporary_blocked_cells)} "
-                        f"expanded_low_yield="
-                        f"{','.join(sorted(str(worker_id)[:8] for worker_id in memory.expanded_low_yield)) or 'none'} "
-                        f"home_vanguard="
-                        f"{str(memory.home_vanguard_id)[:8] if memory.home_vanguard_id else 'none'} "
-                        f"home_ranger="
-                        f"{str(memory.home_ranger_id)[:8] if memory.home_ranger_id else 'none'} "
-                        f"enemy_cores={len(memory.known_enemy_cores)} "
-                        f"enemy_cores_missing={len(memory.enemy_core_missing)} "
-                        f"squad_searches={len(memory.squad_search_missions)} "
-                        f"enemy_worker_tracks={len(memory.enemy_worker_tracks)} "
-                        f"metrics=[{metrics_summary}] "
-                        f"events=[{events}]",
+                        f"Tick {turn.tick} 决策已生成：{len(actions)} 条策略动作",
+                        category="决策",
+                        tick=turn.tick,
+                        data={
+                            "动作数量": statistics["动作数量"],
+                            "动作标签": actions,
+                            "Core动作": None
+                            if turn.plan.core_action is None
+                            else type(turn.plan.core_action).__name__,
+                        },
                     )
 
                     if reached:
                         emit(
                             logger,
-                            f"TARGET_REACHED resources={turn.resources} "
-                            f"capacity={turn.resource_capacity} tick={turn.tick}",
+                            f"已达到采集目标：资源={turn.resources}/{turn.resource_capacity}",
+                            category="目标",
+                            tick=turn.tick,
+                            data={"资源": turn.resources, "容量": turn.resource_capacity},
                         )
                         return 0
 
@@ -6584,18 +6656,27 @@ def main() -> int:
                             skipped_tick = turn.tick
                             emit(
                                 logger,
-                                f"TICK_SKIPPED tick={turn.tick} "
-                                f"error={exc.error} detail={exc}",
+                                f"已跳过 Tick {turn.tick}：官方错误 {exc.error}",
                                 error=True,
+                                category="提交",
+                                tick=turn.tick,
+                                data={
+                                    "状态": "跳过当前Tick",
+                                    "错误代码": exc.error,
+                                    "HTTP状态": exc.status_code,
+                                },
                             )
                             continue
                         raise
                     emit(
                         logger,
-                        "actions=" + ("; ".join(actions) if actions else "WAIT"),
+                        f"Tick {turn.tick} 提交已接受",
+                        category="提交",
+                        tick=turn.tick,
+                        data={"状态": "已接受", "动作数量": statistics["动作数量"]},
                     )
 
-            raise TransportError("event stream ended unexpectedly")
+            raise TransportError("事件流意外结束")
         except (
             AuthenticationError,
             ConfigurationError,
@@ -6605,8 +6686,10 @@ def main() -> int:
         ) as exc:
             emit(
                 logger,
-                f"FATAL_ERROR type={type(exc).__name__} detail={exc}",
+                f"致命错误：{type(exc).__name__}：{exc}",
                 error=True,
+                category="错误",
+                data={"异常类型": type(exc).__name__},
             )
             return 5
         except APIError as exc:
@@ -6614,22 +6697,40 @@ def main() -> int:
             if disposition != "RESTART_SESSION":
                 emit(
                     logger,
-                    f"FATAL_API_ERROR status={exc.status_code} detail={exc}",
+                    f"致命 API 错误：HTTP {exc.status_code}：{exc}",
                     error=True,
+                    category="错误",
+                    data={
+                        "异常类型": type(exc).__name__,
+                        "HTTP状态": exc.status_code,
+                        "错误代码": exc.error,
+                    },
                 )
                 return 5
             emit(
                 logger,
-                f"RECOVERABLE_API_ERROR status={exc.status_code} "
-                f"retry_in={reconnect_delay:g}s detail={exc}",
+                f"可恢复 API 错误：HTTP {exc.status_code}，将在 {reconnect_delay:g} 秒后重连",
                 error=True,
+                category="错误",
+                data={
+                    "异常类型": type(exc).__name__,
+                    "HTTP状态": exc.status_code,
+                    "错误代码": exc.error,
+                    "处理方式": "重启会话",
+                    "退避秒数": reconnect_delay,
+                },
             )
         except (TransportError, OSError, TimeoutError) as exc:
             emit(
                 logger,
-                f"SESSION_RESTART type={type(exc).__name__} "
-                f"retry_in={reconnect_delay:g}s detail={exc}",
+                f"会话将重启：{type(exc).__name__}，将在 {reconnect_delay:g} 秒后重连：{exc}",
                 error=True,
+                category="错误",
+                data={
+                    "异常类型": type(exc).__name__,
+                    "处理方式": "重启会话",
+                    "退避秒数": reconnect_delay,
+                },
             )
 
         time.sleep(reconnect_delay)

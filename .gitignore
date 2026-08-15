@@ -6,5 +6,6 @@ __pycache__/
 .ruff_cache/
 .coverage
 arena_core_agent*.log*
+arena_core_agent*.jsonl*
 .arena_core_state.json
 .arena_core_state.json.tmp

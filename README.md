@@ -148,6 +148,22 @@ Core，才删除记录；彻查不完整则保留记录并在冷却后重试。�
 systemctl --user status arena-core-agent.service
 ```
 
+### 查询中文日志
+
+Agent 默认将 UTF-8 中文结构化日志写入 `arena_core_agent.jsonl`，并按大小保留轮转文件；日志不
+包含 API Key 或完整状态快照。查询命令不连接服务端：
+
+```bash
+python arena_log.py tail --limit 50
+python arena_log.py events --type UNIT_MOVE_FAILED --reason CELL_UNIT_LIMIT
+python arena_log.py stats --from-tick 10000 --to-tick 10583
+python arena_log.py errors --limit 100
+```
+
+需要查询已部署目录时，在该目录执行命令，或使用 `--log-dir /path/to/the/WorkingDirectory`。
+`events` 保留官方 `event_type`、`reason_code` 和事件值；`stats` 汇总资源、动作、事件、耗时、
+生产状态和规划预算。
+
 ### 更新已部署实例
 
 服务文件中的 `WorkingDirectory`、`EnvironmentFile` 和 `ExecStart` 决定实际运行目录；项目
