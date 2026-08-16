@@ -44,11 +44,11 @@ python arena_log.py --log-dir /path/to/WorkingDirectory stats --json
 | `最新快照` | 区间最大 Tick 的兵种、人口、资源和容量快照 |
 | `事件类别数量` | 按官方事件前缀分类的事件数量，未知事件归入 `官方事件` |
 
-只查看最新 Tick 的各种兵种数量，可使用：
+只查看最新 Tick 的各种兵种数量，不依赖额外安装的 `jq`，可使用 Python 标准库：
 
 ```bash
 python arena_log.py stats --json \
-  | jq '.最新快照 | {Worker数, Vanguard数, Ranger数, 人口}'
+  | python -c 'import json,sys; s=json.load(sys.stdin)["最新快照"]; print(json.dumps({k:s.get(k) for k in ("Worker数","Vanguard数","Ranger数","人口")}, ensure_ascii=False, indent=2))'
 ```
 
 其中 `Worker数`、`Vanguard数`、`Ranger数` 是当前存活数量，三者之和应等于该快照的 `人口`。
@@ -56,15 +56,17 @@ python arena_log.py stats --json \
 
 ```bash
 python arena_log.py stats --from-tick 10000 --to-tick 10583 --json \
-  | jq '.兵种数量'
+  | python -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["兵种数量"], ensure_ascii=False, indent=2))'
 ```
 
-例如使用 `jq` 只查看当前区间的兵种和资源：
+如果系统已经安装 `jq`，也可以使用下面的等价写法：
 
 ```bash
 python arena_log.py stats --from-tick 10000 --to-tick 10583 --json \
   | jq '{最新快照, 兵种数量, 人口统计, 资源统计}'
 ```
+
+`jq` 不是项目运行依赖；Bohrium 等精简容器优先使用上面的 Python 命令即可。
 
 PowerShell 可以直接读取 JSON：
 
