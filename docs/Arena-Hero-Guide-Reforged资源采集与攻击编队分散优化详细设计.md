@@ -1,13 +1,13 @@
 # Arena Hero Guide Reforged 资源采集与攻击编队分散优化详细设计
 
-> 文档状态：实施中
+> 文档状态：已完成（无需发布）
 > 目标项目：`agent-projects/ArenaHero-Guide-Reforged`
 > 官方基线：Arena Hero 规则 `v0.14`、API `v0.1`、Python SDK `0.2.9`
 > 发布影响：`none`
 
 ## 1. 背景和目标
 
-根据 [Arena Hero Guide Reforged Bohrium 部署教程](../../third-party-project-deployment/miemiehoho-arena-hero-guide-reforged-bohrium.zh-CN.md) 长期运行数场战争后，出现两类策略退化：
+根据 [Arena Hero Guide Reforged Bohrium 部署教程](../../../docs/third-party-project-deployment/miemiehoho-arena-hero-guide-reforged-bohrium.zh-CN.md) 长期运行数场战争后，出现两类策略退化：
 
 1. Worker 围绕己方 Core 聚集，远处资源搜索和采集明显减少；
 2. Vanguard/Ranger 围绕己方 Core 或同一个集结点聚集，攻击单位没有保持野战间距。
@@ -21,7 +21,7 @@
 - Ranger 只能沿横线、竖线或精确 45 度斜线在 1-3 格射击，Unit/Core 不阻挡射线，障碍物阻挡射线。
 - 每 Tick 收到完整 state 后重新计算完整计划；旧 Turn 不跨 Tick 复用。
 
-来源：[`docs/official/arena-hero-official-reference.zh-CN.md`](../../official/arena-hero-official-reference.zh-CN.md) 和官方三个子模块。
+来源：[`docs/official/arena-hero-official-reference.zh-CN.md`](../../../docs/official/arena-hero-official-reference.zh-CN.md) 和官方三个子模块。
 
 ## 3. 现状根因
 
@@ -70,3 +70,9 @@
 ## 7. 回滚和发布边界
 
 每个阶段在目标嵌套仓库建立独立 commit 并推送远端分支，阶段之间可直接回退到上一 commit。根仓库只提交本设计和任务记录。本阶段发布影响为 `none`，不创建 ArenaHero-Nexus 稳定 tag，不修改 Docker 镜像和用户凭据。
+
+## 8. 实施记录
+
+- 阶段 A（`36fbdf0`）：当前 Tick 可见资源直接进入候选分配；Worker 搜索目标避开本 Tick 友军占位，A* 首步失败时换用下一环点，连续失败记录 `scout-blocked`；新增资源和远程搜索回归测试。
+- 阶段 B（`e02ee16`）：Rally 仅作用于活动攻击波；非活动小队继续 `squad-patrol`；按小队编号轮换敌方目标接近格，Ranger 优先合法射击位并排除己方 Core；新增攻击分散回归测试。
+- 阶段 C：未新增持久化字段，v10 状态格式保持兼容；README 与更新日志已同步，最终离线测试 171 项全部通过。
