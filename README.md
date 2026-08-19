@@ -27,6 +27,7 @@ fork 的 Arena Hero 长期控制 Agent，面向官方游戏规则 v0.14 继续�
 - [中文日志使用说明](docs/logging-usage.zh-CN.md)
 - [Worker 分区探索与战损补员详细设计](docs/worker-exploration-and-replenishment-design.zh-CN.md)
 - [受击危险评估与爆兵优化详细设计](docs/defense-pressure-and-burst-production-design.zh-CN.md)
+- [资源采集与攻击编队分散优化详细设计](docs/Arena-Hero-Guide-Reforged资源采集与攻击编队分散优化详细设计.md)
 
 ## 当前策略
 
