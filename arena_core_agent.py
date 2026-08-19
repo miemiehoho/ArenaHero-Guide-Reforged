@@ -4106,6 +4106,47 @@ def combat_approach_step(
     return None
 
 
+def squad_attack_approach_cells(
+    target: Pos,
+    squad_id: int,
+    formation_slot: int = 0,
+) -> tuple[Pos, ...]:
+    """按小队编号轮换目标四周接近格，避免多队长期争抢同一入口。"""
+    start_index = (squad_id + formation_slot) % len(DIRECTION_STEPS)
+    rotated_steps = (
+        DIRECTION_STEPS[start_index:]
+        + DIRECTION_STEPS[:start_index]
+    )
+    return tuple(add(target, delta) for _, delta in rotated_steps)
+
+
+def squad_combat_approach_step(
+    context: PlanningContext,
+    position: Pos,
+    target: Pos,
+    obstacles: set[Pos],
+    squad_id: int,
+    formation_slot: int = 0,
+) -> Pos | None:
+    """沿本队稳定攻击入口接近目标，并避开已满的友军格。"""
+    for candidate in squad_attack_approach_cells(
+        target,
+        squad_id,
+        formation_slot,
+    ):
+        if candidate in obstacles or not context.occupied.can_enter(candidate):
+            continue
+        destination = first_step_astar(
+            position,
+            candidate,
+            obstacles,
+            set(context.occupied),
+        )
+        if destination is not None and context.occupied.can_enter(destination):
+            return destination
+    return None
+
+
 def combat_move_toward(
     context: PlanningContext,
     position: Pos,
@@ -4131,6 +4172,7 @@ def squad_ranger_follow_destination(
     obstacles: set[Pos],
 ) -> Pos | None:
     """让 Ranger 留在 Vanguard 后侧，避免远程单位顶到行军最前方。"""
+    movement_obstacles = obstacles | {context.core_pos}
     goal_vector = (
         mission_goal[0] - leader_position[0],
         mission_goal[1] - leader_position[1],
@@ -4149,7 +4191,7 @@ def squad_ranger_follow_destination(
             dot = relative[0] * goal_vector[0] + relative[1] * goal_vector[1]
             if (
                 dot <= 0
-                and cell not in obstacles
+                and cell not in movement_obstacles
                 and context.occupied.can_enter(cell)
             ):
                 candidates.append((dot, manhattan(position, cell), cell))
@@ -4159,7 +4201,7 @@ def squad_ranger_follow_destination(
         destination = first_step_astar(
             position,
             cell,
-            obstacles,
+            movement_obstacles,
             set(context.occupied),
         )
         if destination is not None and context.occupied.can_enter(destination):
@@ -4168,7 +4210,7 @@ def squad_ranger_follow_destination(
         context,
         position,
         leader_position,
-        obstacles,
+        movement_obstacles,
         core_radius=None,
     )
 
@@ -4178,9 +4220,11 @@ def ranger_attack_destination(
     position: Pos,
     target: Pos,
     obstacles: set[Pos],
+    squad_id: int = 0,
 ) -> Pos | None:
     """寻找 Ranger 可达的 1-3 格射击位，优先保留 2-3 格安全距离。"""
-    candidates: list[tuple[int, int, Pos]] = []
+    preferred_vector = SCOUT_VECTORS[squad_id % len(SCOUT_VECTORS)]
+    candidates: list[tuple[int, int, int, Pos]] = []
     for delta_x in range(-3, 4):
         for delta_y in range(-3, 4):
             candidate = (target[0] + delta_x, target[1] + delta_y)
@@ -4190,6 +4234,7 @@ def ranger_attack_destination(
             if (
                 candidate in obstacles
                 or candidate == target
+                or candidate == context.core_pos
                 or not context.occupied.can_enter(candidate)
                 or not clear_ranger_shot(candidate, target, obstacles)
             ):
@@ -4197,11 +4242,15 @@ def ranger_attack_destination(
             candidates.append(
                 (
                     0 if distance >= 2 else 1,
+                    -(
+                        delta_x * preferred_vector[0]
+                        + delta_y * preferred_vector[1]
+                    ),
                     manhattan(position, candidate),
                     candidate,
                 )
             )
-    for _, _, candidate in sorted(candidates):
+    for _, _, _, candidate in sorted(candidates):
         destination = first_step_astar(
             position,
             candidate,
@@ -4579,7 +4628,7 @@ def plan_field_squads(context: PlanningContext) -> None:
         squad_idle_for_healing = (
             not squad_in_combat
             and squad_target_position is None
-            and not memory.assault_gathering
+            and (not memory.assault_gathering or not active_wave_squad)
             and search_mission is None
         )
         engaged_vanguard_targets = tuple(
@@ -4726,7 +4775,11 @@ def plan_field_squads(context: PlanningContext) -> None:
                 HOME_PATROL_OFFSETS[squad.squad_id % len(HOME_PATROL_OFFSETS)],
             )
             mission_label = "squad-stage"
-        elif memory.assault_gathering and memory.assault_rally_position is not None:
+        elif (
+            active_wave_squad
+            and memory.assault_gathering
+            and memory.assault_rally_position is not None
+        ):
             mission_goal = memory.assault_rally_position
             mission_label = "squad-gather"
         elif squad_target_position is not None:
@@ -5015,11 +5068,12 @@ def plan_field_squads(context: PlanningContext) -> None:
                     )
             elif unit.id == leader.id:
                 if squad_attack_now:
-                    destination = combat_approach_step(
+                    destination = squad_combat_approach_step(
                         context,
                         position,
                         squad_target_position,
                         static_obstacles | context.visible_enemy_unit_cells,
+                        squad.squad_id,
                     )
                 else:
                     destination = combat_move_toward(
@@ -5039,6 +5093,7 @@ def plan_field_squads(context: PlanningContext) -> None:
                         position,
                         squad_target_position,
                         static_obstacles | context.visible_enemy_unit_cells,
+                        squad.squad_id,
                     )
                 if destination is None:
                     destination = squad_ranger_follow_destination(
@@ -5057,11 +5112,18 @@ def plan_field_squads(context: PlanningContext) -> None:
                     - {planned_leader_position},
                 )
             elif squad_attack_now:
-                destination = combat_approach_step(
+                vanguard_slot = (
+                    squad.vanguard_ids.index(unit.id)
+                    if unit.id in squad.vanguard_ids
+                    else 0
+                )
+                destination = squad_combat_approach_step(
                     context,
                     position,
                     squad_target_position,
                     static_obstacles | context.visible_enemy_unit_cells,
+                    squad.squad_id,
+                    vanguard_slot,
                 )
                 if (
                     destination is not None

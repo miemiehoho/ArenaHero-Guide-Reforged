@@ -2359,6 +2359,33 @@ class SquadStrategyTests(AgentTestCase):
             ranger_ids=(UUID(int=2000 + squad_id),),
         )
 
+    @staticmethod
+    def multi_wave_roster():
+        units = [*workers(4)]
+        assignments = {}
+        for squad_id in range(6):
+            base_x = 1 if squad_id == 0 else 20 + squad_id * 12
+            members = (
+                controlled_unit(
+                    1000 + squad_id * 2,
+                    UnitType.VANGUARD,
+                    (base_x, 0),
+                ),
+                controlled_unit(
+                    1001 + squad_id * 2,
+                    UnitType.VANGUARD,
+                    (base_x, 1),
+                ),
+                controlled_unit(
+                    2000 + squad_id,
+                    UnitType.RANGER,
+                    (base_x - 1, 0),
+                ),
+            )
+            units.extend(members)
+            assignments.update({unit.id: squad_id for unit in members})
+        return units, agent.AgentMemory(squad_assignments=assignments)
+
     def test_high_population_patrol_bands_preserve_low_population_layout(self):
         self.assertEqual(
             agent.squad_patrol_radii_for(39, 0),
@@ -2437,6 +2464,17 @@ class SquadStrategyTests(AgentTestCase):
         self.assertIsNotNone(first_rally)
         self.assertIsNotNone(second_rally)
         self.assertNotEqual(first_rally, second_rally)
+
+    def test_squad_attack_approach_cells_are_stable_and_distinct(self):
+        target = (20, 0)
+
+        first = agent.squad_attack_approach_cells(target, 1, 0)
+        second = agent.squad_attack_approach_cells(target, 2, 0)
+        wing = agent.squad_attack_approach_cells(target, 1, 1)
+
+        self.assertNotEqual(first[0], second[0])
+        self.assertNotEqual(first[0], wing[0])
+        self.assertTrue(all(agent.manhattan(cell, target) == 1 for cell in first))
 
     def test_target_reservations_cap_repeat_attackers_by_target_type(self):
         worker_target = enemy_unit(401, UnitType.WORKER, (20, 0))
@@ -2811,6 +2849,25 @@ class SquadStrategyTests(AgentTestCase):
         self.assertTrue(any("squad-gather" in action for action in actions))
         self.assertFalse(any("squad-assault" in action for action in actions))
 
+    def test_non_active_wave_patrols_while_active_wave_gathers(self):
+        units, memory = self.multi_wave_roster()
+
+        _, actions, memory = self.plan(
+            make_turn(
+                units,
+                enemies=[
+                    enemy_core(400, (64, 0)),
+                    enemy_unit(401, UnitType.VANGUARD, (64, 1)),
+                ],
+            ),
+            memory,
+        )
+
+        self.assertTrue(memory.assault_gathering)
+        self.assertTrue(any("squad-gather" in item and "team=2" in item for item in actions))
+        self.assertTrue(any("squad-patrol" in item and "team=5" in item for item in actions))
+        self.assertFalse(any("squad-gather" in item and "team=5" in item for item in actions))
+
     def test_guarded_core_at_home_distance_65_only_nearby_squad_attacks(self):
         positions = {
             203: (41, 0),
@@ -2895,6 +2952,28 @@ class SquadStrategyTests(AgentTestCase):
 
         self.assertIsInstance(plan.unit_actions[UUID(int=302)], MoveAction)
         self.assertTrue(any("squad-ranger-disengage" in action for action in actions))
+
+    def test_field_ranger_follow_does_not_hold_on_friendly_core(self):
+        context = type(
+            "FollowContext",
+            (),
+            {
+                "core_pos": (0, 0),
+                "occupied": agent.FriendlyOccupancy([(1, 0)]),
+                "visible_enemy_unit_cells": set(),
+            },
+        )()
+
+        destination = agent.squad_ranger_follow_destination(
+            context,
+            (0, 0),
+            (1, 0),
+            (20, 0),
+            set(),
+        )
+
+        self.assertIsNotNone(destination)
+        self.assertNotEqual(destination, (0, 0))
 
     def test_ranger_supports_vanguard_locked_with_enemy_vanguard(self):
         positions = {
