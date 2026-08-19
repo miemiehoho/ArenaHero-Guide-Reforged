@@ -1247,6 +1247,23 @@ class WorkerTests(AgentTestCase):
         self.assertEqual(assignments[first.id], original_resource)
         self.assertEqual(assignments[second.id], closer_new_resource)
 
+    def test_visible_resource_is_assignable_before_memory_merge(self):
+        worker = controlled_unit(100, UnitType.WORKER, (2, 0))
+        resource = (6, 0)
+        memory = agent.AgentMemory()
+
+        assignments = memory.assign_resource_targets(
+            [worker],
+            set(),
+            {resource},
+            tick=100,
+            path_obstacles=set(),
+            blocked_resource_cells=set(),
+        )
+
+        self.assertEqual(assignments, {worker.id: resource})
+        self.assertEqual(memory.worker_resource_target, {worker.id: resource})
+
     def test_dead_unit_state_is_pruned_without_reassigning_live_worker(self):
         live_worker = controlled_unit(100, UnitType.WORKER, (2, 0))
         live_vanguard = controlled_unit(200, UnitType.VANGUARD, (0, 1))
@@ -1824,6 +1841,28 @@ class ResourceScoutTests(AgentTestCase):
         self.assertEqual(goal, route[1])
         self.assertEqual(memory.scout_phase[worker_id], 1)
 
+    def test_full_friendly_scout_goal_is_skipped(self):
+        worker_id = UUID(int=100)
+        memory = agent.AgentMemory(worker_sector={worker_id: 0})
+        route = agent.square_ring_waypoints(
+            (0, 0),
+            12,
+            agent.RESOURCE_SCOUT_WAYPOINT_STEP,
+        )
+
+        goal = memory.goal_for(
+            worker_id,
+            0,
+            4,
+            (0, 0),
+            (5, 0),
+            set(),
+            {route[0]},
+        )
+
+        self.assertEqual(goal, route[1])
+        self.assertEqual(memory.scout_phase[worker_id], 1)
+
     def test_three_path_failures_advance_resource_scout_goal(self):
         worker = controlled_unit(100, UnitType.WORKER, (5, 0))
         obstacles = ((4, 0), (6, 0), (5, -1), (5, 1))
@@ -1841,9 +1880,21 @@ class ResourceScoutTests(AgentTestCase):
             )
             self.assertTrue(any("wait-scout" in action for action in actions))
 
-        self.assertEqual(memory.scout_phase[worker.id], 1)
+        self.assertEqual(memory.scout_phase[worker.id], 3)
         self.assertNotIn(worker.id, memory.scout_goal)
         self.assertNotIn(worker.id, memory.scout_path_failures)
+
+    def test_idle_worker_keeps_remote_scout_goal(self):
+        worker = controlled_unit(100, UnitType.WORKER, (1, 0))
+
+        plan, actions, memory = self.plan(make_turn([worker], resources=0))
+
+        self.assertIsInstance(plan.unit_actions[worker.id], MoveAction)
+        self.assertGreaterEqual(
+            agent.chebyshev((0, 0), memory.scout_goal[worker.id]),
+            agent.RESOURCE_SCOUT_RADII[0],
+        )
+        self.assertTrue(any(" scout " in action for action in actions))
 
     def test_resource_assignment_and_healing_override_resource_scout(self):
         assigned = controlled_unit(100, UnitType.WORKER, (5, 0))

@@ -2505,6 +2505,10 @@ class AgentMemory:
         blocked_resource_cells: set[Pos],
     ) -> dict[UUID, Pos]:
         """为真正空闲的 Worker 保留一个跨 Tick 的静态资源任务。"""
+        # 当前 Tick 的可见资源是权威候选；即使上游观察因事件顺序尚未更新，
+        # 也不能让空闲 Worker 错过刚进入视野的资源。
+        self.known_resources.update(visible_resources)
+        candidate_resources = known_resources | visible_resources
         worker_by_id = {worker.id: worker for worker in workers}
 
         # 只释放已经无法执行的任务；目标在负责 Worker 视野外时继续保留。
@@ -2515,7 +2519,7 @@ class AgentMemory:
                 continue
             if (
                 tick < self.retreat_until.get(worker_id, 0)
-                or resource not in known_resources
+                or resource not in candidate_resources
                 or resource in path_obstacles
                 or resource in blocked_resource_cells
             ):
@@ -2524,7 +2528,7 @@ class AgentMemory:
         self.resource_deferred_until = {
             resource: expiry
             for resource, expiry in self.resource_deferred_until.items()
-            if expiry > tick and resource in known_resources
+            if expiry > tick and resource in candidate_resources
         }
 
         assignments: dict[UUID, Pos] = {}
@@ -2606,7 +2610,7 @@ class AgentMemory:
         ]
         available_resources = {
             resource
-            for resource in known_resources
+            for resource in candidate_resources
             - assigned_resources
             - blocked_resource_cells
             if tick >= self.resource_deferred_until.get(resource, 0)
@@ -2638,6 +2642,8 @@ class AgentMemory:
         self,
         worker_id: UUID,
         worker_count: int = TARGET_WORKERS_CONTROL,
+        *,
+        reset_failures: bool = True,
     ) -> None:
         """沿普通资源方环顺时针前进；绕环一周后切换扫描半径。"""
         ring_sequence = resource_scout_ring_sequence_for(worker_count)
@@ -2657,7 +2663,8 @@ class AgentMemory:
         self.scout_ring_index[worker_id] = ring_index
         self.scout_phase[worker_id] = step
         self.scout_goal.pop(worker_id, None)
-        self.scout_path_failures.pop(worker_id, None)
+        if reset_failures:
+            self.scout_path_failures.pop(worker_id, None)
 
     def goal_for(
         self,
@@ -2667,9 +2674,16 @@ class AgentMemory:
         core: Pos,
         position: Pos,
         obstacles: set[Pos],
+        blocked: set[Pos] | None = None,
     ) -> Pos:
+        blocked = blocked or set()
         goal = self.scout_goal.get(worker_id)
-        if goal is not None and goal not in obstacles and manhattan(position, goal) > 1:
+        if (
+            goal is not None
+            and goal not in obstacles
+            and goal not in blocked
+            and manhattan(position, goal) > 1
+        ):
             return goal
 
         if goal is not None:
@@ -2701,12 +2715,12 @@ class AgentMemory:
             ) % max(1, worker_count)
             offset = (sector * len(route)) // max(1, worker_count)
             candidate = route[(step + offset) % len(route)]
-            if candidate not in obstacles:
+            if candidate not in obstacles and candidate not in blocked:
                 self.scout_goal[worker_id] = candidate
                 return candidate
             self.advance_scout(worker_id, worker_count)
 
-        # 若所有普通方环候选点都被已知障碍覆盖，则回退到 Core。
+        # 只有整个搜索序列都被障碍或本 Tick 占位挡住时才允许回退到 Core。
         self.scout_goal[worker_id] = core
         return core
 
@@ -4010,6 +4024,7 @@ def plan_workers(context: PlanningContext) -> None:
             context.core_pos,
             position,
             context.navigation_obstacles,
+            set(occupied),
         )
         destination = first_step_astar(
             position,
@@ -4017,6 +4032,29 @@ def plan_workers(context: PlanningContext) -> None:
             context.navigation_obstacles,
             occupied,
         )
+        # 首步受临时占位影响时立即换同一搜索序列的下一个点，避免连续
+        # wait-scout 把 Worker 固定在 Core 附近。
+        if destination is None or destination in occupied:
+            memory.advance_scout(
+                worker.id,
+                len(context.workers),
+                reset_failures=False,
+            )
+            goal = memory.goal_for(
+                worker.id,
+                worker_index,
+                len(context.workers),
+                context.core_pos,
+                position,
+                context.navigation_obstacles,
+                set(occupied),
+            )
+            destination = first_step_astar(
+                position,
+                goal,
+                context.navigation_obstacles,
+                occupied,
+            )
         if destination is not None and destination not in occupied:
             direction = direction_between(position, destination)
             if direction is not None:
@@ -4029,11 +4067,15 @@ def plan_workers(context: PlanningContext) -> None:
         failures = memory.scout_path_failures.get(worker.id, 0) + 1
         memory.scout_path_failures[worker.id] = failures
         if failures >= RESOURCE_SCOUT_PATH_FAILURES:
-            memory.advance_scout(worker.id, len(context.workers))
+            memory.scout_goal.pop(worker.id, None)
+            memory.scout_path_failures.pop(worker.id, None)
 
         worker.wait()
         occupied.add(position)
-        actions.append(f"{str(worker.id)[:8]} wait-scout")
+        actions.append(
+            f"{str(worker.id)[:8]} "
+            f"{'scout-blocked' if goal == context.core_pos else 'wait-scout'}"
+        )
 
 
 def combat_approach_step(
